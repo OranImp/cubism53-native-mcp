@@ -1,0 +1,14 @@
+/.state/
+/.venv/
+__pycache__/
+*.py[cod]
+*.class
+*.jar
+*.dll
+*.exe
+*.cmo3
+*.can3
+*.moc3
+*.psd
+/.mcp.json
+/.env

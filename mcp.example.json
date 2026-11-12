@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "cubism53-native-mcp": {
+      "command": "C:/path/to/cubism53-native-mcp/.venv/Scripts/python.exe",
+      "args": ["C:/path/to/cubism53-native-mcp/server.py"],
+      "env": {
+        "CUBISM53_EDITOR_HOME": "C:/Program Files/Live2D Cubism 5.3",
+        "CUBISM53_JDK_HOME": "C:/path/to/jdk-17",
+        "CUBISM53_WORKSPACE": "E:/path/to/your-model-project"
+      }
+    }
+  }
+}
