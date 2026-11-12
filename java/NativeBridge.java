@@ -82,8 +82,8 @@ public final class NativeBridge {
         worker.start();
     }
 
-    private static ExecutorService workers(String name) {
-        return Executors.newFixedThreadPool(8, task -> {
+    private static ExecutorService workers(String name, int queueSize) {
+        return new ThreadPoolExecutor(8, 8, 0, TimeUnit.SECONDS, new ArrayBlockingQueue<>(queueSize), task -> {
             var worker = new Thread(task, name);
             worker.setDaemon(true);
             return worker;
@@ -91,12 +91,16 @@ public final class NativeBridge {
     }
 
     private static void serve() {
-        var connections = workers("Cubism53-connection");
-        var editorRequests = workers("Cubism53-editor-request");
+        var connections = workers("Cubism53-connection", 32);
+        var editorRequests = workers("Cubism53-editor-request", 16);
         try {
             while (!listener.isClosed()) {
                 Socket connection = listener.accept();
-                connections.execute(() -> handle(connection, editorRequests));
+                try {
+                    connections.execute(() -> handle(connection, editorRequests));
+                } catch (RejectedExecutionException error) {
+                    reply(connection, errorResponse(new IllegalStateException("Bridge is busy; retry the request")));
+                }
             }
         } catch (IOException error) {
             if (!listener.isClosed()) System.err.println("Cubism53 bridge: " + error);
@@ -122,7 +126,11 @@ public final class NativeBridge {
                     NativeBridgeJobs.submit(operation, request, () -> execute(operation, request))));
             } else {
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(45);
-                editorRequests.execute(() -> handleEditorRequest(socket, operation, request, deadline));
+                try {
+                    editorRequests.execute(() -> handleEditorRequest(socket, operation, request, deadline));
+                } catch (RejectedExecutionException error) {
+                    throw new IllegalStateException("Editor request queue is busy; retry the request", error);
+                }
             }
         } catch (Exception error) {
             reply(socket, errorResponse(error));
@@ -150,6 +158,8 @@ public final class NativeBridge {
         var started = new java.util.concurrent.atomic.AtomicBoolean();
         FutureTask<Object> task = new FutureTask<>(() -> {
             if (!started.compareAndSet(false, true)) return null;
+            if (deadline - System.nanoTime() <= 0)
+                throw new IllegalStateException("Editor operation timed out before it started");
             return work.call();
         });
         SwingUtilities.invokeLater(task);
@@ -320,15 +330,15 @@ public final class NativeBridge {
             case "move_to_part": {
                 var item = findObject(source, (String) request.get("object_guid"));
                 String partGuid = (String) request.get("part_guid");
-                var parent = partGuid == null ? source.getRootPart() : requirePart(source, partGuid);
+                var root = source.getRootPart();
+                var parent = partGuid == null || root.getGuid().getUuidString().equals(partGuid)
+                    ? root : requirePart(source, partGuid);
                 if (item == source.getRootPart() || item == parent)
                     throw new IllegalArgumentException("Cannot move the root part or parent an object to itself");
                 for (var ancestor : parent.getAllParents()) {
                     if (ancestor == item) throw new IllegalArgumentException("Part hierarchy would contain a cycle");
                 }
-                int index = integer(request, "index", -1);
-                if (index < -1 || index > parent.getChildren().size())
-                    throw new IllegalArgumentException("Part child index is outside the destination");
+                int index = partMoveIndex(request, parent.getChildren().size());
                 if (batchPreflight) return null;
                 finishEdit(doc, parent.getHandler().addPartChild(item, index));
                 return objectInfo(item, false);
@@ -793,7 +803,7 @@ public final class NativeBridge {
             case "save_as_new": {
                 Path path = NativeBridgeAssets.output(workspace, request.get("path"), ".cmo3");
                 Files.createDirectories(path.getParent());
-                boolean saved = doc.saveDocument(path.toFile(), false);
+                boolean saved = NativeBridgeAssets.saveModel(doc, path);
                 return map("saved", saved, "path", path.toString(), "bytes", Files.exists(path) ? Files.size(path) : 0);
             }
             case "close_saved":
@@ -1414,8 +1424,6 @@ public final class NativeBridge {
         return glueInfo(glue);
     }
 
-    private record GlueCandidate(int a, int b, double distance) {}
-
     private static Object suggestGluePairs(CModelSource source, Map<String,Object> request) {
         var a = requireMesh(source, (String) request.get("mesh_a_guid"));
         var b = requireMesh(source, (String) request.get("mesh_b_guid"));
@@ -1440,25 +1448,13 @@ public final class NativeBridge {
             var bu = b.getEditableMesh().getPoints();
             if (ap.length != au.size() * 2 || bp.length != bu.size() * 2)
                 throw new IllegalStateException("Canvas and editable vertex counts differ");
-            int[] aMatches = new int[au.size()];
-            int[] bMatches = new int[bu.size()];
-            var candidates = new ArrayList<GlueCandidate>();
-            for (int i = 0; i < au.size(); i++) {
-                for (int j = 0; j < bu.size(); j++) {
-                    double distance = Math.hypot(ap[i * 2] - bp[j * 2], ap[i * 2 + 1] - bp[j * 2 + 1]);
-                    if (distance <= tolerance) {
-                        aMatches[i]++;
-                        bMatches[j]++;
-                        candidates.add(new GlueCandidate(i, j, distance));
-                    }
-                }
-            }
+            var matches = NativeBridgeGlueSearch.find(ap, bp, tolerance);
             List<Object> pairs = new ArrayList<>();
             List<Object> ambiguous = new ArrayList<>();
-            for (var match : candidates) {
-                var result = map("a_uid", Long.toString(au.get(match.a).getPointUid()),
-                    "b_uid", Long.toString(bu.get(match.b).getPointUid()), "distance", match.distance);
-                (aMatches[match.a] == 1 && bMatches[match.b] == 1 ? pairs : ambiguous).add(result);
+            for (var match : matches.candidates()) {
+                var result = map("a_uid", Long.toString(au.get(match.a()).getPointUid()),
+                    "b_uid", Long.toString(bu.get(match.b()).getPointUid()), "distance", match.distance());
+                (matches.unique(match) ? pairs : ambiguous).add(result);
             }
             return map("pairs", pairs, "ambiguous", ambiguous);
         } finally {
@@ -1678,6 +1674,67 @@ public final class NativeBridge {
         "add_parameter_keys", Set.of("parameter_id", "values"), "remove_parameter_keys", Set.of("parameter_id", "values"),
         "move_parameter_keys", Set.of("parameter_id", "moves"));
 
+    private static int partMoveIndex(Map<String,Object> request, int size) {
+        Object index = request.get("index");
+        if (index == null) return -1;
+        if (!(index instanceof Number value) || value.doubleValue() != value.intValue()
+                || value.intValue() < -1 || value.intValue() > size)
+            throw new IllegalArgumentException("Part child index must be an integer inside the destination or -1");
+        return value.intValue();
+    }
+
+    private static final class BatchPartLayout {
+        final CModelSource source;
+        final CPartSource root;
+        final Map<String,String> parents = new HashMap<>();
+        final Map<String,List<String>> children = new TreeMap<>();
+
+        BatchPartLayout(CModelSource source) {
+            this.source = source;
+            root = source.getRootPart();
+            recordChildren(root);
+            for (var part : source.getAllParts()) recordChildren(part);
+        }
+
+        private void recordChildren(CPartSource part) {
+            String guid = part.getGuid().getUuidString();
+            var list = new ArrayList<String>();
+            for (var item : part.getChildren()) {
+                String child = item.getGuid().getUuidString();
+                list.add(child);
+                parents.put(child, guid);
+            }
+            children.put(guid, list);
+        }
+
+        void move(Map<String,Object> args) {
+            var item = findObject(source, (String) args.get("object_guid"));
+            String guid = item.getGuid().getUuidString();
+            Object target = args.get("part_guid");
+            if (target != null && !(target instanceof String))
+                throw new IllegalArgumentException("part_guid must be a string");
+            var part = target == null || root.getGuid().getUuidString().equals(target)
+                ? root : requirePart(source, (String) target);
+            String parent = part.getGuid().getUuidString();
+            if (item == root || item == part)
+                throw new IllegalArgumentException("Cannot move the root part or parent an object to itself");
+            var visited = new HashSet<String>();
+            for (String next = parent; next != null; next = parents.get(next)) {
+                if (guid.equals(next) || !visited.add(next))
+                    throw new IllegalArgumentException("Batch part hierarchy would contain a cycle");
+            }
+            var destination = children.get(parent);
+            int index = partMoveIndex(args, destination.size());
+            String previous = parents.get(guid);
+            if (previous != null) {
+                if (parent.equals(previous) && index >= 0 && destination.indexOf(guid) < index) index--;
+                children.get(previous).remove(guid);
+            }
+            destination.add(index == -1 ? destination.size() : index, guid);
+            parents.put(guid, parent);
+        }
+    }
+
     private static Object editBatch(CModelingDocument doc, Map<String,Object> request) throws Exception {
         String mode = nonblank(request.get("mode"), "mode");
         if (!Set.of("plan", "apply").contains(mode)) throw new IllegalArgumentException("Unknown batch mode");
@@ -1691,9 +1748,6 @@ public final class NativeBridge {
         var gridObjects = new HashSet<String>();
         var formObjects = new HashSet<String>();
         var bindings = new HashSet<List<String>>();
-        var parents = new HashMap<String,String>();
-        for (var part : source.getAllParts())
-            parents.put(part.getGuid().getUuidString(), part.getParent() == null ? null : part.getParent().getGuid().getUuidString());
         for (var edit : edits) {
             var row = (Map<?,?>) edit;
             String operation = nonblank(row.get("operation"), "operation");
@@ -1715,13 +1769,7 @@ public final class NativeBridge {
                 if (!bindings.add(List.of(guid, paramId)))
                     throw new IllegalArgumentException("Only one grid edit per object and parameter is allowed in a batch");
             }
-            if ("move_to_part".equals(operation) && object instanceof CPartSource) {
-                String parent = args.get("part_guid") == null ? source.getRootPart().getGuid().getUuidString() : (String) args.get("part_guid");
-                for (String next = parent; next != null; next = parents.get(next))
-                    if (guid.equals(next)) throw new IllegalArgumentException("Batch part hierarchy would contain a cycle");
-                parents.put(guid, parent);
-            }
-            snapshots.putIfAbsent(guid, keyformObjectInfo(object));
+            snapshots.computeIfAbsent(guid, key -> keyformObjectInfo(object));
             args.put("operation", operation);
             args.put("document_uid", doc.getDocumentUID());
             operations.add(args);
@@ -1729,14 +1777,22 @@ public final class NativeBridge {
         }
         if (!Collections.disjoint(gridObjects, formObjects))
             throw new IllegalArgumentException("Submit grid and keyform GUID edits for the same object in separate batches");
-        var app = CEAppCtrl.Companion.b();
+        var layout = operations.stream().anyMatch(args -> "move_to_part".equals(args.get("operation")))
+            ? new BatchPartLayout(source) : null;
+        var initialParts = new TreeMap<String,List<String>>();
+        if (layout != null) layout.children.forEach((guid, order) -> initialParts.put(guid, List.copyOf(order)));
         batchPreflight = true;
         try {
-            for (var args : operations) execute((String) args.get("operation"), args);
+            for (var args : operations) {
+                String operation = (String) args.get("operation");
+                if ("move_to_part".equals(operation)) layout.move(args);
+                else execute(operation, args);
+            }
         } finally { batchPreflight = false; }
 
         var fingerprint = map("file", doc.getFile() == null ? null : doc.getFile().toString(), "modified", doc.getLastModifiedTime(),
-            "undo", doc.getUndoManager().getCurrentPos(), "operations", operations, "snapshots", snapshots);
+            "undo", doc.getUndoManager().getCurrentPos(), "operations", operations, "snapshots", snapshots,
+            "part_order", initialParts);
         byte[] serialized = JSONValue.toJSONString(jsonCompatible(fingerprint)).getBytes(StandardCharsets.UTF_8);
         String plan = HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(serialized));
         if ("plan".equals(mode)) return map("plan_id", plan, "impact", impact);

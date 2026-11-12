@@ -53,6 +53,60 @@ class StdioTest(unittest.IsolatedAsyncioTestCase):
                         self.assertTrue(result.isError)
                         self.assertIn(error, result.content[0].text)
 
+    async def test_job_status_has_a_reserved_channel(self):
+        release = asyncio.Event()
+        saturated = asyncio.Event()
+        ordinary = 0
+
+        async def adapter(reader, writer):
+            nonlocal ordinary
+            request = json.loads(await reader.readline())
+            if request['operation'] == 'status':
+                ordinary += 1
+                if ordinary == 8:
+                    saturated.set()
+                await release.wait()
+                result = {'documents': []}
+            else:
+                result = {'state': 'queued'}
+            writer.write(json.dumps({'ok': True, 'result': result}).encode() + b'\n')
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+
+        async with await asyncio.start_server(adapter, '127.0.0.1', 0) as listener:
+            port = listener.sockets[0].getsockname()[1]
+            with TemporaryDirectory() as directory:
+                folder = Path(directory).resolve()
+                (folder / 'config.json').write_text(json.dumps({
+                    'workspace': str(folder), 'port': port, 'token': 'test-token',
+                }), encoding='utf8')
+                options = StdioServerParameters(command=sys.executable, args=[str(ROOT / 'server.py')],
+                    env={'CUBISM53_WORKSPACE': str(folder), 'CUBISM53_BRIDGE_STATE': str(folder),
+                         'CUBISM53_BRIDGE_PORT': str(port), 'PYTHONDONTWRITEBYTECODE': '1'})
+                async with stdio_client(options) as (reader, writer), ClientSession(reader, writer) as session:
+                    await session.initialize()
+                    calls = [asyncio.create_task(session.call_tool('cubism_native_status', {})) for _ in range(24)]
+                    try:
+                        await asyncio.wait_for(saturated.wait(), 5)
+                        result = await asyncio.wait_for(
+                            session.call_tool('cubism_native_job_status', {'job_id': 'test'}), 1)
+                        self.assertEqual(result.structuredContent['state'], 'queued')
+                        done, pending = await asyncio.wait(calls, timeout=3, return_when=asyncio.FIRST_COMPLETED)
+                        for _ in range(24):
+                            if len(done) >= 16:
+                                break
+                            more, pending = await asyncio.wait(pending, timeout=.15, return_when=asyncio.FIRST_COMPLETED)
+                            done.update(more)
+                        self.assertEqual(len(done), 16)
+                        self.assertEqual(ordinary, 8)
+                        for call in done:
+                            self.assertTrue(call.result().isError)
+                            self.assertIn('busy', call.result().content[0].text)
+                    finally:
+                        release.set()
+                        await asyncio.gather(*calls)
+
     async def test_preview_recovers_after_registration_failure(self):
         methods = []
 

@@ -4,56 +4,74 @@
 
 ## 安装和连接
 
-需要 Windows、Python 3.11 或更新版本、JDK 17，以及下列精确构建的 Cubism Editor 5.3.03。项目仅含桥接源代码。构建时从本机编辑器安装目录读取依赖。
+### Windows x64 便携包
 
-- 校验文件为安装目录下的 `app/lib/Live2D_Cubism.jar`。
-- 支持的 SHA-256 为 `bd0a23b9f21a56271d31e6f7f5aed0202661c4fe12444469d093bcdeb4cbf166`。其他构建会在加载前被拒绝。
+1. 安装并能启动官方 Cubism Editor **5.3.03**。核对安装目录下的 `app/lib/Live2D_Cubism.jar`，支持的 SHA-256 为 `bd0a23b9f21a56271d31e6f7f5aed0202661c4fe12444469d093bcdeb4cbf166`。
+2. 解压 `Cubism53-Native-MCP-win-x64.zip`，运行 `Setup.cmd`。程序查找已运行的编辑器、Windows 安装记录和常见安装目录。按提示确认模型工作区，必要时输入自定义的编辑器安装目录。
+3. 根据下表选用生成的配置文件。先启动 Cubism，再在客户端调用 `cubism_native_connect`。用 `cubism_native_status` 获取当前文档 UID。
 
-在本仓库目录执行。
+便携包内有 CPython、MCP 依赖、预编译桥接 JAR 和 Java Attach 运行时。安装和启动可以离线完成。客户端与 Cubism 应运行在同一 Windows 用户会话。
+
+静默配置示例。在解压后的目录执行。
+
+```powershell
+.\Setup.cmd --non-interactive --editor-home 'C:/Program Files/Live2D Cubism 5.3' --workspace 'E:/Models'
+```
+
+默认配置写入 `%LOCALAPPDATA%\Cubism53MCP\profiles\default\settings.json`。用 `--profile` 和 `--bridge-port` 为其他模型工作区创建独立配置。移动便携包后，重新运行 Setup 生成新路径。
+
+| 接入方式 | 配置 |
+| --- | --- |
+| CC Switch | 在 MCP 管理中添加名为 `cubism53-native-mcp` 的 stdio 服务，使用 `cc-switch.json` 的命令和参数，再选择要同步的客户端。已有同名或旧版服务可直接更新该条目的启动配置。 |
+| Claude Code 和通用 stdio 客户端 | 将 `mcp.json` 的服务器条目合并到客户端配置。Claude Code 支持模型项目里的 `.mcp.json`。 |
+| Codex | 运行生成的 `codex.ps1`，或在 CC Switch 中为 Codex 启用同一条服务。 |
+| DeepSeek Harness | 把 `dsh.patch.yml` 用作本机 profile overlay，例如 `dsh web --patch <文件>`。桌面版使用同一文件中 `insert` 下的 `@deepseek-ai/dsh-mcp-client` 插件条目。 |
+
+这些文件位于 profile 的 `client-configs` 目录。配置生成器只写该 profile，导入和同步由各客户端处理。每个客户端均调用同一标准 MCP stdio 入口。
+
+诊断命令会检查编辑器版本、工作区、Attach 运行时和端口状态。将 profile 路径换成 Setup 输出的实际路径。
+
+```powershell
+.\runtime\python\python.exe -B .\app\launcher.py doctor --profile-file "$env:LOCALAPPDATA/Cubism53MCP/profiles/default/settings.json"
+```
+
+升级时先等待作业完成，再以相同命令将 `doctor` 换成 `stop`。从新版目录重新运行 Setup，导入生成的配置并重开客户端会话。
+
+### 从源码安装
+
+Windows 上需要 Python 3.11+ 和 JDK 17。源码方式同样支持用 `launcher.py setup` 生成各客户端配置。
 
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-
-$env:CUBISM53_EDITOR_HOME = 'C:/Program Files/Live2D Cubism 5.3'
-$env:CUBISM53_JDK_HOME = 'C:/path/to/jdk-17'
-$env:CUBISM53_WORKSPACE = 'E:/path/to/your-model-project'
-.\.venv\Scripts\python.exe -m bridge.build
+.\.venv\Scripts\python.exe .\launcher.py setup --editor-home 'C:/Program Files/Live2D Cubism 5.3' --workspace 'E:/Models'
 ```
 
-`bridge.build` 可单独验证依赖。首次调用 `cubism_native_connect` 也会按需构建，并缓存与 Java 源码对应的桥接 JAR。先手动打开 Cubism Editor。若有多个匹配进程，设置 `CUBISM53_EDITOR_PID` 为目标 **Java** 进程 PID。连接成功后通过 `cubism_native_status` 取得文档 UID。
-
-### Codex
-
-以下命令使用当前仓库和上述环境变量。
-
-```powershell
-$root = (Get-Location).Path
-codex mcp add cubism53-native-mcp --env "CUBISM53_EDITOR_HOME=$env:CUBISM53_EDITOR_HOME" --env "CUBISM53_JDK_HOME=$env:CUBISM53_JDK_HOME" --env "CUBISM53_WORKSPACE=$env:CUBISM53_WORKSPACE" -- "$root/.venv/Scripts/python.exe" "$root/server.py"
-```
-
-### Claude Code
-
-将 [mcp.example.json](mcp.example.json) 里 `mcpServers` 下的配置放进**模型项目**的 `.mcp.json`，并替换示例绝对路径。原有配置中已经存在的其他服务可以保留。新会话加载配置后调用 `cubism_native_connect`。
-
-### 配置
+直接启动方式仍支持 `python server.py`。以下变量可用于源码方式或选择目标编辑器。
 
 | 环境变量 | 用途 |
 | --- | --- |
-| `CUBISM53_EDITOR_HOME` | Editor 安装根目录。未指定时在 Program Files 下查找。 |
-| `CUBISM53_JDK_HOME` | JDK 17 安装根目录。未指定时检查 `JAVA_HOME` 和 `PATH`。 |
-| `CUBISM53_WORKSPACE` | 文件工具的工作区根目录，默认本仓库。输入和输出支持相对于该目录的路径。 |
-| `CUBISM53_BRIDGE_STATE` | 桥接 JAR、连接配置和令牌的目录，默认本仓库的 `.state`。 |
+| `CUBISM53_EDITOR_HOME` | Cubism Editor 安装根目录。 |
+| `CUBISM53_JDK_HOME` | 源码构建用 JDK 17。未指定时检查 `JAVA_HOME` 和 `PATH`。 |
+| `CUBISM53_WORKSPACE` | 文件工具的工作区根目录，直接运行源码时默认本仓库。 |
+| `CUBISM53_BRIDGE_STATE` | 桥接和令牌目录，直接运行源码时默认 `.state`。 |
 | `CUBISM53_BRIDGE_PORT` | 原生桥接端口，默认 `22055`。 |
-| `CUBISM53_EDITOR_PID` | 可选，选择要加载桥接器的编辑器 Java 进程。 |
-| `CUBISM53_PORT` | 画布预览所用的官方外部程序集成端口，默认 `22033`。 |
-| `CUBISM53_ATTACH_DIR` | Windows JVM Attach 临时目录，默认 `LOCALAPPDATA`。若默认路径包含非 ASCII 字符，设置为现有的可写 ASCII 路径。工作区和编辑器路径可以包含中文。 |
+| `CUBISM53_EDITOR_PID` | 有多个编辑器时指定目标 Java 进程 PID。 |
+| `CUBISM53_PORT` | 画布预览使用的外部程序集成端口，默认 `22033`。 |
+| `CUBISM53_ATTACH_DIR` | Attach 临时配置目录，直接运行源码时默认 `LOCALAPPDATA`。 |
 
-同一编辑器进程内的多个客户端共享打开的文档和原生撤销栈。多个独立配置应使用各自的桥接端口和状态目录。桥接只监听 `127.0.0.1`。
+同一编辑器进程内的多个客户端共享打开的文档和原生撤销栈。独立配置应使用各自的桥接端口和状态目录。桥接只监听 `127.0.0.1`。首次使用画布预览时，在 Cubism 启用「外部应用程序集成」，保持 MCP 会话连接并批准 **Cubism53 Native MCP**。
 
-更新桥接源码后，等当前作业结束，再用相同环境变量执行 `.\.venv\Scripts\python.exe -m bridge.client stop`，然后重新调用 `cubism_native_connect` 加载新构建。
+### 构建便携包
 
-首次调用画布预览工具前，在 Cubism 启用「外部应用程序集成」。收到权限提示时，保持 MCP 会话连接，在集成列表批准 **Cubism53 Native MCP** 后重试。
+在 Windows x64 上准备官方 CPython 3.13.17 Windows x64 嵌入 ZIP、Eclipse Temurin JDK 17.0.19+10 和 Cubism Editor 5.3.03。用 `portable/wheels-win-x64.txt` 下载锁定的 CPython 3.13 Windows x64 wheels。构建步骤读取这些本机输入。
+
+```powershell
+python -m pip download --require-hashes --no-deps --only-binary=:all: --platform win_amd64 --implementation cp --python-version 3.13 --abi cp313 -r portable/wheels-win-x64.txt -d wheelhouse
+python portable/build.py --python-zip python-3.13.17-embed-amd64.zip --wheelhouse wheelhouse --editor-home 'C:/Program Files/Live2D Cubism 5.3' --output dist/Cubism53-Native-MCP-win-x64.zip
+```
+
+输出同时包含 ZIP 的 SHA-256 文件。第三方运行时及其许可见 `THIRD_PARTY.md`（便携包根目录和源码的 `portable/` 目录中）。
 
 ## 工具
 
@@ -112,9 +130,9 @@ codex mcp add cubism53-native-mcp --env "CUBISM53_EDITOR_HOME=$env:CUBISM53_EDIT
 
 - 编辑操作按文档 UID 执行。另存和导出要求工作区内的新路径。原生撤销也会纳入编辑器里的手工操作。
 - 批量渲染和运行包组装需要 `request_id`。`reimport_psd`、`export_runtime_model` 使用 `execution=job` 时遵守同样约定。用 `job_status` 查询。当前桥接会话内，相同请求 ID 和参数复用原作业。
-- 作业状态查询可以在编辑器线程忙碌时返回。同步编辑超时后，若响应表明操作已开始，请先读回文档或检查输出再决定是否重试。
-- PSD 重导入先用 `plan_psd_reimport` 检查冲突。缺失的旧图层在计划中报告，原对象保留。
-- `edit_batch` 先用 `mode=plan` 获取凭据，再提交同一组编辑与 `plan_id`。
+- 作业状态查询使用独立通道。普通请求满载时会返回可重试的忙碌错误。同步编辑超时后，若响应表明操作已开始，请先读回文档或检查输出再决定是否重试。
+- PSD 重导入先用 `plan_psd_reimport` 检查冲突。连续更新会自动选择唯一当前 PSD 来源。缺失的旧图层在计划中报告，原对象保留。
+- `edit_batch` 先用 `mode=plan` 获取凭据，再提交同一组编辑与 `plan_id`。部件移动按顺序预检，计划在相关文档状态改变后失效。
 - 5.3.03 的原生 SDK 导出会移除 ArtPath。`export_runtime_package` 会拦截使用可见 ArtPath 或将其用于裁剪的模型。`export_runtime_model` 会返回有关丢失的警告。
 
 ## 验证

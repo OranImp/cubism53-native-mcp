@@ -12,3 +12,4 @@ __pycache__/
 *.psd
 /.mcp.json
 /.env
+/dist/

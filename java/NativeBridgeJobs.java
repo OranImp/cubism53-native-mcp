@@ -13,6 +13,8 @@ final class NativeBridgeJobs {
     private static final Map<String, Job> jobs = new HashMap<>();
     private static final Map<String, Job> requests = new HashMap<>();
     private static final Map<String, Supplier<Map<String,Object>>> meshes = new HashMap<>();
+    private static final int MAX_PENDING = 16;
+    private static int pending;
     private static boolean closing;
 
     private static final class Job {
@@ -37,7 +39,6 @@ final class NativeBridgeJobs {
     }
 
     static synchronized Object submit(String operation, Map<String,Object> request, Callable<Object> work) {
-        checkOpen();
         String requestId = NativeBridge.nonblank(request.get("request_id"), "request_id");
         var arguments = new HashMap<>(request);
         arguments.remove("token");
@@ -47,16 +48,22 @@ final class NativeBridgeJobs {
                 throw new IllegalArgumentException("request_id already belongs to a different request");
             return existing.status;
         }
+        checkOpen();
+        if (pending >= MAX_PENDING) throw new IllegalStateException("Job queue is busy; retry the request");
         var job = new Job(requestId, operation, arguments);
+        pending++;
         jobs.put(job.id, job);
         requests.put(requestId, job);
         SwingUtilities.invokeLater(() -> {
             job.update("running", null, null);
             try { job.update("succeeded", work.call(), null); }
             catch (Exception | Error error) { job.update("failed", null, error.toString()); }
+            finally { complete(); }
         });
         return job.status;
     }
+
+    private static synchronized void complete() { pending--; }
 
     static synchronized void registerMesh(String id, Supplier<Map<String,Object>> info) {
         meshes.put(id, info);
@@ -80,7 +87,7 @@ final class NativeBridgeJobs {
 
     static synchronized void beginStop() {
         checkOpen();
-        if (jobs.values().stream().anyMatch(job -> Set.of("queued", "running").contains(job.status.get("state"))))
+        if (pending != 0)
             throw new IllegalStateException("A bridge job is queued or running");
         closing = true;
     }

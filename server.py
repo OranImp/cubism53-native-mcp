@@ -1,6 +1,5 @@
 """MCP for our version-specific, in-process Cubism 5.3.03 adapter."""
 from __future__ import annotations
-import asyncio
 from contextlib import asynccontextmanager
 import math
 from typing import Any, Literal
@@ -9,17 +8,24 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from bridge.client import call
 from bridge.connect import connect_editor
+from bridge.dispatch import RequestChannel
 from bridge.preview import CanvasPreview
 
 preview_client = None
+editor_requests = None
+status_requests = None
 
 
 @asynccontextmanager
 async def lifespan(_server):
-    global preview_client
+    global preview_client, editor_requests, status_requests
+    editor_requests = RequestChannel(8, 'cubism-editor')
+    status_requests = RequestChannel(2, 'cubism-job-status')
     try:
         yield {}
     finally:
+        editor_requests.close()
+        status_requests.close()
         if preview_client is not None:
             await preview_client.close()
             preview_client = None
@@ -128,7 +134,8 @@ class RuntimeExpression(ToolInput):
 
 
 async def native(operation, **arguments):
-    return await asyncio.to_thread(call, operation, **arguments)
+    channel = status_requests if operation == "job_status" else editor_requests
+    return await channel.run(call, operation, **arguments)
 
 @mcp.tool()
 async def cubism_native_connect() -> dict[str,Any]:
@@ -137,7 +144,7 @@ async def cubism_native_connect() -> dict[str,Any]:
     Builds and attaches this workspace's adapter without screen input. Does not
     start or close the editor, open documents, or change project data.
     """
-    return await asyncio.to_thread(connect_editor)
+    return await editor_requests.run(connect_editor)
 
 @mcp.tool()
 async def cubism_native_status() -> dict[str,Any]:

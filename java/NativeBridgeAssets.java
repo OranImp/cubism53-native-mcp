@@ -196,14 +196,23 @@ final class NativeBridgeAssets {
         }
     }
 
+    private record IndexedMesh(int index, String guid) {}
+
     private static List<Object> layerMaterials(CModelSource source, CLayeredImage raw) {
+        var byMaterial = new HashMap<com.live2d.type.CModelImageGuid,List<IndexedMesh>>();
+        int index = 0;
+        for (var mesh : source.getAllArtMeshes()) {
+            var input = mesh.getTextureInputExtension().getModelImageInput();
+            if (input != null)
+                byMaterial.computeIfAbsent(input.getModelImageGuid(), key -> new ArrayList<>())
+                    .add(new IndexedMesh(index, mesh.getGuid().getUuidString()));
+            index++;
+        }
         var result = new ArrayList<Object>();
         for (var row : layers(raw)) {
             var materials = source.getTextureManager().getHandler().a(row.layer);
-            var meshes = source.getAllArtMeshes().stream().filter(mesh -> {
-                var input = mesh.getTextureInputExtension().getModelImageInput();
-                return input != null && materials.contains(input.getModelImageGuid());
-            }).map(mesh -> mesh.getGuid().getUuidString()).toList();
+            var meshes = materials.stream().flatMap(guid -> byMaterial.getOrDefault(guid, List.of()).stream())
+                .sorted(Comparator.comparingInt(IndexedMesh::index)).map(IndexedMesh::guid).toList();
             result.add(map("layer", row.info(), "material_guids", materials.stream().map(guid -> guid.getUuidString()).sorted().toList(),
                 "art_mesh_guids", meshes));
         }
@@ -214,28 +223,45 @@ final class NativeBridgeAssets {
         Object info() { return map("existing", oldLayer.info(), "incoming", incoming.info()); }
     }
 
-    private record ReimportPlan(String id, CLayeredImage previous, CLayeredImage incoming, List<Match> matches,
+    private record ReimportPlan(String id, LayeredImageWrapper previous, CLayeredImage incoming, List<Match> matches,
             List<LayerRow> added, List<LayerRow> missing, List<Object> conflicts) {
         Map<String,Object> info() {
-            return map("plan_id", id, "source_psd_guid", previous.getGuid().getUuidString(),
+            return map("plan_id", id, "source_psd_guid", previous.getImage().getGuid().getUuidString(),
                 "updates", matches.stream().map(Match::info).toList(), "additions", added.stream().map(LayerRow::info).toList(),
                 "missing", missing.stream().map(LayerRow::info).toList(), "conflicts", conflicts);
         }
     }
 
-    private static CLayeredImage sourcePsd(CModelSource source, Object guid) {
-        var images = source.getTextureManager().getRawImages();
+    private static LayeredImageWrapper sourcePsd(CModelSource source, Object guid) {
+        var manager = source.getTextureManager();
+        var images = manager.getRawImages();
         if (guid instanceof String id) {
-            return images.stream().map(LayeredImageWrapper::getImage)
-                .filter(raw -> id.equals(raw.getGuid().getUuidString())).findFirst()
+            return images.stream().filter(raw -> id.equals(raw.getImage().getGuid().getUuidString())).findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("Source PSD GUID not found: " + id));
         }
-        var candidates = images.stream().filter(raw -> !raw.isReplaced()).map(LayeredImageWrapper::getImage).toList();
-        if (candidates.size() != 1) {
-            var descriptions = candidates.stream().map(raw -> raw.getName() + " (" + raw.getGuid().getUuidString() + ")").toList();
-            throw new IllegalArgumentException("Select source_psd_guid from " + descriptions);
+        var candidates = images.stream().filter(raw -> !raw.isReplaced()).toList();
+        if (candidates.size() == 1) return candidates.get(0);
+        var byGuid = new HashMap<com.live2d.type.CLayeredImageGuid,LayeredImageWrapper>();
+        for (var raw : candidates) byGuid.put(raw.getImage().getGuid(), raw);
+        var replaced = new HashSet<com.live2d.type.CLayeredImageGuid>();
+        for (var material : manager.getAllModelImages()) {
+            var env = material.getInputFilterEnv();
+            if (!env.getHasLayerInputData() || !env.getHasCurrentImageGuid()) continue;
+            var active = byGuid.get(env.getCurrentImageGuid());
+            if (active == null) continue;
+            var selectors = env.getLayerInputData().getImageToLayerInput();
+            if (!selectors.containsKey(active.getImage().getGuid())) continue;
+            for (var id : selectors.keySet()) {
+                var older = byGuid.get(id);
+                if (older != null && older.getImportedTimeMSec() < active.getImportedTimeMSec())
+                    replaced.add(id);
+            }
         }
-        return candidates.get(0);
+        var remaining = candidates.stream().filter(raw -> !replaced.contains(raw.getImage().getGuid())).toList();
+        if (remaining.size() == 1) return remaining.get(0);
+        var descriptions = remaining.stream().map(raw -> raw.getImage().getName() + " (" +
+            raw.getImage().getGuid().getUuidString() + ")").toList();
+        throw new IllegalArgumentException("Select source_psd_guid from " + descriptions);
     }
 
     private static ReimportPlan plan(CModelingDocument doc, Path path, Map<String,Object> request) throws Exception {
@@ -245,7 +271,7 @@ final class NativeBridgeAssets {
             stream.transferTo(java.io.OutputStream.nullOutputStream());
         }
         var incoming = readPsd(path);
-        var oldLayers = layers(previous);
+        var oldLayers = layers(previous.getImage());
         var newLayers = layers(incoming);
         var explicit = (Map<?,?>) request.get("layer_map");
         var matches = new ArrayList<Match>();
@@ -279,7 +305,7 @@ final class NativeBridgeAssets {
         var missing = oldLayers.stream().filter(row -> !used.contains(row)).toList();
         var model = doc.getModelSource();
         var snapshot = map("document", doc.getDocumentUID(), "undo", doc.getUndoManager().getCurrentPos(),
-            "source", previous.getGuid().getUuidString(), "layers", layerMaterials(model, previous),
+            "source", previous.getImage().getGuid().getUuidString(), "layers", layerMaterials(model, previous.getImage()),
             "matches", matches.stream().map(Match::info).toList());
         digest.update(org.json.simple.JSONValue.toJSONString(snapshot).getBytes(StandardCharsets.UTF_8));
         return new ReimportPlan(HexFormat.of().formatHex(digest.digest()), previous, incoming, matches, added, missing, conflicts);
@@ -293,7 +319,7 @@ final class NativeBridgeAssets {
         if (!plan.conflicts.isEmpty()) throw new IllegalArgumentException("Resolve PSD layer conflicts with explicit mappings first");
         var source = doc.getModelSource();
         var manager = source.getTextureManager();
-        var oldGuid = plan.previous.getGuid();
+        var oldGuid = plan.previous.getImage().getGuid();
         var newGuid = plan.incoming.getGuid();
         var replacements = new HashMap<com.live2d.type.CLayerGuid,CLayer>();
         for (var match : plan.matches) replacements.put(match.oldLayer.layer.getGuid(), match.incoming.layer);
@@ -302,6 +328,12 @@ final class NativeBridgeAssets {
         try {
             var wrapper = new LayeredImageWrapper(plan.incoming, System.currentTimeMillis(), path.toFile().lastModified(), false);
             undo.plusAssign(manager.getHandler().a(wrapper, 0));
+            boolean wasReplaced = plan.previous.isReplaced();
+            // The pinned build exposes a synthetic Kotlin setter to reflection.
+            var setReplaced = LayeredImageWrapper.class.getMethod("setReplaced", boolean.class);
+            undo.plusAssign(new LambdaUndo<>("Mark previous PSD revision", plan.previous,
+                edit -> markPsdRevision(setReplaced, plan.previous, true),
+                edit -> markPsdRevision(setReplaced, plan.previous, wasReplaced), null));
             for (var material : List.copyOf(manager.getAllModelImages())) {
                 var env = material.getInputFilterEnv();
                 if (!env.getHasLayerInputData()) continue;
@@ -341,6 +373,37 @@ final class NativeBridgeAssets {
         result.put("updated_material_guids", changed);
         result.put("layers", layerMaterials(source, plan.incoming));
         return result;
+    }
+
+    private static Unit markPsdRevision(java.lang.reflect.Method setter, LayeredImageWrapper image, boolean replaced) {
+        try {
+            setter.invoke(image, replaced);
+            return Unit.INSTANCE;
+        } catch (ReflectiveOperationException error) {
+            throw new IllegalStateException("Could not update the PSD revision marker", error);
+        }
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    static boolean saveModel(CModelingDocument doc, Path path) throws Exception {
+        var source = doc.getModelSource();
+        if (source.getTextureManager().getHandler().b().isEmpty())
+            return doc.saveDocument(path.toFile(), false);
+        // The stock command asks whether to delete unused PSD sources. Keep
+        // them and call the same native save callback after the same edit check.
+        Class<?> checks = Class.forName("com.live2d.cubism.view.b.a");
+        Object validator = checks.getField("a").get(null);
+        String reason = (String) checks.getMethod("c").invoke(validator);
+        if ((boolean) checks.getMethod("a", CModelSource.class, String.class).invoke(validator, source, reason))
+            return false;
+        var constructor = Class.forName("com.live2d.cubism.doc.modeling.b")
+            .getDeclaredConstructor(CModelingDocument.class, java.io.File.class, boolean.class);
+        constructor.setAccessible(true);
+        var callback = (kotlin.jvm.functions.Function1) constructor.newInstance(doc, path.toFile(), false);
+        com.live2d.util.ak.a.b(callback);
+        doc.getCompletePack().updateProject();
+        doc.getCompletePack().repaintCanvas(com.live2d.cubism.CEUpdateManager.b.a);
+        return true;
     }
 
     static Object exportPhysics(CModelingDocument doc, Path workspace, Map<String,Object> request) throws Exception {

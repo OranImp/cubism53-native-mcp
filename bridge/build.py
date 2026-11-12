@@ -58,14 +58,20 @@ def jdk_bin() -> Path:
     raise FileNotFoundError('Set CUBISM53_JDK_HOME to a JDK 17 installation, or put JDK 17 on PATH')
 
 
-def build(home: Path, bin_path: Path) -> Path:
+def verify_editor(home: Path) -> str:
     libraries = home / 'app/lib'
     with (libraries / 'Live2D_Cubism.jar').open('rb') as stream:
         editor_digest = hashlib.file_digest(stream, 'sha256').hexdigest()
     if editor_digest != SUPPORTED_EDITOR_SHA256:
         raise RuntimeError(f'Unsupported Cubism editor JAR for the 5.3.03 adapter: {editor_digest}')
+    return editor_digest
+
+
+def build(home: Path, bin_path: Path) -> Path:
+    verify_editor(home)
+    libraries = home / 'app/lib'
     sources = sorted((ROOT / 'java').glob('*.java'))
-    manifest = 'Manifest-Version: 1.0\nAgent-Class: cubism53.mcp.BootstrapV2\n\n'
+    manifest = 'Manifest-Version: 1.0\nAgent-Class: cubism53.mcp.BootstrapV3\n\n'
     source_digest = hashlib.sha256(manifest.encode('ascii'))
     for source in sources:
         source_digest.update(source.name.encode('ascii') + b'\0' + source.read_bytes() + b'\0')

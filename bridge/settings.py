@@ -45,6 +45,12 @@ def editor_home() -> Path:
     raise FileNotFoundError('Set CUBISM53_EDITOR_HOME to the Cubism 5.3.03 installation directory')
 
 
+def windows_powershell() -> str:
+    system = Path(os.environ.get('SystemRoot', 'C:/Windows'))
+    executable = system / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    return str(executable) if executable.is_file() else 'powershell.exe'
+
+
 def write_text_atomic(path: Path, value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     stream = NamedTemporaryFile(dir=path.parent, encoding='utf8', mode='w', delete=False)

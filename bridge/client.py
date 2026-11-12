@@ -7,7 +7,7 @@ import socket
 from .settings import bridge_port, state_directory, workspace
 
 
-def call(operation: str, **arguments) -> dict:
+def call(operation: str, *, response_timeout: float = 55, **arguments) -> dict:
     path = state_directory() / 'config.json'
     try:
         config = json.loads(path.read_text(encoding='utf8'))
@@ -17,7 +17,7 @@ def call(operation: str, **arguments) -> dict:
         raise RuntimeError('Bridge state belongs to different settings. Choose a separate CUBISM53_BRIDGE_STATE.')
     request = {**arguments, 'operation': operation, 'token': config['token']}
     with socket.create_connection(('127.0.0.1', config['port']), timeout=5) as connection:
-        connection.settimeout(55)
+        connection.settimeout(response_timeout)
         connection.sendall(json.dumps(request, ensure_ascii=False, allow_nan=False).encode('utf8') + b'\n')
         with connection.makefile('rb') as response_file:
             line = response_file.readline()
