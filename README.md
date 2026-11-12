@@ -2,13 +2,37 @@
 
 在 Windows 上通过 MCP stdio 操作 Live2D Cubism Editor 5.3.03，共 75 个工具。桥接器在已运行的官方编辑器进程中调用原生建模、动画、物理、渲染和导出接口。两项临时画布预览工具使用 Cubism 官方本机 WebSocket API。
 
+## 下载
+
+- [Windows x64 便携包 ZIP](https://github.com/OranImp/cubism53-native-mcp/releases/latest/download/Cubism53-Native-MCP-win-x64.zip)
+- [SHA-256 校验文件](https://github.com/OranImp/cubism53-native-mcp/releases/latest/download/Cubism53-Native-MCP-win-x64.zip.sha256)
+- [版本记录和第三方源码](https://github.com/OranImp/cubism53-native-mcp/releases/latest)
+
+便携包内置 Python 和 Java Attach 运行时。另行安装官方 Cubism Editor 5.3.03 即可使用。在下载目录运行以下命令校验 ZIP。
+
+```powershell
+$archive = 'Cubism53-Native-MCP-win-x64.zip'
+$expected = ((Get-Content -LiteralPath "$archive.sha256" -Raw) -split '\s+')[0]
+if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ine $expected) {
+    throw '便携包 SHA-256 校验失败'
+}
+```
+
+### English quick start
+
+On Windows x64, install Live2D Cubism Editor 5.3.03, extract the portable ZIP,
+and run `Setup.cmd`. Choose the folder containing your models. Setup prints
+the location of the generated stdio configurations for CC Switch, DeepSeek
+Harness, Codex, Claude Code, and other MCP clients. Start the editor, then
+call `cubism_native_connect` and `cubism_native_status` from your client.
+
 ## 安装和连接
 
 ### Windows x64 便携包
 
 1. 安装并能启动官方 Cubism Editor **5.3.03**。核对安装目录下的 `app/lib/Live2D_Cubism.jar`，支持的 SHA-256 为 `bd0a23b9f21a56271d31e6f7f5aed0202661c4fe12444469d093bcdeb4cbf166`。
-2. 解压 `Cubism53-Native-MCP-win-x64.zip`，运行 `Setup.cmd`。程序查找已运行的编辑器、Windows 安装记录和常见安装目录。按提示确认模型工作区，必要时输入自定义的编辑器安装目录。
-3. 根据下表选用生成的配置文件。先启动 Cubism，再在客户端调用 `cubism_native_connect`。用 `cubism_native_status` 获取当前文档 UID。
+2. 将 ZIP 解压到准备长期保留的目录，运行 `Setup.cmd`。程序查找已运行的编辑器、Windows 安装记录和常见安装目录。按提示确认模型工作区，必要时输入自定义的编辑器安装目录。
+3. 从 Setup 显示的 `client-configs` 目录选用下表对应的文件。客户端已有 Cubism 条目时，更新该条目的启动命令和参数。启动 Cubism 后调用 `cubism_native_connect`，再用 `cubism_native_status` 获取当前文档 UID。
 
 便携包内有 CPython、MCP 依赖、预编译桥接 JAR 和 Java Attach 运行时。安装和启动可以离线完成。客户端与 Cubism 应运行在同一 Windows 用户会话。
 
@@ -35,7 +59,12 @@
 .\runtime\python\python.exe -B .\app\launcher.py doctor --profile-file "$env:LOCALAPPDATA/Cubism53MCP/profiles/default/settings.json"
 ```
 
-升级时先等待作业完成，再以相同命令将 `doctor` 换成 `stop`。从新版目录重新运行 Setup，导入生成的配置并重开客户端会话。
+#### 升级和故障排查
+
+- 升级前等作业完成。若旧桥接仍在运行，用旧包的诊断命令将 `doctor` 换成 `stop`。解压新版，在新版目录用同一 profile 运行 Setup，更新客户端条目并重开会话。
+- `Unsupported Cubism editor JAR` 表示选中的编辑器构建与桥接版本不符。重新运行 Setup，通过 `--editor-home` 指定受支持的 5.3.03 安装目录。
+- `Expected one running Cubism` 表示编辑器未启动或有多个匹配进程。启动对应版本，或者用 `CUBISM53_EDITOR_PID` 指定目标 Java 进程。
+- 端口已占用时，先用 `doctor` 确认该端口是否属于本 profile。并行使用多个 profile 时，为每个 profile 指定不同的 `--bridge-port`。
 
 ### 从源码安装
 
@@ -141,7 +170,7 @@ python portable/build.py --python-zip python-3.13.17-embed-amd64.zip --wheelhous
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-测试使用本机临时端口，验证 stdio 工具发现、结构化错误和官方预览协议的重新注册。实机冒烟测试可在空白的独立 Cubism Editor 会话运行。设置 `CUBISM53_EDITOR_PID`、`CUBISM53_WORKSPACE`、`CUBISM53_BRIDGE_STATE` 和专用 `CUBISM53_BRIDGE_PORT`，然后执行 `.\.venv\Scripts\python.exe tests/native_smoke.py`。测试只使用生成的临时图像和模型。
+测试使用本机临时端口，验证 stdio 工具发现、结构化错误和官方预览协议的重新注册。实机冒烟测试可在空白的独立 Cubism Editor 会话运行。设置 `CUBISM53_EDITOR_PID`、`CUBISM53_WORKSPACE`、`CUBISM53_BRIDGE_STATE` 和专用 `CUBISM53_BRIDGE_PORT`，然后执行 `.\.venv\Scripts\python.exe tests/native_smoke.py`。测试只使用生成的临时图像和模型。便携启动、批量编辑、PSD 重导入和 Glue 性能的覆盖范围见 [验证记录](https://github.com/OranImp/cubism53-native-mcp/blob/main/VALIDATION.md)。
 
 ## 许可证
 
