@@ -1,5 +1,18 @@
 # 验证记录
 
+## v0.2.1 修复回归
+
+同一份 Windows x64 ZIP 分别用于 Cubism 5.3.03 和 5.3.04 的独立编辑器进程、工作区、端口和 profile。便携客户端进程的 PATH 只含 Windows 系统目录。对照 v0.2.0 的 75 项工具定义，并用旧包实际启动同构建旧桥接，验证新版拒绝复用、旧包停止桥接及新版重新连接。
+
+| 检查 | 覆盖内容 |
+| --- | --- |
+| PSD | 生成多版 PSD，依次导入、移除并恢复图层。检验历史层映射、同名冲突、原 ArtMesh GUID 和网格数据、保存重开、撤销重做及代表像素。5.3.03 另检验旧模型的 PSD 来源推断。 |
+| 渲染 | 用原生编辑器命令执行撤销重做，验证同尺寸缓存失效和可见像素。1536 × 1536 单张与批量渲染逐像素比较，同姿态基准差分为零。验证缺失基准的失败作业清理临时文件。 |
+| 导出与作业 | 比较同步和后台 SDK 导出的 Model3 相对引用，检查路径冲突和 MOC3 文件头。Java 检查覆盖队列容量、请求去重、轮询、停止前排空和过期标记。 |
+| 预览 | 在隔离编辑器开启官方 WebSocket 集成，通过原生授权入口批准测试连接。验证两个 stdio 客户端共用同一端点授权、切换端口后独立登记，以及设置和清除预览参数。模拟测试覆盖两个客户端并发首次登记。 |
+
+Python stdio 和版本检查共 7 项通过。两版编辑器各执行一次 1536 × 1536 批量渲染期间的 `status` 探测，分别在 0.067 秒和 0.132 秒返回。便携验收在开发机隔离运行。独立 Windows 虚拟机和各客户端的交互导入未纳入本轮验收。
+
 ## v0.2.0 双版本包
 
 同一份 Windows x64 ZIP 在 Cubism 5.3.03 和 5.3.04 中分别通过隔离实机测试。Setup 按编辑器 JAR 的 SHA-256 选择适配器，连接状态报告对应的版本。两版均发现 75 项工具，名称和输入输出定义与基线相同，连接工具说明更新了适用版本。
@@ -35,7 +48,7 @@ java -cp .state/test-classes cubism53.mcp.GlueSearchCheck
 便携实机用例需要测试环境安装 Pillow 与 psd-tools。准备空白的独立测试环境并解压 ZIP，命令会启动一个专用编辑器进程。
 
 ```powershell
-python -B tests/portable_smoke.py --package 'C:/path/to/Cubism53-Native-MCP' --editor-home 'C:/path/to/Live2D Cubism 5.3'
+python -B tests/portable_smoke.py --package 'C:/path/to/Cubism53-Native-MCP' --editor-home 'C:/path/to/Live2D Cubism 5.3' --native-probe
 ```
 
-分别用两个受支持的 `--editor-home` 执行同一份便携包。可传入 `--baseline-server` 指向独立解出的 `2611ec9/server.py`，比较旧版工具定义。5.3.03 同时生成旧版 PSD 重导入样本。
+分别用两个受支持的 `--editor-home` 执行同一份便携包。`--native-probe` 使用测试机的 JDK 17 编译测试代理，并仅附加到该次用例启动的进程。传入 `--previous-package` 指向解出的 v0.2.0 便携包以重现升级，传入 `--baseline-server` 指向该包的 `app/server.py` 以比较工具定义。5.3.03 还可用 `--legacy-server` 指向独立解出的 `2611ec9/server.py`，生成旧版 PSD 重导入样本。

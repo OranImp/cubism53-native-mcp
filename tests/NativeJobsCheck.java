@@ -1,8 +1,10 @@
 package cubism53.mcp;
 
 import java.util.Map;
+import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import javax.swing.SwingUtilities;
 
 public final class NativeJobsCheck {
@@ -41,6 +43,28 @@ public final class NativeJobsCheck {
         NativeBridgeJobs.abortStop();
         submit("after-drain", 0);
         SwingUtilities.invokeAndWait(() -> {});
-        System.out.println("Native job capacity, replay, polling and drain verified");
+        for (int i = 0; i < 256; i++) {
+            submit("retention-" + i, i);
+            SwingUtilities.invokeAndWait(() -> {});
+        }
+        try {
+            submit("request-0", 1);
+            throw new AssertionError("An expired request was accepted");
+        } catch (IllegalArgumentException error) {
+            if (!error.getMessage().contains("expired")) throw error;
+        }
+        var clock = new AtomicLong();
+        var retention = new NativeBridgeJobs.Retention(clock::get);
+        var mesh = new NativeBridgeJobs.Key("mesh-job", null);
+        retention.complete(mesh);
+        clock.addAndGet(Duration.ofHours(23).toNanos());
+        if (!retention.prune().isEmpty()) throw new AssertionError("Job expired too early");
+        clock.addAndGet(Duration.ofHours(1).toNanos());
+        if (!retention.prune().contains(mesh) || !retention.expired("mesh-job", null))
+            throw new AssertionError("Automatic mesh history did not expire");
+        clock.addAndGet(Duration.ofDays(7).toNanos());
+        retention.prune();
+        if (retention.expired("mesh-job", null)) throw new AssertionError("Expiry marker was retained too long");
+        System.out.println("Native job capacity, replay, polling, drain and expiry verified");
     }
 }

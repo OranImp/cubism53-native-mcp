@@ -53,8 +53,7 @@ public final class NativeBridge {
     private static String token;
     // The stock one-image export recreates a GL context for every image. Reuse
     // two native offscreen sessions for the full-size QA and animation preview.
-    private static final LinkedHashMap<String,NativeRenderSession> renderSessions = new LinkedHashMap<>();
-    private static final Map<String,AutoMeshJob> autoMeshJobs = new HashMap<>();
+    private static final LinkedHashMap<String,CachedRender> renderSessions = new LinkedHashMap<>();
     private static AutoMeshJob activeAutoMesh;
     private static boolean batchPreflight;
     private static GroupUndo batchUndo;
@@ -124,12 +123,15 @@ public final class NativeBridge {
             Map<String,Object> request = (Map<String,Object>) JSONValue.parse(reader.readLine());
             if (request == null || !token.equals(request.get("token"))) throw new SecurityException("Unauthorized local client");
             String operation = nonblank(request.get("operation"), "operation");
-            if ("job_status".equals(operation)) {
+            if ("bridge_info".equals(operation)) {
+                reply(socket, map("ok", true, "result", bridgeIdentity()));
+            } else if ("job_status".equals(operation)) {
                 reply(socket, map("ok", true, "result", NativeBridgeJobs.status(request)));
             } else if (Set.of("render_pose_set", "export_runtime_package").contains(operation)
                     || "job".equals(request.get("execution")) && Set.of("reimport_psd", "export_runtime_model").contains(operation)) {
-                reply(socket, map("ok", true, "result",
-                    NativeBridgeJobs.submit(operation, request, () -> execute(operation, request))));
+                boolean background = !"reimport_psd".equals(operation);
+                reply(socket, map("ok", true, "result", NativeBridgeJobs.submit(operation, request, background,
+                    () -> background ? executeBackground(operation, request, 0) : execute(operation, request))));
             } else {
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(45);
                 try {
@@ -147,10 +149,19 @@ public final class NativeBridge {
                                             long deadline) {
         Map<String,Object> response;
         try {
-            Object result = "stop".equals(operation) ? stop(deadline) : onEditorThread(() -> {
-                NativeBridgeJobs.checkOpen();
-                return execute(operation, request);
-            }, deadline);
+            Object result;
+            if ("stop".equals(operation)) {
+                result = stop(deadline);
+            } else if ("export_runtime_model".equals(operation)) {
+                NativeBridgeJobs.beginWork();
+                try { result = executeBackground(operation, request, deadline); }
+                finally { NativeBridgeJobs.endWork(); }
+            } else {
+                result = onEditorThread(() -> {
+                    NativeBridgeJobs.checkOpen();
+                    return execute(operation, request);
+                }, deadline);
+            }
             response = map("ok", true, "result", result);
         } catch (Exception error) {
             response = errorResponse(error);
@@ -158,25 +169,38 @@ public final class NativeBridge {
         reply(socket, response);
     }
 
-    private static Object onEditorThread(Callable<Object> work, long deadline) throws Exception {
-        if (deadline - System.nanoTime() <= 0)
+    static <T> T onEditorThread(Callable<T> work, long deadline) throws Exception {
+        if (deadline != 0 && deadline - System.nanoTime() <= 0)
             throw new IllegalStateException("Editor operation timed out before it started");
         var started = new java.util.concurrent.atomic.AtomicBoolean();
-        FutureTask<Object> task = new FutureTask<>(() -> {
+        FutureTask<T> task = new FutureTask<>(() -> {
             if (!started.compareAndSet(false, true)) return null;
-            if (deadline - System.nanoTime() <= 0)
+            if (deadline != 0 && deadline - System.nanoTime() <= 0)
                 throw new IllegalStateException("Editor operation timed out before it started");
             return work.call();
         });
         SwingUtilities.invokeLater(task);
         try {
-            return task.get(deadline - System.nanoTime(), TimeUnit.NANOSECONDS);
+            return deadline == 0 ? task.get() : task.get(deadline - System.nanoTime(), TimeUnit.NANOSECONDS);
         } catch (TimeoutException error) {
             boolean wasQueued = started.compareAndSet(false, true);
             task.cancel(false);
             throw new IllegalStateException(wasQueued ? "Editor operation timed out before it started"
                 : "Editor operation timed out after starting; inspect state before retrying", error);
         }
+    }
+
+    private static Object executeBackground(String operation, Map<String,Object> request, long deadline) throws Exception {
+        Callable<CModelingDocument> document = () -> {
+            var doc = findDocument(CEAppCtrl.Companion.b(), (String) request.get("document_uid"));
+            if (activeAutoMesh != null && activeAutoMesh.documentUid.equals(doc.getDocumentUID()))
+                throw new IllegalStateException("Automatic mesh generation is running: " + activeAutoMesh.id);
+            return doc;
+        };
+        if ("render_pose_set".equals(operation)) return NativeBridgeRendering.renderSet(document, workspace, request);
+        var destination = NativeBridgeAssets.output(workspace, request.get("directory"), "");
+        var export = onEditorThread(() -> NativeBridgeAssets.prepareRuntime(document.call(), workspace, request), deadline);
+        return NativeBridgeAssets.writeRuntime(export, destination, deadline);
     }
 
     private static Object stop(long deadline) throws Exception {
@@ -188,6 +212,7 @@ public final class NativeBridge {
                 return null;
             }, deadline);
             listener.close();
+            NativeBridgeJobs.stopped();
         } catch (Exception error) {
             NativeBridgeJobs.abortStop();
             throw error;
@@ -198,6 +223,12 @@ public final class NativeBridge {
     private static Map<String,Object> errorResponse(Exception error) {
         Throwable cause = error instanceof ExecutionException ? error.getCause() : error;
         return map("ok", false, "error", cause.toString());
+    }
+
+    private static Map<String,Object> bridgeIdentity() {
+        return map("editor_version", NativeBridgeBuild.VERSION, "editor_sha256", NativeBridgeBuild.SHA256,
+            "editor_pid", ProcessHandle.current().pid(), "bridge_protocol", NativeBridgeBuild.PROTOCOL,
+            "adapter_build_id", NativeBridgeBuild.ID);
     }
 
     private static void reply(Socket socket, Map<String,Object> response) {
@@ -217,17 +248,19 @@ public final class NativeBridge {
                 "import_psd", "create_animation_scene").contains(op))
             throw new IllegalStateException("Automatic mesh generation is running: " + activeAutoMesh.id);
         if ("status".equals(op)) {
+            pruneRenderSessions(app);
             List<Object> documents = new ArrayList<>();
             for (IDocument doc : app.getAllDocs()) {
                 if (doc instanceof CModelingDocument modelDoc) documents.add(describe(modelDoc));
             }
             for (var scene : NativeBridgeAnimation.scenes(app)) documents.add(NativeBridgeAnimation.describe(scene));
             var current = app.getCurrentDoc();
-            return map("adapter", "internal-" + NativeBridgeBuild.VERSION + "-experimental",
-                "editor_version", NativeBridgeBuild.VERSION, "editor_sha256", NativeBridgeBuild.SHA256,
-                "editor_pid",ProcessHandle.current().pid(),"editor_thread", SwingUtilities.isEventDispatchThread(),
-                "documents", documents, "current_document_uid", current instanceof CModelingDocument d ? d.getDocumentUID()
-                    : current instanceof CSceneDocument d ? d.getDocumentUID() : null);
+            var status = bridgeIdentity();
+            status.putAll(map("adapter", "internal-" + NativeBridgeBuild.VERSION + "-experimental",
+                "editor_thread", SwingUtilities.isEventDispatchThread(), "documents", documents,
+                "current_document_uid", current instanceof CModelingDocument d ? d.getDocumentUID()
+                    : current instanceof CSceneDocument d ? d.getDocumentUID() : null));
+            return status;
         }
         if ("open_project".equals(op)) {
             String requestedPath = nonblank(request.get("path"), "path");
@@ -314,21 +347,13 @@ public final class NativeBridge {
             case "create_blend_shape": return NativeBridgeModel.createBlendShape(doc, request);
             case "replace_mesh_texture_resized": return NativeBridgeAssets.replaceResized(doc, workspace, request);
             case "edit_batch": return editBatch(doc, request);
-            case "render_pose_set": return NativeBridgeRendering.renderSet(doc, workspace, request);
             case "fit_warp_to_children": return fitWarp(doc, request);
             case "plan_psd_reimport", "reimport_psd": return NativeBridgeAssets.reimportPsd(doc, workspace, request, op);
             case "edit_texture_atlas": return NativeBridgeAssets.editAtlas(doc, request);
             case "export_physics3": return NativeBridgeAssets.exportPhysics(doc, workspace, request);
-            case "export_runtime_model", "export_runtime_package": return NativeBridgeAssets.exportRuntime(doc, workspace, request);
             case "preflight_runtime_export": return NativeBridgeAssets.preflightRuntime(doc, workspace, request);
             case "auto_generate_mesh": return startAutoMesh(doc, request);
-            case "auto_mesh_status": {
-                var job = autoMeshJobs.get(doc.getDocumentUID());
-                String id = (String) request.get("job_id");
-                if (job == null || (id != null && !id.equals(job.id)))
-                    throw new IllegalArgumentException("Automatic mesh job not found in this document");
-                return job.info();
-            }
+            case "auto_mesh_status": return NativeBridgeJobs.meshStatus(doc.getDocumentUID(), (String) request.get("job_id"));
             case "list_glues": return map("glues", glues(source).stream().map(NativeBridge::glueInfo).toList());
             case "create_glue": return createGlue(doc, request);
             case "update_glue_weights", "remove_glue_pairs", "set_glue_intensity": return editGlue(doc, request, op);
@@ -614,15 +639,16 @@ public final class NativeBridge {
                 if (width < 1 || height < 1 || width > 8192 || height > 8192) throw new IllegalArgumentException("Image size out of range");
                 Map<?,?> values = (Map<?,?>)request.getOrDefault("parameters",Map.of());
                 var pose = pose(source, (String) request.get("base_pose"), values);
+                pruneRenderSessions(app);
                 String key=doc.getDocumentUID()+":"+width+"x"+height;
                 boolean reused=renderSessions.containsKey(key);
                 if (!reused) {
                     while (renderSessions.size()>=2) {
                         String first=renderSessions.keySet().iterator().next();renderSessions.remove(first).close();
                     }
-                    renderSessions.put(key,new NativeRenderSession(doc.getDocumentUID(),source,width,height,pose));
+                    renderSessions.put(key,new CachedRender(doc, new NativeRenderSession(doc.getDocumentUID(),source,width,height,pose)));
                 }
-                var renderer=renderSessions.get(key);
+                var renderer=renderSessions.get(key).renderer;
                 var image = renderer.render(pose);
                 if (image == null) throw new IllegalStateException("Cubism offscreen renderer returned no image");
                 try { Files.createDirectories(path.getParent()); image.writeImage(path.toFile()); }
@@ -817,7 +843,7 @@ public final class NativeBridge {
             case "close_saved":
                 if (doc.isModifiedAfterSaving()) throw new IllegalStateException("Save or undo changes before closing");
                 closeRenderSessions(doc.getDocumentUID());
-                autoMeshJobs.remove(doc.getDocumentUID());
+                NativeBridgeJobs.closeDocument(doc.getDocumentUID());
                 app.command_close(doc); return map("close_requested", true);
             default: throw new IllegalArgumentException("Unsupported operation: " + op);
         }
@@ -1221,8 +1247,7 @@ public final class NativeBridge {
 
         var job = new AutoMeshJob(doc, mesh);
         activeAutoMesh = job;
-        autoMeshJobs.put(job.documentUid, job);
-        NativeBridgeJobs.registerMesh(job.id, job::info);
+        NativeBridgeJobs.registerMesh(job.documentUid, job.id, job::info);
         SwingUtilities.invokeLater(() -> runAutoMesh(doc, mesh, extension, job));
         return job.info();
     }
@@ -1322,15 +1347,18 @@ public final class NativeBridge {
                 refresh(doc);
                 state = "succeeded";
                 activeAutoMesh = null;
+                NativeBridgeJobs.completeMesh(id);
             } catch (RuntimeException error) {
                 fail(error.toString());
             }
         }
 
         void fail(String message) {
+            if ("failed".equals(state) || "succeeded".equals(state)) return;
             error = message;
             state = "failed";
             if (activeAutoMesh == this) activeAutoMesh = null;
+            NativeBridgeJobs.completeMesh(id);
         }
     }
 
@@ -1941,12 +1969,51 @@ public final class NativeBridge {
         }
     }
 
+    private static final class CachedRender implements AutoCloseable {
+        final CModelingDocument document;
+        final NativeRenderSession renderer;
+        final long modified;
+        final com.live2d.undo.CUndoManager undo;
+        final com.live2d.undo.j listener = event -> invalid = true;
+        volatile boolean invalid;
+
+        CachedRender(CModelingDocument document, NativeRenderSession renderer) {
+            this.document = document;
+            this.renderer = renderer;
+            modified = document.getLastModifiedTime();
+            undo = document.getUndoManager();
+            undo.addUndoStateChangeListener(listener);
+        }
+
+        boolean valid(CEAppCtrl app) {
+            return !invalid && app.getAllModelDocs().contains(document)
+                && document.getCurrentEditMode() == document.getEditMode_modeling()
+                && document.getLastModifiedTime() == modified && document.getUndoManager() == undo;
+        }
+
+        public void close() {
+            try { undo.removeUndoStateChangeListener(listener); }
+            finally { renderer.close(); }
+        }
+    }
+
+    private static void pruneRenderSessions(CEAppCtrl app) {
+        var sessions = renderSessions.values().iterator();
+        while (sessions.hasNext()) {
+            var session = sessions.next();
+            if (!session.valid(app)) {
+                sessions.remove();
+                session.close();
+            }
+        }
+    }
+
     private static void closeRenderSessions(String documentUid) {
         var entries=renderSessions.entrySet().iterator();
         while (entries.hasNext()) {
             var entry=entries.next();
-            if (documentUid==null || documentUid.equals(entry.getValue().documentUid)) {
-                NativeRenderSession session=entry.getValue();entries.remove();session.close();
+            if (documentUid==null || documentUid.equals(entry.getValue().renderer.documentUid)) {
+                var session=entry.getValue();entries.remove();session.close();
             }
         }
     }

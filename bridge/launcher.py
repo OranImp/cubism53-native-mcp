@@ -12,7 +12,7 @@ import subprocess
 import sys
 import winreg
 
-from bridge.connect import editor_pid, portable_runtime, requested_pid
+from bridge.connect import bridge_identity, editor_pid, portable_runtime, requested_pid
 from bridge.editor_versions import SUPPORTED_VERSIONS, verify_editor
 from bridge.settings import ROOT, windows_powershell, write_json, write_text_atomic
 
@@ -23,14 +23,16 @@ PROFILE_ID = re.compile(r'[A-Za-z0-9_-]{1,40}')
 def editor_candidates():
     query = r"""Get-CimInstance Win32_Process -Filter "Name = 'java.exe' OR Name = 'javaw.exe'" |
         Where-Object { $_.CommandLine -match 'com\.live2d\.cubism\.CECubismEditorApp' } |
+        Sort-Object @{Expression = { "$($_.ProcessId)" -ne $env:CUBISM53_EDITOR_PID }}, ProcessId |
         ForEach-Object { $_.ExecutablePath }"""
     try:
         result = subprocess.run([windows_powershell(), '-NoProfile', '-Command',
             '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ' + query],
             capture_output=True, encoding='utf8', check=True, timeout=10)
         for path in result.stdout.splitlines():
-            if path.strip():
-                yield Path(path.strip()).parents[3]
+            java = Path(path.strip())
+            if len(java.parents) >= 4:
+                yield java.parents[3]
     except (OSError, subprocess.SubprocessError):
         pass
 
@@ -185,7 +187,7 @@ def doctor(profile):
               'portable_runtime': portable_runtime(build) is not None}
     try:
         report['editor_pid'] = editor_pid(home, requested_pid())
-    except RuntimeError as error:
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         report['editor'] = str(error)
     with socket.socket() as check:
         check.settimeout(1)
@@ -193,13 +195,14 @@ def doctor(profile):
     report['bridge_port'] = 'available'
     if occupied:
         try:
-            from bridge.client import call
-            status = call('status', response_timeout=3)
-            report['bridge_pid'] = status['editor_pid']
-            report['bridge_port'] = ('connected' if status.get('editor_sha256') == build.sha256
-                                     else 'different or older bridge')
-        except (OSError, ValueError, RuntimeError, KeyError):
-            report['bridge_port'] = 'occupied or bridge did not respond'
+            if 'editor_pid' not in report:
+                raise RuntimeError('Select the intended editor PID before verifying the occupied port')
+            status = bridge_identity(build, report['editor_pid'], timeout=3)
+            report.update(bridge_pid=status['editor_pid'], adapter_build_id=status['adapter_build_id'],
+                          bridge_protocol=status['bridge_protocol'], bridge_port='connected')
+        except (OSError, ValueError, RuntimeError, KeyError) as error:
+            report['bridge_port'] = 'occupied'
+            report['bridge_error'] = str(error)
     print(json.dumps(report, ensure_ascii=True))
     return 0 if report['workspace'] and report['bridge_port'] in ('available', 'connected') else 1
 

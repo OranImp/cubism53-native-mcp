@@ -15,7 +15,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bridge.build import build, build_lock, jdk_bin
+from bridge.build import adapter_sources, build, build_lock, jdk_bin
 from bridge.editor_versions import BUILDS, verify_editor
 
 PYTHON_VERSION = '3.13.17'
@@ -90,7 +90,8 @@ def build_package(options):
             for editor, home in editors.values():
                 agent = build(home, jdk, editor)
                 shutil.copyfile(agent, app / 'adapters' / f'{editor.version}.jar')
-                adapters[editor.sha256] = {'version': editor.version, 'sha256': digest(agent)}
+                adapters[editor.sha256] = {'version': editor.version, 'sha256': digest(agent),
+                                          'build_id': adapter_sources(editor)[1]}
         (app / 'portable.json').write_text(json.dumps({'adapters': adapters,
             'python_version': PYTHON_VERSION, 'java_version': JAVA_VERSION}, indent=2), encoding='utf8')
         for path in (ROOT / 'bridge').glob('*.py'):

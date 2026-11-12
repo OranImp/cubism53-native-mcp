@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import uuid
 
@@ -19,7 +20,7 @@ class CubismAPIError(RuntimeError):
 class CanvasPreview:
     def __init__(self):
         self.port = port_from_env('CUBISM53_PORT', 22033)
-        self.token_path = state_directory() / 'preview-token.txt'
+        self.token_path = state_directory() / f'preview-{self.port}-token.txt'
         self.socket = None
         self.reader = None
         self.pending = {}
@@ -66,13 +67,37 @@ class CanvasPreview:
             self.socket = await connect(f'ws://127.0.0.1:{self.port}', proxy=None, open_timeout=5)
             self.reader = asyncio.create_task(self._receive(self.socket))
             try:
-                token = self.token_path.read_text(encoding='utf8').strip() if self.token_path.exists() else ''
-                response = await self.rpc('RegisterPlugin', {'Token': token, 'Name': PLUGIN_NAME})
-                if response.get('Token'):
-                    write_text_atomic(self.token_path, response['Token'])
+                async with self.registration_lock():
+                    token = self.token_path.read_text(encoding='utf8').strip() if self.token_path.exists() else ''
+                    response = await self.rpc('RegisterPlugin', {'Token': token, 'Name': PLUGIN_NAME})
+                    if response.get('Token'):
+                        write_text_atomic(self.token_path, response['Token'])
             except BaseException:
                 await self._close()
                 raise
+
+    @asynccontextmanager
+    async def registration_lock(self):
+        import msvcrt
+
+        self.token_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.token_path.with_suffix('.lock').open('a+b') as stream:
+            try:
+                async with asyncio.timeout(20):
+                    while True:
+                        stream.seek(0)
+                        try:
+                            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                            break
+                        except OSError:
+                            await asyncio.sleep(0.1)
+            except TimeoutError as error:
+                raise RuntimeError('Timed out waiting for another preview registration') from error
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
 
     async def ready(self):
         await self.connect()

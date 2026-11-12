@@ -4,7 +4,8 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from bridge.connect import portable_runtime
+from bridge.build import PROTOCOL_VERSION
+from bridge.connect import bridge_identity, portable_runtime
 from bridge.editor_versions import BUILDS, file_digest, verify_editor
 
 
@@ -29,7 +30,7 @@ class EditorVersionsTest(unittest.TestCase):
             for build in BUILDS:
                 agent = app / 'adapters' / f'{build.version}.jar'
                 agent.write_bytes(build.version.encode('ascii'))
-                adapters[build.sha256] = {'version': build.version, 'sha256': file_digest(agent)}
+                adapters[build.sha256] = {'version': build.version, 'sha256': file_digest(agent), 'build_id': build.sha256}
             (app / 'portable.json').write_text(json.dumps({'adapters': adapters}), encoding='utf8')
             with patch('bridge.connect.ROOT', app):
                 for build in BUILDS:
@@ -39,3 +40,20 @@ class EditorVersionsTest(unittest.TestCase):
                 agent.write_bytes(b'unexpected adapter bytes')
                 with self.assertRaisesRegex(RuntimeError, 'JAR checksum mismatch'):
                     portable_runtime(build)
+
+    def test_bridge_identity_requires_pid_protocol_and_adapter(self):
+        editor = BUILDS[0]
+        status = {'editor_pid': 42, 'editor_sha256': editor.sha256, 'bridge_protocol': PROTOCOL_VERSION,
+                  'adapter_build_id': 'verified-id'}
+        with patch('bridge.connect.packaged_adapter', return_value={'build_id': 'verified-id'}), \
+                patch('bridge.connect.call', return_value=status) as client:
+            self.assertEqual(bridge_identity(editor, 42), status)
+            with self.assertRaisesRegex(RuntimeError, 'expected 43'):
+                bridge_identity(editor, 43)
+            for mismatch in ({'bridge_protocol': 1}, {'adapter_build_id': 'old'}):
+                client.return_value = {**status, **mismatch}
+                with self.assertRaisesRegex(RuntimeError, 'adapter build differs'):
+                    bridge_identity(editor, 42)
+            client.side_effect = RuntimeError('Explicit document_uid required')
+            with self.assertRaisesRegex(RuntimeError, 'Older bridge is running'):
+                bridge_identity(editor, 42)

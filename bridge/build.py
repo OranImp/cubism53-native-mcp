@@ -17,6 +17,9 @@ import time
 from .editor_versions import EditorBuild, verify_editor
 from .settings import ROOT, editor_home, state_directory
 
+PROTOCOL_VERSION = 2
+MANIFEST = 'Manifest-Version: 1.0\nAgent-Class: cubism53.mcp.BootstrapV3\n\n'
+
 
 @contextmanager
 def build_lock():
@@ -57,24 +60,30 @@ def jdk_bin() -> Path:
     raise FileNotFoundError('Set CUBISM53_JDK_HOME to a JDK 17 installation, or put JDK 17 on PATH')
 
 
-def build(home: Path, bin_path: Path, editor: EditorBuild | None = None) -> Path:
-    editor = editor or verify_editor(home)
-    libraries = home / 'app/lib'
+def adapter_sources(editor: EditorBuild) -> tuple[dict[str, str], str]:
     sources = {path.name: editor.adapt_source(path.name, path.read_text(encoding='utf8'))
                for path in sorted((ROOT / 'java').glob('*.java'))}
-    sources['NativeBridgeBuild.java'] = (
+    metadata = (
         'package cubism53.mcp;\n'
         'final class NativeBridgeBuild {\n'
         f'    static final String VERSION = "{editor.version}";\n'
         f'    static final String SHA256 = "{editor.sha256}";\n'
-        '}\n'
+        f'    static final int PROTOCOL = {PROTOCOL_VERSION};\n'
     )
-    manifest = 'Manifest-Version: 1.0\nAgent-Class: cubism53.mcp.BootstrapV3\n\n'
-    source_digest = hashlib.sha256(manifest.encode('ascii'))
+    source_digest = hashlib.sha256((MANIFEST + metadata).encode('ascii'))
     for name, source in sources.items():
         source_digest.update(name.encode('ascii') + b'\0' + source.encode('utf8') + b'\0')
+    identity = source_digest.hexdigest()
+    sources['NativeBridgeBuild.java'] = metadata + f'    static final String ID = "{identity}";\n}}\n'
+    return sources, identity
+
+
+def build(home: Path, bin_path: Path, editor: EditorBuild | None = None) -> Path:
+    editor = editor or verify_editor(home)
+    libraries = home / 'app/lib'
+    sources, identity = adapter_sources(editor)
     state = state_directory()
-    agent = state / f'cubism53-mcp-{editor.version}-{source_digest.hexdigest()[:16]}.jar'
+    agent = state / f'cubism53-mcp-{editor.version}-{identity[:16]}.jar'
     if agent.is_file():
         return agent
     with TemporaryDirectory(prefix='build-', dir=state) as temporary:
@@ -88,7 +97,7 @@ def build(home: Path, bin_path: Path, editor: EditorBuild | None = None) -> Path
                         '-classpath', classpath, '-d', str(classes), *[str(folder / name) for name in sources]],
                        check=True, stdout=sys.stderr, timeout=60)
         manifest_path = folder / 'MANIFEST.MF'
-        manifest_path.write_text(manifest, encoding='ascii', newline='\n')
+        manifest_path.write_text(MANIFEST, encoding='ascii', newline='\n')
         package = folder / agent.name
         subprocess.run([str(bin_path / 'jar.exe'), '--create', '--file', str(package),
                         '--manifest', str(manifest_path), '-C', str(classes), '.'],

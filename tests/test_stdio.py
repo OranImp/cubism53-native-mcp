@@ -145,7 +145,37 @@ class StdioTest(unittest.IsolatedAsyncioTestCase):
                                                      {'document_uid': 'doc-1'})
                     self.assertEqual(cleared.structuredContent['result'], {'ModelUID': 'model-1'})
                 self.assertEqual(methods.count('RegisterPlugin'), 2)
-                self.assertEqual((Path(directory) / 'preview-token.txt').read_text(), 'new-preview-token')
+                self.assertEqual((Path(directory) / f'preview-{port}-token.txt').read_text(), 'new-preview-token')
+
+    async def test_concurrent_clients_share_token_only_for_the_same_port(self):
+        calls = {'a': [], 'b': []}
+
+        def server(endpoint):
+            async def handler(socket):
+                async for raw in socket:
+                    request = json.loads(raw)
+                    method = request['Method']
+                    if method == 'RegisterPlugin':
+                        calls[endpoint].append(request['Data']['Token'])
+                        await asyncio.sleep(0.15)
+                    response = {'RegisterPlugin': {'Token': f'token-{endpoint}'},
+                                'GetIsApproval': {'Result': True}, 'GetDocument': {'ModelUID': 'model'}}.get(method, {})
+                    await socket.send(json.dumps({'Type': 'Response', 'RequestId': request['RequestId'], 'Data': response}))
+            return handler
+
+        async with serve(server('a'), '127.0.0.1', 0) as a, serve(server('b'), '127.0.0.1', 0) as b:
+            with TemporaryDirectory() as directory:
+                async def preview(endpoint):
+                    port = endpoint.sockets[0].getsockname()[1]
+                    options = StdioServerParameters(command=sys.executable, args=[str(ROOT / 'server.py')],
+                        env={'CUBISM53_BRIDGE_STATE': directory, 'CUBISM53_PORT': str(port)})
+                    async with stdio_client(options) as (reader, writer), ClientSession(reader, writer) as session:
+                        await session.initialize()
+                        result = await session.call_tool('cubism_native_clear_preview_parameters', {'document_uid': 'doc'})
+                        self.assertFalse(result.isError, result.content)
+
+                await asyncio.gather(preview(a), preview(a), preview(b))
+                self.assertEqual(calls, {'a': ['', 'token-a'], 'b': ['']})
 
 
 if __name__ == '__main__':

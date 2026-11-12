@@ -21,9 +21,10 @@ from psd_tools.api.layers import PixelLayer
 
 ROOT = Path(__file__).resolve().parents[1]
 
-def setup(portable, editor, root, env, port):
+def setup(portable, editor, root, env, port, preview_port):
     arguments = [portable / 'Setup.cmd', '--non-interactive', '--profile-root', root / '配置 profile',
-                 '--workspace', root / '模型 空间', '--editor-home', editor, '--bridge-port', port]
+                 '--workspace', root / '模型 空间', '--editor-home', editor, '--bridge-port', port,
+                 '--preview-port', preview_port]
     command = '& ' + ' '.join("'" + str(value).replace("'", "''") + "'" for value in arguments)
     command += '; exit $LASTEXITCODE'
     encoded = base64.b64encode(command.encode('utf-16le')).decode('ascii')
@@ -39,11 +40,12 @@ def setup(portable, editor, root, env, port):
     return report, spec
 
 def fixture(folder):
-    for i, color in enumerate(('red', 'green', 'blue'), 1):
+    for i, color in enumerate(('red', 'green', 'blue', 'blue'), 1):
         psd = PSDImage.new('RGBA', (256, 256), color=(0, 0, 0, 0))
         PixelLayer.frompil(Image.new('RGBA',(16,16),color), psd, name='Paint', left=80, top=80)
-        if i == 1:
-            PixelLayer.frompil(Image.new('RGBA',(16,16),'yellow'), psd, name='Old', left=120, top=80)
+        if i in (1, 4):
+            PixelLayer.frompil(Image.new('RGBA',(16,16),'yellow' if i == 1 else 'magenta'),
+                               psd, name='Old', left=120, top=80)
         psd.save(folder/f'revision-{i}.psd')
 
     for name, layers in [('unrelated.psd', ['Independent']), ('conflict.psd', ['Paint', 'Paint'])]:
@@ -118,7 +120,54 @@ async def seed_legacy(server, editor, root, editor_pid):
         return revisions
 
 
-async def exercise(spec, env, work, legacy, expected_version):
+def native_probe(portable, editor, root, pid, version):
+    source = ROOT / 'tests/NativeEditorProbe.java'
+    lib = editor / 'app/lib'
+    classes = root / 'probe-classes'
+    classes.mkdir()
+    manifest = root / 'probe.mf'
+    manifest.write_text('Manifest-Version: 1.0\nAgent-Class: cubism53.mcp.NativeEditorProbe\n\n', encoding='ascii')
+    probe = root / 'probe.jar'
+    subprocess.run(['javac', '--release', '17', '-cp', str(lib / '*'), '-d', str(classes), str(source)],
+                   check=True, timeout=20)
+    subprocess.run(['jar', '--create', '--file', str(probe), '--manifest', str(manifest), '-C', str(classes), '.'],
+                   check=True, timeout=15)
+    java = portable / 'runtime/java/bin/java.exe'
+    adapter = portable / 'app/adapters' / f'{version}.jar'
+
+    async def run(operation):
+        process = await asyncio.create_subprocess_exec(
+            str(java), '--add-modules', 'jdk.attach', '-cp', str(adapter), 'cubism53.mcp.Attach',
+            str(pid), str(probe), operation)
+        assert await asyncio.wait_for(process.wait(), 20) == 0
+
+    return run
+
+
+async def check_upgrade(previous, spec, env, profile):
+    python = previous / 'runtime/python/python.exe'
+    launcher = previous / 'app/launcher.py'
+    args = ['-B', str(launcher), 'serve', '--profile-file', profile]
+    session_env = {key: env[key] for key in ('PATH', 'LOCALAPPDATA', 'CUBISM53_EDITOR_PID')}
+    old = StdioServerParameters(command=str(python), args=args, env=session_env)
+    new = StdioServerParameters(command=spec['command'], args=spec['args'], env=session_env)
+    async with stdio_client(old) as (reader, writer), ClientSession(reader, writer) as client:
+        await client.initialize()
+        first = await client.call_tool('cubism_native_connect', {})
+        assert not first.isError, first.content
+    async with stdio_client(new) as (reader, writer), ClientSession(reader, writer) as client:
+        await client.initialize()
+        result = await client.call_tool('cubism_native_connect', {})
+        assert result.isError and 'Older bridge' in result.content[0].text, result.content
+    stopper = await asyncio.create_subprocess_exec(
+        str(python), '-B', str(launcher), 'stop', '--profile-file', profile,
+        env=env, stdout=asyncio.subprocess.PIPE)
+    out, _ = await asyncio.wait_for(stopper.communicate(), 20)
+    assert stopper.returncode == 0 and json.loads(out)['stopped']
+    print('OLD_BRIDGE_REJECTED_AND_STOPPED_FOR_UPGRADE', flush=True)
+
+
+async def exercise(spec, env, work, legacy, expected_version, probe=None, preview_port=None):
     config = StdioServerParameters(command=spec['command'], args=spec['args'], env={
         'PATH':env['PATH'], 'LOCALAPPDATA':env['LOCALAPPDATA'], 'CUBISM53_EDITOR_PID':env['CUBISM53_EDITOR_PID'],
         'PYTHONDONTWRITEBYTECODE':'1',
@@ -139,6 +188,8 @@ async def exercise(spec, env, work, legacy, expected_version):
         first, second = await asyncio.gather(invoke('connect'), invoke('connect'))
         assert first['editor_thread'] and second['editor_thread'] and not first['documents']
         assert first['editor_version'] == second['editor_version'] == expected_version
+        assert first['bridge_protocol'] == 2 and first['adapter_build_id'] == second['adapter_build_id']
+        assert len(first['adapter_build_id']) == 64
         assert (await invoke('status'))['editor_version'] == expected_version
         assert sum(bool(item.get('already_connected')) for item in (first, second)) == 1
         async def reopen(path):
@@ -167,6 +218,20 @@ async def exercise(spec, env, work, legacy, expected_version):
         uid = doc['document_uid']
         async def current(op, **kwargs):
             return await invoke(op, document_uid=uid, **kwargs)
+
+        async def wait_job(job, request_id, *, reject=None):
+            for _ in range(200):
+                status = await invoke('job_status', request_id=request_id)
+                assert status['job_id'] == job['job_id']
+                if status['state'] == 'succeeded':
+                    assert reject is None, status
+                    return status['result']
+                if status['state'] == 'failed':
+                    if reject and reject in status['error']:
+                        return None
+                    raise AssertionError(status['error'])
+                await asyncio.sleep(.1)
+            raise AssertionError('Job did not finish')
 
         a = (await current('create_part', name='A'))['guid']
         b = (await current('create_part', name='B',parent_part_guid=a))['guid']
@@ -230,7 +295,101 @@ async def exercise(spec, env, work, legacy, expected_version):
         conflict = await current('plan_psd_reimport', path='conflict.psd')
         assert conflict['conflicts']
         await current('reimport_psd', path='conflict.psd', plan_id=conflict['plan_id'], reject='conflicts')
+        recovered = await current('plan_psd_reimport', path='revision-4.psd')
+        assert not (recovered['additions'] or recovered['conflicts']), recovered
+        old_match = next(row for row in recovered['updates'] if row['incoming']['path'][-1] == 'Old')
+        assert old_match['existing']['source_psd_guid'] == imported['source_psd_guid']
+        mapping = {old_match['incoming']['key']: old_match['existing']['key']}
+        recovered = await current('plan_psd_reimport', path='revision-4.psd', layer_map=mapping)
+        applied = await current('reimport_psd', path='revision-4.psd', plan_id=recovered['plan_id'], layer_map=mapping)
+        restored = next(row for row in applied['layers'] if row['layer']['path'][-1] == 'Old')
+        assert restored['art_mesh_guids'] == [guids['Old']], restored
+        assert await geometry() == after
+        await current('render_png', path='restored.png', width=256, height=256, base_pose='default')
+        assert pixels('restored.png')[(255,0,255,255)] > 0
+        await current('undo')
+        await current('render_png', path='restored-undo.png', width=256, height=256, base_pose='default')
+        assert pixels('restored-undo.png') == pixels('revision3.png')
+        await current('redo')
+        await current('render_png', path='restored-redo.png', width=256, height=256, base_pose='default')
+        assert pixels('restored-redo.png') == pixels('restored.png')
+        print('PSD_MISSING_LAYER_RESTORED_WITH_ORIGINAL_GUID', flush=True)
+
         paint, old = guids['Paint'], guids['Old']
+        cached = await current('render_png', path='cached.png', width=256, height=256, base_pose='default')
+        assert cached['renderer_reused']
+        await current('set_visibility', object_guid=old, visible=False)
+        refreshed = await current('render_png', path='hidden.png', width=256, height=256, base_pose='default')
+        assert not refreshed['renderer_reused'] and not pixels('hidden.png')[(255,0,255,255)]
+        if probe:
+            await probe('undo')
+            native_undo = await current('render_png', path='native-undo.png', width=256, height=256, base_pose='default')
+            assert not native_undo['renderer_reused'] and pixels('native-undo.png') == pixels('restored.png')
+            await probe('redo')
+            native_redo = await current('render_png', path='native-redo.png', width=256, height=256, base_pose='default')
+            assert not native_redo['renderer_reused'] and pixels('native-redo.png') == pixels('hidden.png')
+            await probe('undo')
+            print('EDITOR_NATIVE_UNDO_REDO_INVALIDATES_CACHE', flush=True)
+        else:
+            await current('undo')
+        await current('render_png', path='single-high.png', width=1536, height=1536, base_pose='default')
+        render = {'poses': [{'name': 'default', 'parameters': {}}, {'name': 'turned', 'parameters': {'ParamAngleZ': 5}}],
+                  'width': 1536, 'height': 1536}
+        job = await current('render_pose_set', directory='poses', request_id='pose-set', **render)
+        started = time.monotonic()
+        await asyncio.wait_for(invoke('status'), 5)
+        print(f'STATUS_DURING_RENDER_SECONDS={time.monotonic() - started:.3f}', flush=True)
+        rendered = await wait_job(job, 'pose-set')
+        with Image.open(work/'single-high.png') as single, Image.open(work/'poses/default.png') as batch:
+            assert single.convert('RGBA').tobytes() == batch.convert('RGBA').tobytes()
+        job = await current('render_pose_set', directory='poses-compare', request_id='pose-compare',
+                            baseline_manifest=rendered['manifest'], **render)
+        compared = await wait_job(job, 'pose-compare')
+        manifest = json.loads(Path(compared['manifest']).read_text(encoding='utf8'))
+        assert all(frame['difference']['changed_pixels'] == 0 for frame in manifest['frames'])
+        failed = await current('render_pose_set', directory='poses-failed', request_id='pose-failed',
+                               baseline_manifest='missing.json', **render)
+        await wait_job(failed, 'pose-failed', reject='NoSuchFileException')
+        assert not (work / 'poses-failed').exists() and not list(work.glob('.cubism-render-*'))
+        print('RENDER_CACHE_AND_BACKGROUND_PIXELS_OK', flush=True)
+
+        if probe:
+            await probe(f'preview={preview_port}')
+            await asyncio.sleep(.5)
+            await current('set_preview_parameters', parameters={'ParamAngleZ': 5}, reject='approve')
+            await probe('approve-preview')
+            assert (await current('set_preview_parameters', parameters={'ParamAngleZ': 5}))['applied']
+            async with stdio_client(config) as (reader, writer), ClientSession(reader, writer) as second:
+                await second.initialize()
+                applied = await second.call_tool('cubism_native_set_preview_parameters',
+                                                 {'document_uid': uid, 'parameters': {'ParamAngleZ': 6}})
+                assert not applied.isError and applied.structuredContent['applied'], applied.content
+                assert (await current('clear_preview_parameters'))['applied']
+            with socket.socket() as spare:
+                spare.bind(('127.0.0.1', 0))
+                second_port = spare.getsockname()[1]
+            await probe(f'preview={second_port}')
+            await asyncio.sleep(.5)
+            profile = Path(spec['args'][-1])
+            alternate = profile.with_name('preview-alternate.json')
+            settings = json.loads(profile.read_text(encoding='utf8'))
+            alternate.write_text(json.dumps({**settings, 'preview_port': second_port}), encoding='utf8')
+            alternate_config = StdioServerParameters(command=spec['command'],
+                args=[*spec['args'][:-1], str(alternate)], env=config.env)
+            async with stdio_client(alternate_config) as (reader, writer), ClientSession(reader, writer) as other_port:
+                await other_port.initialize()
+                params = {'document_uid': uid, 'parameters': {'ParamAngleZ': 8}}
+                pending = await other_port.call_tool('cubism_native_set_preview_parameters', params)
+                assert pending.isError and 'approve' in pending.content[0].text, pending.content
+                await probe('approve-preview')
+                applied = await other_port.call_tool('cubism_native_set_preview_parameters', params)
+                assert not applied.isError and applied.structuredContent['applied'], applied.content
+            first_token, second_token = (list((profile.parent / 'state').rglob(f'preview-{port}-token.txt'))
+                                         for port in (preview_port, second_port))
+            assert len(first_token) == len(second_token) == 1
+            assert first_token[0].read_bytes() != second_token[0].read_bytes()
+            print('EDITOR_PREVIEW_APPROVAL_AND_TWO_CLIENTS_OK', flush=True)
+
         evaluated = await current('evaluate', object_guids=[paint, old], base_pose='default')
         assert [obj['guid'] for obj in evaluated['objects']] == [paint, old]
         assert all(obj['canvas_positions'] for obj in evaluated['objects'])
@@ -257,6 +416,11 @@ async def exercise(spec, env, work, legacy, expected_version):
         references = json.loads(Path(runtime['model3']).read_text(encoding='utf8'))['FileReferences']
         assert (work / 'runtime' / references['Moc']).read_bytes().startswith(b'MOC3')
         assert all((work / 'runtime' / texture).is_file() for texture in references['Textures'])
+        job = await current('export_runtime_package', directory='runtime-job', name='probe', request_id='runtime-package')
+        package = await wait_job(job, 'runtime-package')
+        package_refs = json.loads(Path(package['model3']).read_text(encoding='utf8'))['FileReferences']
+        assert references == package_refs
+        await current('export_runtime_model', directory='runtime', name='probe', reject='FileAlreadyExistsException')
         await current('save_as_new',path='revision3.cmo3')
         scene = await invoke('create_animation_scene', model_document_uid=uid, name='Probe', fps=30, duration_frames=30)
         animation, track = scene['document_uid'], scene['model_track_guid']
@@ -284,6 +448,9 @@ def main():
     parser.add_argument('--package', type=Path, required=True)
     parser.add_argument('--editor-home', type=Path, required=True)
     parser.add_argument('--baseline-server', type=Path)
+    parser.add_argument('--legacy-server', type=Path)
+    parser.add_argument('--previous-package', type=Path, help='Exercise an upgrade with the previous portable package')
+    parser.add_argument('--native-probe', action='store_true', help='Test editor undo and preview via a dedicated test agent')
     options = parser.parse_args()
     portable = options.package.resolve(strict=True)
     editor = options.editor_home.resolve(strict=True)
@@ -298,11 +465,13 @@ def main():
         for name in ('JAVA_HOME','CUBISM53_JDK_HOME','PYTHONHOME','PYTHONPATH'):
             env.pop(name,None)
         env['HTTP_PROXY'] = env['HTTPS_PROXY'] = 'http://127.0.0.1:1'
-        with socket.socket() as spare:
+        with socket.socket() as spare, socket.socket() as preview:
             spare.bind(('127.0.0.1',0))
             port=spare.getsockname()[1]
-        report,spec=setup(portable, editor, root, env, port)
-        assert setup(portable, editor, root, env, port)==(report,spec)
+            preview.bind(('127.0.0.1',0))
+            preview_port=preview.getsockname()[1]
+        report,spec=setup(portable, editor, root, env, port, preview_port)
+        assert setup(portable, editor, root, env, port, preview_port)==(report,spec)
         expected = re.search(r'Cubism ver (5\.3\.\d+)',
                              (editor / 'CubismEditor5.bat').read_text(encoding='ascii', errors='ignore'))[1]
         assert report['editor_version'] == expected
@@ -331,10 +500,15 @@ def main():
             detected_profile = json.loads(Path(json.loads(detected)['profile']).read_text(encoding='utf8'))
             assert Path(detected_profile['editor_home']) == editor
             assert json.loads(detected)['editor_version'] == expected
+            if options.previous_package:
+                previous = options.previous_package.resolve(strict=True)
+                asyncio.run(asyncio.wait_for(check_upgrade(previous, spec, env, report['profile']), 70))
             baseline = options.baseline_server.resolve(strict=True) if options.baseline_server else None
-            legacy = (asyncio.run(asyncio.wait_for(seed_legacy(baseline, editor, root, process.pid), 90))
-                      if baseline and expected == '5.3.03' else {})
-            definitions = asyncio.run(asyncio.wait_for(exercise(spec, env, folder, legacy, expected), 120))
+            legacy = (asyncio.run(asyncio.wait_for(seed_legacy(
+                options.legacy_server.resolve(strict=True), editor, root, process.pid), 90))
+                      if options.legacy_server and expected == '5.3.03' else {})
+            probe = native_probe(portable, editor, root, process.pid, expected) if options.native_probe else None
+            definitions = asyncio.run(asyncio.wait_for(exercise(spec, env, folder, legacy, expected, probe, preview_port), 180))
             assert definitions == asyncio.run(schemas(ROOT / 'server.py'))
             if baseline:
                 previous = asyncio.run(schemas(baseline))

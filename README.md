@@ -69,9 +69,11 @@ call `cubism_native_connect` and `cubism_native_status` from your client.
 #### 升级和故障排查
 
 - 升级前等作业完成。若旧桥接仍在运行，用旧包的诊断命令将 `doctor` 换成 `stop`。解压新版，在新版目录用同一 profile 运行 Setup，更新客户端条目并重开会话。
+- `doctor` 会核对目标编辑器 PID、编辑器构建、桥接协议和适配器构建 ID。若提示旧桥接或适配器不匹配，先用旧包停止桥接，再用新版重连。
 - `Unsupported Cubism editor JAR` 表示选中的编辑器构建不在兼容表内。重新运行 Setup，通过 `--editor-home` 指定受支持的安装目录。
 - `Expected one running Cubism` 表示编辑器未启动或有多个匹配进程。启动对应版本，或者用 `CUBISM53_EDITOR_PID` 指定目标 Java 进程。
 - 端口已占用时，先用 `doctor` 确认该端口是否属于本 profile。并行使用多个 profile 时，为每个 profile 指定不同的 `--bridge-port`。
+- 从 v0.2.0 升级后，各预览端口首次使用时需在「外部应用程序集成」中批准 **Cubism53 Native MCP**。保持发起预览的客户端会话连接，批准后重试。同一个 profile 的同一预览端口会复用已登记的令牌。
 
 ### 从源码安装
 
@@ -165,9 +167,9 @@ python portable/build.py --python-zip python-3.13.17-embed-amd64.zip --wheelhous
 ## 调用约定
 
 - 编辑操作按文档 UID 执行。另存和导出要求工作区内的新路径。原生撤销也会纳入编辑器里的手工操作。
-- 批量渲染和运行包组装需要 `request_id`。`reimport_psd`、`export_runtime_model` 使用 `execution=job` 时遵守同样约定。用 `job_status` 查询。当前桥接会话内，相同请求 ID 和参数复用原作业。
+- 批量渲染和运行包组装需要 `request_id`。`reimport_psd`、`export_runtime_model` 使用 `execution=job` 时遵守同样约定。用 `job_status` 查询。桥接会话保留最近 256 条已完成作业，最长 24 小时。保留期内，相同请求 ID 和参数复用原作业。最近 4,096 条过期标记最多保留 7 天。记录过期后，先检查文档或产物，再为确实需要重新执行的作业生成新 ID。
 - 作业状态查询使用独立通道。普通请求满载时会返回可重试的忙碌错误。同步编辑超时后，若响应表明操作已开始，请先读回文档或检查输出再决定是否重试。
-- PSD 重导入先用 `plan_psd_reimport` 检查冲突。连续更新会自动选择唯一当前 PSD 来源。缺失的旧图层在计划中报告，原对象保留。
+- PSD 重导入先用 `plan_psd_reimport` 检查冲突。缺失层保留原对象。图层重新出现且可唯一匹配同一来源的历史层时，会更新原材质。发生冲突时，把候选的 `key` 填入 `layer_map` 并重新预检。历史候选键形如 `来源GUID:图层键`。需要明确创建新层时，映射值可用 `new`。
 - `edit_batch` 先用 `mode=plan` 获取凭据，再提交同一组编辑与 `plan_id`。部件移动按顺序预检，计划在相关文档状态改变后失效。
 - 5.3.03 的原生 SDK 导出会移除 ArtPath。`export_runtime_package` 会拦截使用可见 ArtPath 或将其用于裁剪的模型。`export_runtime_model` 会返回有关丢失的警告。
 

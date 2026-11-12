@@ -219,16 +219,25 @@ final class NativeBridgeAssets {
         return result;
     }
 
-    private record Match(LayerRow oldLayer, LayerRow incoming) {
+    private record HistoryLayer(String source, String key, LayerRow row) {
+        Map<String,Object> info() {
+            var result = row.info();
+            result.put("key", key);
+            result.put("source_psd_guid", source);
+            return result;
+        }
+    }
+
+    private record Match(HistoryLayer oldLayer, LayerRow incoming) {
         Object info() { return map("existing", oldLayer.info(), "incoming", incoming.info()); }
     }
 
     private record ReimportPlan(String id, LayeredImageWrapper previous, CLayeredImage incoming, List<Match> matches,
-            List<LayerRow> added, List<LayerRow> missing, List<Object> conflicts) {
+            List<LayerRow> added, List<HistoryLayer> missing, List<Object> conflicts) {
         Map<String,Object> info() {
             return map("plan_id", id, "source_psd_guid", previous.getImage().getGuid().getUuidString(),
                 "updates", matches.stream().map(Match::info).toList(), "additions", added.stream().map(LayerRow::info).toList(),
-                "missing", missing.stream().map(LayerRow::info).toList(), "conflicts", conflicts);
+                "missing", missing.stream().map(HistoryLayer::info).toList(), "conflicts", conflicts);
         }
     }
 
@@ -265,50 +274,109 @@ final class NativeBridgeAssets {
     }
 
     private static ReimportPlan plan(CModelingDocument doc, Path path, Map<String,Object> request) throws Exception {
-        var previous = sourcePsd(doc.getModelSource(), request.get("source_psd_guid"));
+        var model = doc.getModelSource();
+        var previous = sourcePsd(model, request.get("source_psd_guid"));
         var digest = MessageDigest.getInstance("SHA-256");
         try (var stream = new DigestInputStream(Files.newInputStream(path), digest)) {
             stream.transferTo(java.io.OutputStream.nullOutputStream());
         }
         var incoming = readPsd(path);
-        var oldLayers = layers(previous.getImage());
+        String current = previous.getImage().getGuid().getUuidString();
+        var activeLayerIds = new HashSet<com.live2d.type.CLayerGuid>();
+        var linkedSources = new HashMap<String,Set<String>>();
+        var materialSnapshot = new TreeMap<String,Object>();
+        var replacedSources = new HashSet<String>();
+        var oldLayers = new ArrayList<HistoryLayer>();
+        var manager = model.getTextureManager();
+        for (var material : manager.getAllModelImages()) {
+            var env = material.getInputFilterEnv();
+            if (!env.getHasLayerInputData() || !env.getHasCurrentImageGuid()) continue;
+            var selector = env.getLayerInputData();
+            var active = env.getCurrentImageGuid();
+            var inputs = selector.get(active);
+            if (inputs == null) continue;
+            var sources = selector.getImageToLayerInput().keySet().stream()
+                .map(id -> id.getUuidString()).sorted().toList();
+            for (String source : sources) linkedSources.computeIfAbsent(source, ignored -> new HashSet<>()).addAll(sources);
+            var layerIds = inputs.stream().map(input -> input.getLayer().getGuid()).toList();
+            activeLayerIds.addAll(layerIds);
+            materialSnapshot.put(material.getGuid().getUuidString(),
+                map("active", active.getUuidString(), "sources", sources,
+                    "layers", layerIds.stream().map(id -> id.getUuidString()).toList()));
+        }
+        var provenSources = new HashSet<String>();
+        var visit = new ArrayDeque<String>();
+        visit.add(current);
+        while (!visit.isEmpty()) {
+            String source = visit.removeFirst();
+            if (provenSources.add(source)) visit.addAll(linkedSources.getOrDefault(source, Set.of()));
+        }
+        for (var raw : manager.getRawImages()) {
+            String source = raw.getImage().getGuid().getUuidString();
+            if (raw.isReplaced()) replacedSources.add(source);
+            for (var row : layers(raw.getImage())) {
+                if (source.equals(current) || activeLayerIds.contains(row.layer.getGuid()))
+                    oldLayers.add(new HistoryLayer(source, source.equals(current) ? row.key : source + ":" + row.key, row));
+            }
+        }
+        var proven = oldLayers.stream().filter(layer -> provenSources.contains(layer.source)).toList();
+        var unproven = oldLayers.stream()
+            .filter(layer -> !provenSources.contains(layer.source) && replacedSources.contains(layer.source)).toList();
         var newLayers = layers(incoming);
         var explicit = (Map<?,?>) request.get("layer_map");
         var matches = new ArrayList<Match>();
         var added = new ArrayList<LayerRow>();
         var conflicts = new ArrayList<Object>();
-        var used = new HashSet<LayerRow>();
+        var used = new HashSet<HistoryLayer>();
         var explicitlyMatched = new HashSet<LayerRow>();
-        for (var entry : explicit.entrySet()) {
-            var newRow = newLayers.stream().filter(row -> row.key.equals(entry.getKey())).findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("Unknown incoming layer key: " + entry.getKey()));
-            var oldRow = oldLayers.stream().filter(row -> row.key.equals(entry.getValue())).findFirst()
-                .orElseThrow(() -> new IllegalArgumentException("Unknown existing layer key: " + entry.getValue()));
-            if (!used.add(oldRow)) throw new IllegalArgumentException("Two explicit mappings use the same existing layer");
+        for (Object key : explicit.keySet()) {
+            if (newLayers.stream().noneMatch(row -> row.key.equals(key)))
+                throw new IllegalArgumentException("Unknown incoming layer key: " + key);
+        }
+        for (var newRow : newLayers) {
+            if (!explicit.containsKey(newRow.key)) continue;
             explicitlyMatched.add(newRow);
-            matches.add(new Match(oldRow, newRow));
+            Object target = explicit.get(newRow.key);
+            if ("new".equals(target)) {
+                added.add(newRow);
+            } else {
+                var oldRow = oldLayers.stream().filter(layer -> layer.key.equals(target)
+                    || (layer.source + ":" + layer.row.key).equals(target)).findFirst()
+                    .orElseThrow(() -> new IllegalArgumentException("Unknown existing layer key: " + target));
+                if (!used.add(oldRow)) throw new IllegalArgumentException("Two explicit mappings use the same existing layer");
+                matches.add(new Match(oldRow, newRow));
+            }
         }
         for (var newRow : newLayers) {
             if (explicitlyMatched.contains(newRow)) continue;
-            List<LayerRow> candidates = List.of();
-            if (newRow.id() != null && !newRow.id().isBlank() && !newRow.id().equals("0"))
-                candidates = oldLayers.stream().filter(row -> newRow.id().equals(row.id())).toList();
-            if (candidates.isEmpty()) candidates = oldLayers.stream().filter(row -> row.path.equals(newRow.path)).toList();
+            var candidates = matchLayers(proven, newRow);
             if (candidates.isEmpty()) {
-                added.add(newRow);
+                var uncertain = matchLayers(unproven, newRow);
+                if (uncertain.isEmpty()) added.add(newRow);
+                else conflicts.add(map("incoming", newRow.info(), "reason", "unverified_psd_source",
+                    "existing_candidates", uncertain.stream().map(HistoryLayer::info).toList()));
             } else if (candidates.size() == 1 && used.add(candidates.get(0))) {
                 matches.add(new Match(candidates.get(0), newRow));
             } else {
-                conflicts.add(map("incoming", newRow.info(), "existing_candidates", candidates.stream().map(LayerRow::info).toList()));
+                conflicts.add(map("incoming", newRow.info(), "existing_candidates", candidates.stream().map(HistoryLayer::info).toList()));
             }
         }
-        var missing = oldLayers.stream().filter(row -> !used.contains(row)).toList();
-        var model = doc.getModelSource();
+        var missing = proven.stream().filter(row -> !used.contains(row)).toList();
         var snapshot = map("document", doc.getDocumentUID(), "undo", doc.getUndoManager().getCurrentPos(),
-            "source", previous.getImage().getGuid().getUuidString(), "layers", layerMaterials(model, previous.getImage()),
-            "matches", matches.stream().map(Match::info).toList());
+            "source", current, "materials", materialSnapshot, "layers", oldLayers.stream().map(HistoryLayer::info).toList(),
+            "matches", matches.stream().map(Match::info).toList(), "additions", added.stream().map(LayerRow::info).toList(),
+            "conflicts", conflicts);
         digest.update(org.json.simple.JSONValue.toJSONString(snapshot).getBytes(StandardCharsets.UTF_8));
         return new ReimportPlan(HexFormat.of().formatHex(digest.digest()), previous, incoming, matches, added, missing, conflicts);
+    }
+
+    private static List<HistoryLayer> matchLayers(List<HistoryLayer> layers, LayerRow incoming) {
+        String id = incoming.id();
+        if (id != null && !id.isBlank() && !"0".equals(id)) {
+            var sameId = layers.stream().filter(layer -> id.equals(layer.row.id())).toList();
+            if (!sameId.isEmpty()) return sameId;
+        }
+        return layers.stream().filter(layer -> layer.row.path.equals(incoming.path)).toList();
     }
 
     static Object reimportPsd(CModelingDocument doc, Path workspace, Map<String,Object> request, String op) throws Exception {
@@ -319,10 +387,9 @@ final class NativeBridgeAssets {
         if (!plan.conflicts.isEmpty()) throw new IllegalArgumentException("Resolve PSD layer conflicts with explicit mappings first");
         var source = doc.getModelSource();
         var manager = source.getTextureManager();
-        var oldGuid = plan.previous.getImage().getGuid();
         var newGuid = plan.incoming.getGuid();
         var replacements = new HashMap<com.live2d.type.CLayerGuid,CLayer>();
-        for (var match : plan.matches) replacements.put(match.oldLayer.layer.getGuid(), match.incoming.layer);
+        for (var match : plan.matches) replacements.put(match.oldLayer.row.layer.getGuid(), match.incoming.layer);
         var undo = new GroupUndo("Native bridge: reimport PSD");
         List<String> changed = new ArrayList<>();
         try {
@@ -336,16 +403,16 @@ final class NativeBridgeAssets {
                 edit -> markPsdRevision(setReplaced, plan.previous, wasReplaced), null));
             for (var material : List.copyOf(manager.getAllModelImages())) {
                 var env = material.getInputFilterEnv();
-                if (!env.getHasLayerInputData()) continue;
+                if (!env.getHasLayerInputData() || !env.getHasCurrentImageGuid()) continue;
                 var selector = env.getLayerInputData();
-                var oldInputs = selector.get(oldGuid);
+                var active = env.getCurrentImageGuid();
+                var oldInputs = selector.get(active);
                 if (oldInputs == null || oldInputs.stream().noneMatch(entry -> replacements.containsKey(entry.getLayer().getGuid())))
                     continue;
                 var inputs = oldInputs.stream().map(entry -> {
                     var replacement = replacements.get(entry.getLayer().getGuid());
                     return replacement == null ? entry : new CLayerInputData(replacement, new CAffine(entry.getAffine()), entry.getClippingOnTexturePx());
                 }).toList();
-                var active = env.getCurrentImageGuid();
                 undo.plusAssign(new LambdaUndo<>("Replace PSD layer selection", selector,
                     edit -> { selector.put(newGuid, inputs); env.setCurrentImageGuid(newGuid); material.reset(); return Unit.INSTANCE; },
                     edit -> { selector.remove(newGuid); env.setCurrentImageGuid(active); material.reset(); return Unit.INSTANCE; }, null));
@@ -421,8 +488,9 @@ final class NativeBridgeAssets {
             "source_group_count", settings.getSources().size(), "bytes", Files.size(path));
     }
 
-    static Object exportRuntime(CModelingDocument doc, Path workspace, Map<String,Object> request) throws Exception {
-        var destination = output(workspace, request.get("directory"), "");
+    record RuntimeExport(String name, String sdk, List<String> artPathWarnings, RuntimeAssets assets, List<?> files) {}
+
+    static RuntimeExport prepareRuntime(CModelingDocument doc, Path workspace, Map<String,Object> request) throws Exception {
         String name = request.get("name") == null ? doc.getModelSource().getName() : nonblank(request.get("name"), "name");
         if (name.isBlank() || name.matches(".*[\\\\/:*?\"<>|].*") || name.endsWith(".") || name.endsWith(" "))
             throw new IllegalArgumentException("Export name must be a valid file basename");
@@ -457,12 +525,17 @@ final class NativeBridgeAssets {
         packageFiles.setAccessible(true);
         var files = (List<?>) packageFiles.invoke(companion, name, source, result, options.getVersion().b(),
             options.getExportTextureScale(), assets.physics == null, true, false, true, true, false, true, standard);
+        return new RuntimeExport(name, sdk, artPathWarnings, assets, files);
+    }
 
+    static Object writeRuntime(RuntimeExport export, Path destination, long deadline) throws Exception {
+        String name = export.name;
+        var assets = export.assets;
         Files.createDirectories(destination.getParent());
         Path staging = Files.createTempDirectory(destination.getParent(), ".cubism-export-");
         var manifest = new ArrayList<Map<String,Object>>();
         try {
-            for (var entry : files) {
+            for (var entry : export.files) {
                 var pair = (kotlin.Pair<?,?>) entry;
                 Path file = staging.resolve((String) pair.getFirst()).normalize();
                 if (!file.startsWith(staging) || file.equals(staging))
@@ -502,11 +575,13 @@ final class NativeBridgeAssets {
                 for (var file : paths.filter(Files::isRegularFile).sorted().toList())
                     manifest.add(map("path", staging.relativize(file).toString().replace('\\', '/'), "bytes", Files.size(file)));
             }
+            if (deadline != 0 && deadline - System.nanoTime() <= 0)
+                throw new IOException("Export timed out before publishing. Retry with execution=job.");
             publishDirectory(staging, destination);
         } finally { removeStaging(staging); }
         var resultInfo = map("directory", destination.toString(), "model3", destination.resolve(name + ".model3.json").toString(),
-            "files", manifest, "sdk_version", sdk);
-        if (!artPathWarnings.isEmpty()) resultInfo.put("warnings", artPathWarnings);
+            "files", manifest, "sdk_version", export.sdk);
+        if (!export.artPathWarnings.isEmpty()) resultInfo.put("warnings", export.artPathWarnings);
         return resultInfo;
     }
 
