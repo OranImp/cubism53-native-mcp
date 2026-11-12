@@ -1,5 +1,13 @@
 # 验证记录
 
+## v0.2.0 双版本包
+
+同一份 Windows x64 ZIP 在 Cubism 5.3.03 和 5.3.04 中分别通过隔离实机测试。Setup 按编辑器 JAR 的 SHA-256 选择适配器，连接状态报告对应的版本。两版均发现 75 项工具，名称和输入输出定义与基线相同，连接工具说明更新了适用版本。
+
+两个构建均验证了批量编辑、撤销重做、PSD 连续重导入、模型保存重开、离屏渲染、求值、Glue 候选搜索、ArtMesh 网格提交、图集、物理、MOC3 和 Motion3 导出。5.3.03 另外复跑了旧版 PSD 来源推断及多来源歧义。实机用例在新的编辑器进程和临时工作区中运行。
+
+## v0.1.0 优化基线
+
 优化基线为 `2611ec9`，编辑器为官方 Cubism 5.3.03 固定构建。实机测试在单独的编辑器进程、端口、工作区和状态目录中运行，使用生成的 PNG、PSD 和 CMO3。
 
 | 检查 | 结果 |
@@ -30,4 +38,4 @@ java -cp .state/test-classes cubism53.mcp.GlueSearchCheck
 python -B tests/portable_smoke.py --package 'C:/path/to/Cubism53-Native-MCP' --editor-home 'C:/path/to/Live2D Cubism 5.3'
 ```
 
-可传入 `--baseline-server` 指向独立解出的 `2611ec9/server.py`，同时比较旧版工具定义并生成旧版 PSD 重导入样本。
+分别用两个受支持的 `--editor-home` 执行同一份便携包。可传入 `--baseline-server` 指向独立解出的 `2611ec9/server.py`，比较旧版工具定义。5.3.03 同时生成旧版 PSD 重导入样本。

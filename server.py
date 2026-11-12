@@ -1,4 +1,4 @@
-"""MCP for our version-specific, in-process Cubism 5.3.03 adapter."""
+"""MCP for the in-process adapter for verified Cubism 5.3 builds."""
 from __future__ import annotations
 from contextlib import asynccontextmanager
 import math
@@ -31,7 +31,7 @@ async def lifespan(_server):
             preview_client = None
 
 
-mcp = FastMCP('Cubism 5.3.03 Internal Native Bridge', lifespan=lifespan, log_level='WARNING')
+mcp = FastMCP('Cubism 5.3 Internal Native Bridge', lifespan=lifespan, log_level='WARNING')
 
 
 class ToolInput(BaseModel):
@@ -139,7 +139,7 @@ async def native(operation, **arguments):
 
 @mcp.tool()
 async def cubism_native_connect() -> dict[str,Any]:
-    """Connect to the already-running official Cubism 5.3.03 editor after a restart.
+    """Connect to the already-running supported Cubism 5.3 editor after a restart.
 
     Builds and attaches this workspace's adapter without screen input. Does not
     start or close the editor, open documents, or change project data.

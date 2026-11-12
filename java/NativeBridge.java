@@ -68,6 +68,12 @@ public final class NativeBridge {
         Path expectedJar = Path.of((String) config.get("editor_jar")).toRealPath();
         Path loadedJar = Path.of(CEAppCtrl.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toRealPath();
         if (!loadedJar.equals(expectedJar)) throw new IllegalStateException("Unexpected editor build: " + loadedJar);
+        var digest = java.security.MessageDigest.getInstance("SHA-256");
+        try (var stream = new java.security.DigestInputStream(Files.newInputStream(loadedJar), digest)) {
+            stream.transferTo(OutputStream.nullOutputStream());
+        }
+        if (!NativeBridgeBuild.SHA256.equals(HexFormat.of().formatHex(digest.digest())))
+            throw new IllegalStateException("Adapter requires the verified Cubism " + NativeBridgeBuild.VERSION + " build");
         if (token == null || token.length() < 24) throw new IllegalArgumentException("Missing local token");
         ServerSocket bound = new ServerSocket();
         try {
@@ -217,7 +223,9 @@ public final class NativeBridge {
             }
             for (var scene : NativeBridgeAnimation.scenes(app)) documents.add(NativeBridgeAnimation.describe(scene));
             var current = app.getCurrentDoc();
-            return map("adapter", "internal-5.3.03-experimental", "editor_pid",ProcessHandle.current().pid(),"editor_thread", SwingUtilities.isEventDispatchThread(),
+            return map("adapter", "internal-" + NativeBridgeBuild.VERSION + "-experimental",
+                "editor_version", NativeBridgeBuild.VERSION, "editor_sha256", NativeBridgeBuild.SHA256,
+                "editor_pid",ProcessHandle.current().pid(),"editor_thread", SwingUtilities.isEventDispatchThread(),
                 "documents", documents, "current_document_uid", current instanceof CModelingDocument d ? d.getDocumentUID()
                     : current instanceof CSceneDocument d ? d.getDocumentUID() : null);
         }

@@ -52,6 +52,23 @@ def fixture(folder):
             PixelLayer.frompil(Image.new('RGBA', (16, 16), 'gray'), psd, name=layer, left=80 + 20 * index, top=80)
         psd.save(folder / name)
 
+    physics = {'Version': 3, 'Meta': {
+        'PhysicsSettingCount': 1, 'TotalInputCount': 1, 'TotalOutputCount': 1, 'VertexCount': 2, 'Fps': 60,
+        'EffectiveForces': {'Gravity': {'X': 0, 'Y': -1}, 'Wind': {'X': 0, 'Y': 0}},
+        'PhysicsDictionary': [{'Id': 'PhysicsSetting1', 'Name': 'Probe'}]},
+        'PhysicsSettings': [{
+            'Id': 'PhysicsSetting1',
+            'Input': [{'Source': {'Target': 'Parameter', 'Id': 'ParamAngleZ'}, 'Weight': 100,
+                       'Type': 'Angle', 'Reflect': False}],
+            'Output': [{'Destination': {'Target': 'Parameter', 'Id': 'ParamAngleX'}, 'VertexIndex': 1,
+                        'Scale': 1.5, 'Weight': 100, 'Type': 'Angle', 'Reflect': False}],
+            'Vertices': [
+                {'Position': {'X': 0, 'Y': 0}, 'Mobility': 0, 'Delay': 0, 'Acceleration': 0, 'Radius': 0},
+                {'Position': {'X': 0, 'Y': 20}, 'Mobility': .8, 'Delay': .25, 'Acceleration': 1, 'Radius': 20}],
+            'Normalization': {'Position': {'Minimum': -10, 'Maximum': 10, 'Default': 0},
+                              'Angle': {'Minimum': -30, 'Maximum': 30, 'Default': 0}}}]}
+    (folder / 'probe.physics3.json').write_text(json.dumps(physics), encoding='utf8')
+
 
 def launch(editor, root, env):
     batch = (editor / 'CubismEditor5.bat').read_text(encoding='ascii', errors='ignore')
@@ -101,7 +118,7 @@ async def seed_legacy(server, editor, root, editor_pid):
         return revisions
 
 
-async def exercise(spec, env, work, legacy):
+async def exercise(spec, env, work, legacy, expected_version):
     config = StdioServerParameters(command=spec['command'], args=spec['args'], env={
         'PATH':env['PATH'], 'LOCALAPPDATA':env['LOCALAPPDATA'], 'CUBISM53_EDITOR_PID':env['CUBISM53_EDITOR_PID'],
         'PYTHONDONTWRITEBYTECODE':'1',
@@ -121,6 +138,8 @@ async def exercise(spec, env, work, legacy):
 
         first, second = await asyncio.gather(invoke('connect'), invoke('connect'))
         assert first['editor_thread'] and second['editor_thread'] and not first['documents']
+        assert first['editor_version'] == second['editor_version'] == expected_version
+        assert (await invoke('status'))['editor_version'] == expected_version
         assert sum(bool(item.get('already_connected')) for item in (first, second)) == 1
         async def reopen(path):
             await invoke('open_project', path=path)
@@ -211,10 +230,47 @@ async def exercise(spec, env, work, legacy):
         conflict = await current('plan_psd_reimport', path='conflict.psd')
         assert conflict['conflicts']
         await current('reimport_psd', path='conflict.psd', plan_id=conflict['plan_id'], reject='conflicts')
+        paint, old = guids['Paint'], guids['Old']
+        evaluated = await current('evaluate', object_guids=[paint, old], base_pose='default')
+        assert [obj['guid'] for obj in evaluated['objects']] == [paint, old]
+        assert all(obj['canvas_positions'] for obj in evaluated['objects'])
+        suggestions = await current('suggest_glue_pairs', mesh_a_guid=paint, mesh_b_guid=old, tolerance=500)
+        assert suggestions['pairs'] or suggestions['ambiguous']
+        original = await current('object', object_guid=paint)
+        positions = original['source_positions'].copy()
+        positions[0] += .25
+        topology = await current('set_mesh_topology', object_guid=paint,
+                                 positions=positions, indices=original['indices'])
+        assert len(topology['indices']) == len(original['indices'])
+        assert topology['source_positions'] != original['source_positions']
+        await current('undo')
+        assert (await current('object', object_guid=paint))['source_positions'] == original['source_positions']
+        print('EVALUATE_GLUE_AND_MESH_TRANSFER_OK', flush=True)
+
+        await current('import_physics3', path='probe.physics3.json')
+        exported = await current('export_physics3', path='physics.physics3.json')
+        assert exported['source_group_count'] == 1
+        atlas = await current('edit_texture_atlas', action='create_page', name='Atlas', width=256, height=256)
+        atlas = await current('edit_texture_atlas', action='auto_layout', page_guid=atlas['pages'][0]['guid'])
+        assert not atlas['unplaced_materials']
+        runtime = await current('export_runtime_model', directory='runtime', name='probe')
+        references = json.loads(Path(runtime['model3']).read_text(encoding='utf8'))['FileReferences']
+        assert (work / 'runtime' / references['Moc']).read_bytes().startswith(b'MOC3')
+        assert all((work / 'runtime' / texture).is_file() for texture in references['Textures'])
         await current('save_as_new',path='revision3.cmo3')
+        scene = await invoke('create_animation_scene', model_document_uid=uid, name='Probe', fps=30, duration_frames=30)
+        animation, track = scene['document_uid'], scene['model_track_guid']
+        await invoke('set_timeline_keys', document_uid=animation, track_guid=track, parameter_id='ParamAngleZ',
+                     keys=[{'frame': 0, 'value': 0}, {'frame': 15, 'value': 12}])
+        await invoke('export_motion3', document_uid=animation, track_guid=track, path='probe.motion3.json')
+        motion = json.loads((work / 'probe.motion3.json').read_text(encoding='utf8'))
+        assert any(curve['Id'] == 'ParamAngleZ' for curve in motion['Curves'])
+        assert (await invoke('save_as_new', document_uid=animation, path='probe.can3'))['saved']
+        await invoke('close_saved', document_uid=animation)
         await current('close_saved')
         assert not (await invoke('status'))['documents']
         print('PSD_UNDO_REDO_REOPEN_PIXELS_OK', flush=True)
+        print('PHYSICS_RUNTIME_AND_ANIMATION_EXPORT_OK', flush=True)
         return definitions
 
 async def schemas(server):
@@ -247,6 +303,9 @@ def main():
             port=spare.getsockname()[1]
         report,spec=setup(portable, editor, root, env, port)
         assert setup(portable, editor, root, env, port)==(report,spec)
+        expected = re.search(r'Cubism ver (5\.3\.\d+)',
+                             (editor / 'CubismEditor5.bat').read_text(encoding='ascii', errors='ignore'))[1]
+        assert report['editor_version'] == expected
         fake=root/'wrong-editor/app/lib'
         fake.mkdir(parents=True)
         (fake/'Live2D_Cubism.jar').write_bytes(b'not a supported editor')
@@ -265,13 +324,23 @@ def main():
             time.sleep(8)
             assert process.poll() is None
             env['CUBISM53_EDITOR_PID']=str(process.pid)
+            detected = subprocess.check_output([
+                spec['command'], '-B', str(portable / 'app/launcher.py'), 'setup', '--non-interactive',
+                '--profile', 'detected', '--profile-root', str(root / '配置 profile'), '--workspace', str(folder),
+            ], env=env, timeout=20)
+            detected_profile = json.loads(Path(json.loads(detected)['profile']).read_text(encoding='utf8'))
+            assert Path(detected_profile['editor_home']) == editor
+            assert json.loads(detected)['editor_version'] == expected
             baseline = options.baseline_server.resolve(strict=True) if options.baseline_server else None
-            legacy = asyncio.run(asyncio.wait_for(seed_legacy(baseline, editor, root, process.pid), 90)) if baseline else {}
-            definitions = asyncio.run(asyncio.wait_for(exercise(spec, env, folder, legacy), 90))
+            legacy = (asyncio.run(asyncio.wait_for(seed_legacy(baseline, editor, root, process.pid), 90))
+                      if baseline and expected == '5.3.03' else {})
+            definitions = asyncio.run(asyncio.wait_for(exercise(spec, env, folder, legacy, expected), 120))
             assert definitions == asyncio.run(schemas(ROOT / 'server.py'))
-            if options.baseline_server:
-                assert definitions == asyncio.run(schemas(options.baseline_server.resolve(strict=True)))
-            print(json.dumps({'portable_tools':len(definitions), 'system_python_java_git_on_path':False,
+            if baseline:
+                previous = asyncio.run(schemas(baseline))
+                previous['cubism_native_connect']['description'] = definitions['cubism_native_connect']['description']
+                assert definitions == previous
+            print(json.dumps({'editor_version':expected, 'portable_tools':len(definitions), 'system_python_java_git_on_path':False,
                 'source_schema_match':True,'cc_switch_and_dsh_specs_match':True}),flush=True)
         finally:
             if process.poll() is None:

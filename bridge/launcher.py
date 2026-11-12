@@ -12,8 +12,8 @@ import subprocess
 import sys
 import winreg
 
-from bridge.build import verify_editor
 from bridge.connect import editor_pid, portable_runtime, requested_pid
+from bridge.editor_versions import SUPPORTED_VERSIONS, verify_editor
 from bridge.settings import ROOT, windows_powershell, write_json, write_text_atomic
 
 SERVER_NAME = 'cubism53-native-mcp'
@@ -44,9 +44,17 @@ def editor_candidates():
                             with winreg.OpenKey(entries, winreg.EnumKey(entries, i)) as item:
                                 name = winreg.QueryValueEx(item, 'DisplayName')[0]
                                 if 'cubism' in name.casefold():
-                                    location = winreg.QueryValueEx(item, 'InstallLocation')[0]
+                                    try:
+                                        location = winreg.QueryValueEx(item, 'InstallLocation')[0]
+                                    except FileNotFoundError:
+                                        location = ''
                                     if location:
                                         yield Path(location)
+                                    else:
+                                        icon = winreg.QueryValueEx(item, 'DisplayIcon')[0]
+                                        executable = Path(icon.rsplit(',', 1)[0].strip().strip('"'))
+                                        if executable.name.casefold() == 'cubismeditor5.exe':
+                                            yield executable.parent
                         except OSError:
                             continue
             except OSError:
@@ -59,16 +67,14 @@ def editor_candidates():
 def select_editor(configured=None):
     if configured:
         path = Path(configured).expanduser().resolve(strict=True)
-        verify_editor(path)
-        return path
+        return path, verify_editor(path)
     for candidate in editor_candidates():
         try:
             path = candidate.resolve(strict=True)
-            verify_editor(path)
-            return path
+            return path, verify_editor(path)
         except (OSError, RuntimeError):
             continue
-    raise FileNotFoundError('Supported Cubism 5.3.03 was not found. Provide its installation folder with --editor-home.')
+    raise FileNotFoundError(f'No supported Cubism installation found ({SUPPORTED_VERSIONS}). Use --editor-home.')
 
 
 def profile_state(path, settings):
@@ -134,12 +140,12 @@ def setup(args):
     path = folder / 'settings.json'
     old = json.loads(path.read_text(encoding='utf8')) if path.is_file() else {}
     try:
-        editor = select_editor(args.editor_home or old.get('editor_home'))
+        editor, build = select_editor(args.editor_home or old.get('editor_home'))
     except (OSError, RuntimeError):
         if args.non_interactive or args.editor_home:
             raise
-        print('Cubism 5.3.03 was not found automatically. Enter its installation folder.')
-        editor = select_editor(input('Cubism folder: ').strip().strip('"'))
+        print(f'Enter the installation folder for a supported Cubism build ({SUPPORTED_VERSIONS}).')
+        editor, build = select_editor(input('Cubism folder: ').strip().strip('"'))
     work = args.workspace or old.get('workspace')
     if not work:
         if args.non_interactive:
@@ -154,7 +160,7 @@ def setup(args):
         raise ValueError('Native bridge and preview ports must differ')
     settings = {'version': 1, 'editor_home': str(editor), 'workspace': str(workspace),
                 'bridge_port': bridge_port, 'preview_port': preview_port}
-    portable_runtime()
+    portable_runtime(build)
     if old and profile_state(path, old) != profile_state(path, settings) and old['bridge_port'] == bridge_port:
         with socket.socket() as check:
             check.settimeout(1)
@@ -164,17 +170,19 @@ def setup(args):
     path = path.resolve(strict=True)
     output = export_config(path)
     if args.non_interactive:
-        print(json.dumps({'profile': str(path), 'client_configs': str(output)}, ensure_ascii=True))
+        print(json.dumps({'profile': str(path), 'client_configs': str(output), 'editor_version': build.version},
+                         ensure_ascii=True))
     else:
-        print(f'Profile: {path}\nClient configurations: {output}')
+        print(f'Cubism Editor {build.version}\nProfile: {path}\nClient configurations: {output}')
     return 0
 
 
 def doctor(profile):
     home = Path(profile['editor_home'])
-    report = {'editor_sha256': verify_editor(home),
+    build = verify_editor(home)
+    report = {'editor_version': build.version, 'editor_sha256': build.sha256,
               'workspace': Path(profile['workspace']).is_dir(),
-              'portable_runtime': portable_runtime() is not None}
+              'portable_runtime': portable_runtime(build) is not None}
     try:
         report['editor_pid'] = editor_pid(home, requested_pid())
     except RuntimeError as error:
@@ -186,8 +194,10 @@ def doctor(profile):
     if occupied:
         try:
             from bridge.client import call
-            report['bridge_pid'] = call('status', response_timeout=3)['editor_pid']
-            report['bridge_port'] = 'connected'
+            status = call('status', response_timeout=3)
+            report['bridge_pid'] = status['editor_pid']
+            report['bridge_port'] = ('connected' if status.get('editor_sha256') == build.sha256
+                                     else 'different or older bridge')
         except (OSError, ValueError, RuntimeError, KeyError):
             report['bridge_port'] = 'occupied or bridge did not respond'
     print(json.dumps(report, ensure_ascii=True))

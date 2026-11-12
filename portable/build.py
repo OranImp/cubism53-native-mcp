@@ -1,4 +1,4 @@
-"""Build a Windows x64 ZIP using a verified offline wheelhouse and a local Editor."""
+"""Build a Windows x64 ZIP with an adapter for every verified editor build."""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,8 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bridge.build import build, build_lock, jdk_bin, verify_editor
+from bridge.build import build, build_lock, jdk_bin
+from bridge.editor_versions import BUILDS, verify_editor
 
 PYTHON_VERSION = '3.13.17'
 PYTHON_SHA256 = '9e35319bffedab8b36ad44d8f377cb4f1733bcec257a0b6d04d94f01486ddb38'
@@ -30,7 +31,16 @@ def digest(path):
 def build_package(options):
     python_zip = options.python_zip.resolve(strict=True)
     wheelhouse = options.wheelhouse.resolve(strict=True)
-    editor = options.editor_home.resolve(strict=True)
+    editors = {}
+    for path in options.editor_home:
+        home = path.resolve(strict=True)
+        editor = verify_editor(home)
+        if editor.version in editors:
+            raise ValueError(f'Editor version supplied twice: {editor.version}')
+        editors[editor.version] = (editor, home)
+    missing = [editor.version for editor in BUILDS if editor.version not in editors]
+    if missing:
+        raise ValueError('Supply --editor-home once for each missing build: ' + ', '.join(missing))
     output = options.output.resolve()
     if output.suffix.lower() != '.zip':
         raise ValueError('The package destination must end in .zip')
@@ -38,7 +48,6 @@ def build_package(options):
         raise FileExistsError('Choose a new ZIP destination')
     if digest(python_zip) != PYTHON_SHA256:
         raise ValueError('CPython embeddable archive does not match the pinned SHA-256')
-    verify_editor(editor)
     if options.jdk_home:
         os.environ['CUBISM53_JDK_HOME'] = str(options.jdk_home.resolve(strict=True))
     jdk = jdk_bin()
@@ -75,11 +84,14 @@ def build_package(options):
             check=True)
         shutil.copyfile(jdk.parent / 'NOTICE', runtime / 'java/NOTICE')
         os.environ['CUBISM53_BRIDGE_STATE'] = str(scratch / 'build-state')
+        (app / 'adapters').mkdir(parents=True)
+        adapters = {}
         with build_lock():
-            agent = build(editor, jdk)
-        app.mkdir()
-        shutil.copyfile(agent, app / 'adapter.jar')
-        (app / 'portable.json').write_text(json.dumps({'adapter_sha256': digest(agent),
+            for editor, home in editors.values():
+                agent = build(home, jdk, editor)
+                shutil.copyfile(agent, app / 'adapters' / f'{editor.version}.jar')
+                adapters[editor.sha256] = {'version': editor.version, 'sha256': digest(agent)}
+        (app / 'portable.json').write_text(json.dumps({'adapters': adapters,
             'python_version': PYTHON_VERSION, 'java_version': JAVA_VERSION}, indent=2), encoding='utf8')
         for path in (ROOT / 'bridge').glob('*.py'):
             (app / 'bridge').mkdir(exist_ok=True)
@@ -101,8 +113,9 @@ def build_package(options):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for option in ('python-zip', 'wheelhouse', 'editor-home', 'output'):
+    for option in ('python-zip', 'wheelhouse', 'output'):
         parser.add_argument(f'--{option}', type=Path, required=True)
+    parser.add_argument('--editor-home', type=Path, required=True, action='append')
     parser.add_argument('--jdk-home', type=Path)
     build_package(parser.parse_args())
 

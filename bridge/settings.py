@@ -42,7 +42,7 @@ def editor_home() -> Path:
     for candidate in candidates:
         if (candidate / 'app/lib/Live2D_Cubism.jar').is_file():
             return candidate.resolve()
-    raise FileNotFoundError('Set CUBISM53_EDITOR_HOME to the Cubism 5.3.03 installation directory')
+    raise FileNotFoundError('Set CUBISM53_EDITOR_HOME to a supported Cubism installation directory')
 
 
 def windows_powershell() -> str:

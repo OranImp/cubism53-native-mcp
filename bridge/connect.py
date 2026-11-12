@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,8 +11,9 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 
-from .build import build, build_lock, jdk_bin, verify_editor
+from .build import build, build_lock, jdk_bin
 from .client import call
+from .editor_versions import EditorBuild, file_digest, verify_editor
 from .settings import ROOT, bridge_port, editor_home, state_directory, windows_powershell, workspace, write_json
 
 PROCESS_QUERY = r"""
@@ -51,7 +51,7 @@ def editor_pid(home: Path, selected: int | None) -> int:
         return selected
     if len(pids) != 1:
         detail = 'Open Cubism Editor first.' if not pids else 'Set CUBISM53_EDITOR_PID to the intended editor PID.'
-        raise RuntimeError(f'Expected one running Cubism 5.3.03 editor; found {len(pids)}. {detail}')
+        raise RuntimeError(f'Expected one running Cubism editor from the selected installation; found {len(pids)}. {detail}')
     return pids[0]
 
 
@@ -67,14 +67,16 @@ def attach(pid: int, agent: Path, bin_path: Path, config: dict) -> None:
                        check=True, stdout=sys.stderr, timeout=25)
 
 
-def portable_runtime():
+def portable_runtime(editor: EditorBuild) -> tuple[Path, Path] | None:
     metadata = ROOT / 'portable.json'
     if not metadata.is_file():
         return None
-    agent = ROOT / 'adapter.jar'
-    with agent.open('rb') as stream:
-        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-    if digest != json.loads(metadata.read_text(encoding='utf8'))['adapter_sha256']:
+    manifest = json.loads(metadata.read_text(encoding='utf8'))
+    adapter = manifest['adapters'].get(editor.sha256)
+    if adapter is None or adapter['version'] != editor.version:
+        raise RuntimeError(f'Portable bundle is missing the verified Cubism {editor.version} adapter')
+    agent = ROOT / 'adapters' / f'{editor.version}.jar'
+    if file_digest(agent) != adapter['sha256']:
         raise RuntimeError('Portable bridge JAR checksum mismatch; unpack the release again')
     bin_path = ROOT.parent / 'runtime/java/bin'
     if not (bin_path / 'java.exe').is_file():
@@ -84,6 +86,8 @@ def portable_runtime():
 
 def connect_editor() -> dict:
     selected = requested_pid()
+    home = editor_home()
+    editor = verify_editor(home)
     with build_lock():
         try:
             status = call('status')
@@ -92,6 +96,8 @@ def connect_editor() -> dict:
         else:
             if selected is not None and status['editor_pid'] != selected:
                 raise RuntimeError('This bridge state is connected to a different editor PID')
+            if status.get('editor_sha256') != editor.sha256:
+                raise RuntimeError('This port is connected to a different or older bridge. Stop it before reconnecting.')
             return {'connected': True, 'already_connected': True, **status}
         port = bridge_port()
         with socket.socket() as check:
@@ -100,14 +106,12 @@ def connect_editor() -> dict:
                 check.bind(('127.0.0.1', port))
             except OSError as error:
                 raise RuntimeError(f'Loopback port {port} is unavailable. Set a separate CUBISM53_BRIDGE_PORT.') from error
-        home = editor_home()
         pid = editor_pid(home, selected)
-        packaged = portable_runtime()
+        packaged = portable_runtime(editor)
         if packaged is None:
             bin_path = jdk_bin()
-            agent = build(home, bin_path)
+            agent = build(home, bin_path, editor)
         else:
-            verify_editor(home)
             bin_path, agent = packaged
         config = {'workspace': str(workspace()), 'editor_jar': str(home / 'app/lib/Live2D_Cubism.jar'),
                   'port': port, 'token': secrets.token_urlsafe(32), 'adapter_jar': str(agent)}
