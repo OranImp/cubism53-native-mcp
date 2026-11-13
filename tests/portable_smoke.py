@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -18,8 +19,37 @@ from mcp.client.stdio import stdio_client
 from PIL import Image
 from psd_tools import PSDImage
 from psd_tools.api.layers import PixelLayer
+from expansion_smoke import check_expansion
 
 ROOT = Path(__file__).resolve().parents[1]
+
+def free_preview_port():
+    # Keep test listeners outside Windows' default outbound TCP port range.
+    for _ in range(40):
+        port = 30000 + secrets.randbelow(19000)
+        with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            try:
+                probe.bind(('', port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError('Could not reserve an isolated preview test port')
+
+
+async def start_preview(probe, port):
+    await probe(f'preview={port}')
+    for _ in range(50):
+        try:
+            _, writer = await asyncio.open_connection('127.0.0.1', port)
+        except OSError:
+            await asyncio.sleep(.1)
+        else:
+            writer.close()
+            await writer.wait_closed()
+            return
+    raise RuntimeError(f'The isolated preview server did not listen on port {port}')
+
 
 def setup(portable, editor, root, env, port, preview_port):
     arguments = [portable / 'Setup.cmd', '--non-interactive', '--profile-root', root / '配置 profile',
@@ -139,7 +169,7 @@ def native_probe(portable, editor, root, pid, version):
         process = await asyncio.create_subprocess_exec(
             str(java), '--add-modules', 'jdk.attach', '-cp', str(adapter), 'cubism53.mcp.Attach',
             str(pid), str(probe), operation)
-        assert await asyncio.wait_for(process.wait(), 20) == 0
+        assert await asyncio.wait_for(process.wait(), 20) == 0, f'Native test probe failed: {operation}'
 
     return run
 
@@ -158,7 +188,8 @@ async def check_upgrade(previous, spec, env, profile):
     async with stdio_client(new) as (reader, writer), ClientSession(reader, writer) as client:
         await client.initialize()
         result = await client.call_tool('cubism_native_connect', {})
-        assert result.isError and 'Older bridge' in result.content[0].text, result.content
+        assert result.isError and any(message in result.content[0].text for message in
+                                      ('Older bridge', 'adapter build differs')), result.content
     stopper = await asyncio.create_subprocess_exec(
         str(python), '-B', str(launcher), 'stop', '--profile-file', profile,
         env=env, stdout=asyncio.subprocess.PIPE)
@@ -167,7 +198,7 @@ async def check_upgrade(previous, spec, env, profile):
     print('OLD_BRIDGE_REJECTED_AND_STOPPED_FOR_UPGRADE', flush=True)
 
 
-async def exercise(spec, env, work, legacy, expected_version, probe=None, preview_port=None):
+async def exercise(spec, env, work, legacy, expected_version, probe, preview_port, editor, pid, high_resolution):
     config = StdioServerParameters(command=spec['command'], args=spec['args'], env={
         'PATH':env['PATH'], 'LOCALAPPDATA':env['LOCALAPPDATA'], 'CUBISM53_EDITOR_PID':env['CUBISM53_EDITOR_PID'],
         'PYTHONDONTWRITEBYTECODE':'1',
@@ -175,7 +206,7 @@ async def exercise(spec, env, work, legacy, expected_version, probe=None, previe
     async with stdio_client(config) as (r,w), ClientSession(r,w) as mcp:
         await mcp.initialize()
         definitions = {tool.name: tool.model_dump(mode='json') for tool in (await mcp.list_tools()).tools}
-        assert len(definitions) == 75
+        assert len(definitions) == 84
         async def invoke(op, *, reject=None, **kwargs):
             result = await mcp.call_tool('cubism_native_'+op, kwargs)
             if reject is not None:
@@ -354,8 +385,7 @@ async def exercise(spec, env, work, legacy, expected_version, probe=None, previe
         print('RENDER_CACHE_AND_BACKGROUND_PIXELS_OK', flush=True)
 
         if probe:
-            await probe(f'preview={preview_port}')
-            await asyncio.sleep(.5)
+            await start_preview(probe, preview_port)
             await current('set_preview_parameters', parameters={'ParamAngleZ': 5}, reject='approve')
             await probe('approve-preview')
             assert (await current('set_preview_parameters', parameters={'ParamAngleZ': 5}))['applied']
@@ -365,11 +395,8 @@ async def exercise(spec, env, work, legacy, expected_version, probe=None, previe
                                                  {'document_uid': uid, 'parameters': {'ParamAngleZ': 6}})
                 assert not applied.isError and applied.structuredContent['applied'], applied.content
                 assert (await current('clear_preview_parameters'))['applied']
-            with socket.socket() as spare:
-                spare.bind(('127.0.0.1', 0))
-                second_port = spare.getsockname()[1]
-            await probe(f'preview={second_port}')
-            await asyncio.sleep(.5)
+            second_port = free_preview_port()
+            await start_preview(probe, second_port)
             profile = Path(spec['args'][-1])
             alternate = profile.with_name('preview-alternate.json')
             settings = json.loads(profile.read_text(encoding='utf8'))
@@ -435,6 +462,7 @@ async def exercise(spec, env, work, legacy, expected_version, probe=None, previe
         assert not (await invoke('status'))['documents']
         print('PSD_UNDO_REDO_REOPEN_PIXELS_OK', flush=True)
         print('PHYSICS_RUNTIME_AND_ANIMATION_EXPORT_OK', flush=True)
+        await check_expansion(invoke, work, editor, pid, probe, high_resolution)
         return definitions
 
 async def schemas(server):
@@ -451,6 +479,7 @@ def main():
     parser.add_argument('--legacy-server', type=Path)
     parser.add_argument('--previous-package', type=Path, help='Exercise an upgrade with the previous portable package')
     parser.add_argument('--native-probe', action='store_true', help='Test editor undo and preview via a dedicated test agent')
+    parser.add_argument('--high-resolution', action='store_true', help='Render and compare 4K and 8K; requires psutil')
     options = parser.parse_args()
     portable = options.package.resolve(strict=True)
     editor = options.editor_home.resolve(strict=True)
@@ -465,11 +494,10 @@ def main():
         for name in ('JAVA_HOME','CUBISM53_JDK_HOME','PYTHONHOME','PYTHONPATH'):
             env.pop(name,None)
         env['HTTP_PROXY'] = env['HTTPS_PROXY'] = 'http://127.0.0.1:1'
-        with socket.socket() as spare, socket.socket() as preview:
+        with socket.socket() as spare:
             spare.bind(('127.0.0.1',0))
             port=spare.getsockname()[1]
-            preview.bind(('127.0.0.1',0))
-            preview_port=preview.getsockname()[1]
+        preview_port = free_preview_port()
         report,spec=setup(portable, editor, root, env, port, preview_port)
         assert setup(portable, editor, root, env, port, preview_port)==(report,spec)
         expected = re.search(r'Cubism ver (5\.3\.\d+)',
@@ -508,18 +536,36 @@ def main():
                 options.legacy_server.resolve(strict=True), editor, root, process.pid), 90))
                       if options.legacy_server and expected == '5.3.03' else {})
             probe = native_probe(portable, editor, root, process.pid, expected) if options.native_probe else None
-            definitions = asyncio.run(asyncio.wait_for(exercise(spec, env, folder, legacy, expected, probe, preview_port), 180))
+            definitions = asyncio.run(asyncio.wait_for(exercise(
+                spec, env, folder, legacy, expected, probe, preview_port, editor, process.pid, options.high_resolution), 240))
             assert definitions == asyncio.run(schemas(ROOT / 'server.py'))
             if baseline:
                 previous = asyncio.run(schemas(baseline))
-                previous['cubism_native_connect']['description'] = definitions['cubism_native_connect']['description']
-                assert definitions == previous
+                assert len(previous) == 75 and previous.keys() <= definitions.keys()
+                additions = {'objects': {'sections', 'part_guid', 'object_types', 'parameter_id'},
+                             'object': {'form_guids', 'geometry'},
+                             'simulate_physics': {'output_parameter_ids', 'result_mode', 'execution', 'request_id'}}
+                for name, old in previous.items():
+                    current = definitions[name]
+                    if name == 'cubism_native_connect':
+                        old['description'] = current['description']
+                    extra = additions.get(name.removeprefix('cubism_native_'), set())
+                    if extra:
+                        old_fields = old['inputSchema']['properties']
+                        current_fields = current['inputSchema']['properties']
+                        assert current_fields.keys() - old_fields.keys() == extra
+                        current = {**current, 'inputSchema': {**current['inputSchema'],
+                            'properties': {key: current_fields[key] for key in old_fields}}}
+                    assert current == old, name
             print(json.dumps({'editor_version':expected, 'portable_tools':len(definitions), 'system_python_java_git_on_path':False,
                 'source_schema_match':True,'cc_switch_and_dsh_specs_match':True}),flush=True)
         finally:
             if process.poll() is None:
                 process.terminate()
                 process.wait(15)
+            if sys.exc_info()[0]:
+                log = (root / 'editor.log').read_text(encoding='utf8', errors='replace')
+                print('\n'.join(log.splitlines()[-16:]), file=sys.stderr)
 
 
 if __name__ == '__main__':

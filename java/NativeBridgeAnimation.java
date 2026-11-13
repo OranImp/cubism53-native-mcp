@@ -11,6 +11,7 @@ import com.live2d.cubism.doc.animation.movie.effect.attr.value.CMutableSequence;
 import com.live2d.cubism.doc.animation.movie.track.CMvTrack_Live2DModel_Source;
 import com.live2d.cubism.doc.modeling.CModelingDocument;
 import com.live2d.undo.SimpleUndo;
+import com.live2d.undo.GroupUndo;
 import java.nio.file.*;
 import java.util.*;
 
@@ -107,6 +108,8 @@ final class NativeBridgeAnimation {
         switch (op) {
             case "describe": return describe(doc);
             case "set_timeline_keys": return setKeys(doc, request);
+            case "edit_animation_scene": return editScene(doc, request);
+            case "batch_edit_timeline": return batchCurves(doc, request);
             case "get_timeline_keys", "remove_timeline_keys", "sample_timeline_parameters": return curves(doc, op, request);
             case "export_motion3": return exportMotion(doc, workspace, request);
             case "save_as_new": {
@@ -148,6 +151,64 @@ final class NativeBridgeAnimation {
     }
 
     private record Key(int frame, double value, CCurveType type) {}
+
+    private static Object editScene(CSceneDocument doc, Map<String,Object> request) {
+        var scene = doc.getSceneSource();
+        var movie = scene.getMovieInfo();
+        double fps = request.containsKey("fps") ? number(request.get("fps"), "fps") : movie.getFps();
+        int duration = request.containsKey("duration_frames")
+            ? integer(request.get("duration_frames"), "duration_frames") : movie.getDuration();
+        int fadeIn = request.containsKey("fade_in_seconds") ? fadeMillis(request.get("fade_in_seconds")) : movie.getFadeInMSec();
+        int fadeOut = request.containsKey("fade_out_seconds") ? fadeMillis(request.get("fade_out_seconds")) : movie.getFadeOutMSec();
+        boolean loop = (boolean) request.getOrDefault("loop", movie.isLoopMotion());
+        if (fps <= 0 || duration < 1) throw new IllegalArgumentException("FPS and duration must be positive");
+        if (duration < movie.getDuration()) {
+            int start = movie.getStartFrame();
+            long end = (long) start + duration;
+            var conflicts = new ArrayList<Object>();
+            for (var track : scene.getAllTracks()) {
+                String guid = track.getGuid().getUuidString();
+                long startOffset = (long) track.getStart() - track.getInternalOffset();
+                if (track != scene.getRootTrack()) {
+                    long trackEnd = (long) track.getStart() + track.getDuration();
+                    if (trackEnd > end || Arrays.stream(track.getKeyFrames()).anyMatch(frame -> startOffset + frame >= end))
+                        conflicts.add(map("track_guid", guid, "name", track.getName(), "end_frame", trackEnd));
+                }
+                track.getUserData().keySet().stream().map(frame -> startOffset + frame).filter(frame -> frame >= end).sorted()
+                    .forEach(frame -> conflicts.add(map("track_guid", guid, "event_frame", frame)));
+            }
+            scene.getMarker().keySet().stream().filter(frame -> frame >= end).sorted()
+                .forEach(frame -> conflicts.add(map("marker_frame", frame)));
+            scene.getOnionSkinMarker().stream().filter(frame -> frame >= end).sorted()
+                .forEach(frame -> conflicts.add(map("onion_skin_marker_frame", frame)));
+            if (!conflicts.isEmpty()) return map("applied", false, "conflicts", conflicts);
+        }
+        var undo = new SimpleUndo("Native bridge: edit animation scene", movie, new com.live2d.core.a());
+        try {
+            movie.setFps(fps);
+            movie.setDuration(duration);
+            movie.setLoopMotion(loop);
+            movie.setFadeInMSec(fadeIn);
+            movie.setFadeOutMSec(fadeOut);
+        } catch (RuntimeException | Error error) {
+            undo.undo();
+            throw error;
+        }
+        undo.addUndoRedoListener(event -> {
+            refreshScene(doc);
+            return kotlin.Unit.INSTANCE;
+        });
+        finishSceneEdit(doc, undo);
+        return map("applied", true, "fps", movie.getFps(), "duration_frames", movie.getDuration(), "loop", movie.isLoopMotion(),
+            "fade_in_seconds", movie.getFadeInMSec() / 1000.0, "fade_out_seconds", movie.getFadeOutMSec() / 1000.0);
+    }
+
+    private static int fadeMillis(Object value) {
+        double seconds = number(value, "fade time");
+        if (seconds < 0 || seconds * 1000 > Integer.MAX_VALUE)
+            throw new IllegalArgumentException("Fade time is outside the supported range");
+        return (int) Math.round(seconds * 1000);
+    }
 
     private static CMutableSequence curve(CMvTrack_Live2DModel_Source track, String id) {
         var parameter = track.getParameterSourceSet().getSources().stream()
@@ -198,12 +259,22 @@ final class NativeBridgeAnimation {
     private static Object setKeys(CSceneDocument doc, Map<String,Object> request) {
         var track = track(doc, request.get("track_guid"));
         String id = nonblank(request.get("parameter_id"), "parameter_id");
+        var keys = parseKeys(doc, track, id, (List<?>) request.get("keys"));
+        if (keys.isEmpty()) throw new IllegalArgumentException("At least one keyframe is required");
+        var sequence = curve(track, id);
+        editCurve(doc, track, sequence, "Set timeline keys", () -> applyKeys(sequence, keys.values()));
+        return map("document_uid", doc.getDocumentUID(), "track_guid", track.getGuid().getUuidString(), "parameter_id", id,
+            "keys", keys.values().stream().map(key -> map("frame", key.frame, "value", sequence.getDoubleValue(key.frame),
+                "interpolation", key.type.name().toLowerCase(Locale.ROOT))).toList());
+    }
+
+    private static Map<Integer,Key> parseKeys(CSceneDocument doc, CMvTrack_Live2DModel_Source track, String id, List<?> rows) {
         var parameter = track.getParameterSourceSet().getSources().stream()
             .filter(candidate -> id.equals(candidate.getId().toString())).findFirst()
             .orElseThrow(() -> new IllegalArgumentException("Parameter is absent from the linked model: " + id));
         int duration = doc.getSceneSource().getMovieInfo().getDuration();
         var keys = new TreeMap<Integer,Key>();
-        for (var value : (List<?>) request.get("keys")) {
+        for (var value : rows) {
             var row = (Map<?,?>) value;
             int frame = integer(row.get("frame"), "frame");
             double number = number(row.get("value"), "value");
@@ -214,38 +285,91 @@ final class NativeBridgeAnimation {
             if (keys.putIfAbsent(frame, new Key(frame, number, type)) != null)
                 throw new IllegalArgumentException("Keyframe is duplicated: " + frame);
         }
-        if (keys.isEmpty()) throw new IllegalArgumentException("At least one keyframe is required");
-        var sequence = curve(track, id);
-        editCurve(doc, track, sequence, "Set timeline keys", () -> {
-            for (var key : keys.values()) {
-                sequence.setDoubleValueAuto(key.frame, key.value, key.type, false, false);
-                sequence.setCurveType(key.frame, key.type);
+        return keys;
+    }
+
+    private static void applyKeys(CMutableSequence sequence, Collection<Key> keys) {
+        for (var key : keys) {
+            sequence.setDoubleValueAuto(key.frame, key.value, key.type, false, false);
+            sequence.setCurveType(key.frame, key.type);
+        }
+    }
+
+    private record CurveEdit(CMvTrack_Live2DModel_Source track, String parameter, CMutableSequence sequence,
+                             Map<Integer,Key> keys, Set<Integer> remove) {}
+
+    private static Object batchCurves(CSceneDocument doc, Map<String,Object> request) {
+        var edits = new ArrayList<CurveEdit>();
+        var seen = new HashSet<List<String>>();
+        for (Object value : (List<?>) request.get("edits")) {
+            var row = (Map<?,?>) value;
+            var track = track(doc, row.get("track_guid"));
+            String id = nonblank(row.get("parameter_id"), "parameter_id");
+            if (!seen.add(List.of(track.getGuid().getUuidString(), id)))
+                throw new IllegalArgumentException("Only one edit per track and parameter is allowed");
+            var sequence = curve(track, id);
+            var keys = parseKeys(doc, track, id, (List<?>) row.get("keys"));
+            var existing = new HashSet<Integer>();
+            for (var point : sequence.getPoints()) existing.add(point.getPos());
+            var remove = new LinkedHashSet<Integer>();
+            for (Object frameValue : (List<?>) row.get("remove_frames")) {
+                int frame = integer(frameValue, "frame");
+                if (!existing.contains(frame) || keys.containsKey(frame) || !remove.add(frame))
+                    throw new IllegalArgumentException("Removal must name a distinct existing key outside the upserts: " + frame);
             }
-        });
-        return map("document_uid", doc.getDocumentUID(), "track_guid", track.getGuid().getUuidString(), "parameter_id", id,
-            "keys", keys.values().stream().map(key -> map("frame", key.frame, "value", sequence.getDoubleValue(key.frame),
-                "interpolation", key.type.name().toLowerCase(Locale.ROOT))).toList());
+            if (keys.isEmpty() && remove.isEmpty()) throw new IllegalArgumentException("Each curve needs an edit");
+            edits.add(new CurveEdit(track, id, sequence, keys, remove));
+        }
+        if (edits.isEmpty()) throw new IllegalArgumentException("Specify at least one curve edit");
+        var undo = new GroupUndo("Native bridge: batch edit timeline");
+        try {
+            for (var edit : edits) undo.plusAssign(applyCurve(doc, edit.track, edit.sequence, "Edit timeline curve", () -> {
+                edit.remove.forEach(edit.sequence::removeDoubleValueAuto);
+                applyKeys(edit.sequence, edit.keys.values());
+            }));
+        } catch (RuntimeException | Error error) {
+            undo.undo();
+            refreshScene(doc);
+            throw error;
+        }
+        finishSceneEdit(doc, undo);
+        return map("document_uid", doc.getDocumentUID(), "curves", edits.stream().map(edit ->
+            map("track_guid", edit.track.getGuid().getUuidString(), "parameter_id", edit.parameter,
+                "keys", timelineKeys(edit.sequence))).toList());
     }
 
     private static void editCurve(CSceneDocument doc, CMvTrack_Live2DModel_Source track,
                                   CMutableSequence sequence, String name, Runnable apply) {
+        finishSceneEdit(doc, applyCurve(doc, track, sequence, name, apply));
+    }
+
+    private static SimpleUndo applyCurve(CSceneDocument doc, CMvTrack_Live2DModel_Source track,
+                                         CMutableSequence sequence, String name, Runnable apply) {
         var effect = track.getKeyParam();
         var undo = new SimpleUndo("Native bridge: " + name, sequence, new com.live2d.core.a());
         try {
             apply.run();
             sequence.setDirty();
             effect.setDirty();
-        } catch (RuntimeException error) {
+        } catch (RuntimeException | Error error) {
             undo.undo();
             throw error;
         }
         undo.addUndoRedoListener(event -> {
             effect.setDirty();
-            if (!doc.getViewContexts().isEmpty()) doc.resetAllViewContext();
+            refreshScene(doc);
             return kotlin.Unit.INSTANCE;
         });
+        return undo;
+    }
+
+    private static void finishSceneEdit(CSceneDocument doc, com.live2d.undo.ACUndoable undo) {
         doc.getUndoManager().addEdit(undo);
         doc.updateLastModifiedTime();
+        refreshScene(doc);
+    }
+
+    private static void refreshScene(CSceneDocument doc) {
         if (!doc.getViewContexts().isEmpty()) doc.resetAllViewContext();
     }
 

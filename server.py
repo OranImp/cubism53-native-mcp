@@ -111,6 +111,50 @@ class TimelineKey(ToolInput):
     value: float
     interpolation: Literal['linear', 'step', 'smooth'] = 'linear'
 
+
+class TimelineEdit(ToolInput):
+    track_guid: str
+    parameter_id: str
+    keys: list[TimelineKey] = Field(default_factory=list)
+    remove_frames: list[int] = Field(default_factory=list)
+
+
+class AnimationScenePatch(ToolInput):
+    fps: float | None = None
+    duration_frames: int | None = None
+    loop: bool | None = None
+    fade_in_seconds: float | None = None
+    fade_out_seconds: float | None = None
+
+
+class PartRenderingPatch(ToolInput):
+    offscreen: bool | None = None
+    mask_guids: list[str] | None = None
+    invert_mask: bool | None = None
+    draw_order_group: bool | None = None
+
+
+class MirrorForm(ToolInput):
+    source_form_guid: str
+    target_form_guid: str
+    source_parameters: dict[str, float] | None = None
+    target_parameters: dict[str, float] | None = None
+
+
+class ArtPathPoint(ToolInput):
+    x: float
+    y: float
+    width: float | None = None
+    opacity: float | None = None
+    corner: bool = False
+
+
+class ExpressionParameter(ToolInput):
+    id: str
+    value: float
+    blend: Literal['Add', 'Multiply', 'Overwrite']
+
+
 class RenderPose(ToolInput):
     name: str
     parameters: dict[str, float] = Field(default_factory=dict)
@@ -175,14 +219,19 @@ async def cubism_native_set_clipping(document_uid:str,object_guid:str,mask_guids
     return await native('set_clipping',document_uid=document_uid,object_guid=object_guid,mask_guids=mask_guids,invert=invert)
 
 @mcp.tool()
-async def cubism_native_objects(document_uid:str) -> dict[str,Any]:
+async def cubism_native_objects(document_uid: str,
+                                sections: list[Literal['objects', 'parts', 'parameters', 'parameter_groups']] | None = None,
+                                part_guid: str | None = None, object_types: list[str] | None = None,
+                                parameter_id: str | None = None) -> dict[str,Any]:
     """List native mesh/deformer identities and available parameter ranges."""
-    return await native('objects',document_uid=document_uid)
+    return await native('objects', document_uid=document_uid, sections=sections, part_guid=part_guid,
+                        object_types=object_types, parameter_id=parameter_id)
 
 @mcp.tool()
-async def cubism_native_object(document_uid:str,object_guid:str) -> dict[str,Any]:
+async def cubism_native_object(document_uid: str, object_guid: str, form_guids: list[str] | None = None,
+                               geometry: bool = True) -> dict[str,Any]:
     """Read a native mesh or deformer, including keyform UUIDs and vertex positions."""
-    return await native('object',document_uid=document_uid,object_guid=object_guid)
+    return await native('object', document_uid=document_uid, object_guid=object_guid, form_guids=form_guids, geometry=geometry)
 
 @mcp.tool()
 async def cubism_native_replace_mesh_texture(document_uid:str,object_guid:str,path:str) -> dict[str,Any]:
@@ -348,13 +397,17 @@ async def cubism_native_import_physics3(document_uid:str,path:str,replace:bool=F
 
 @mcp.tool()
 async def cubism_native_simulate_physics(document_uid:str,frames:list[dict[str,float]],delta_seconds:float=1/60,
-                                         warmup_frames:int=120) -> dict[str,Any]:
+                                         warmup_frames:int=120, output_parameter_ids: list[str] | None = None,
+                                         result_mode: Literal['trace', 'summary'] = 'trace',
+                                         execution: Literal['sync', 'job'] = 'sync',
+                                         request_id: str | None = None) -> dict[str,Any]:
     """Run Cubism's solver on isolated copies. Each frame supplies absolute drivers.
 
     Unspecified parameters reset to defaults each step. Does not change the editor pose.
     """
     return await native('simulate_physics',document_uid=document_uid,frames=frames,
-                        delta_seconds=delta_seconds,warmup_frames=warmup_frames)
+                        delta_seconds=delta_seconds,warmup_frames=warmup_frames, output_parameter_ids=output_parameter_ids,
+                        result_mode=result_mode, execution=execution, request_id=request_id)
 
 
 @mcp.tool()
@@ -420,6 +473,57 @@ async def cubism_native_set_blend_mode(document_uid: str, object_guid: str, blen
 async def cubism_native_set_part_offscreen(document_uid: str, part_guid: str, enabled: bool) -> dict[str, Any]:
     """Toggle part-level Offscreen Drawing. Enabling also groups the part's draw order."""
     return await native('set_part_offscreen', document_uid=document_uid, part_guid=part_guid, enabled=enabled)
+
+
+@mcp.tool()
+async def cubism_native_edit_part_rendering(document_uid: str, part_guid: str,
+                                            patch: PartRenderingPatch) -> dict[str, Any]:
+    """Edit offscreen drawing, clipping, inverted masks and draw order grouping as one native undo."""
+    return await native('edit_part_rendering', document_uid=document_uid, part_guid=part_guid, **patch.provided())
+
+
+@mcp.tool()
+async def cubism_native_mirror_keyforms(document_uid: str, source_guid: str, target_guid: str,
+                                       axis: Literal['x', 'y'], pivot: float, forms: list[MirrorForm],
+                                       vertex_indices: list[int] | None = None) -> dict[str, Any]:
+    """Reflect the named canvas coordinate about a pixel pivot into explicit target forms.
+
+    ArtMesh vertex_indices maps each target vertex to a source vertex. Warp grid order follows the mirror axis.
+    """
+    return await native('mirror_keyforms', document_uid=document_uid, source_guid=source_guid, target_guid=target_guid,
+                        axis=axis, pivot=pivot, forms=[form.provided() for form in forms], vertex_indices=vertex_indices)
+
+
+@mcp.tool()
+async def cubism_native_plan_delete_objects(document_uid: str, object_guids: list[str], cascade: bool = False,
+                                            detach_references: bool = False) -> dict[str, Any]:
+    """Preview an object deletion and its effects on children, masks, Glue, ArtPath and materials."""
+    return await native('plan_delete_objects', document_uid=document_uid, object_guids=object_guids,
+                        cascade=cascade, detach_references=detach_references)
+
+
+@mcp.tool()
+async def cubism_native_delete_objects(document_uid: str, object_guids: list[str], plan_id: str,
+                                       cascade: bool = False, detach_references: bool = False) -> dict[str, Any]:
+    """Apply a current, unblocked deletion plan as one native undo."""
+    return await native('delete_objects', document_uid=document_uid, object_guids=object_guids,
+                        plan_id=plan_id, cascade=cascade, detach_references=detach_references)
+
+
+@mcp.tool()
+async def cubism_native_inspect_art_paths(document_uid: str, object_guid: str | None = None) -> dict[str, Any]:
+    """List ArtPath brushes, native control points, keyforms and mesh bindings."""
+    return await native('inspect_art_paths', document_uid=document_uid, object_guid=object_guid)
+
+
+@mcp.tool()
+async def cubism_native_create_art_path(document_uid: str, name: str, points: list[ArtPathPoint],
+                                        brush_guid: str | None = None, part_guid: str | None = None,
+                                        deformer_guid: str | None = None, closed: bool = False) -> dict[str, Any]:
+    """Create a native ArtPath from canvas points at the default pose. Omit brush_guid for Cubism's default stroke."""
+    return await native('create_art_path', document_uid=document_uid, name=name,
+                        points=[point.provided() for point in points], brush_guid=brush_guid,
+                        part_guid=part_guid, deformer_guid=deformer_guid, closed=closed)
 
 
 @mcp.tool()
@@ -636,6 +740,27 @@ async def cubism_native_set_timeline_keys(document_uid: str, track_guid: str, pa
     """Set or replace native parameter keys at integer frames in one animation scene and track."""
     return await native('set_timeline_keys', document_uid=document_uid, track_guid=track_guid,
                         parameter_id=parameter_id, keys=[key.provided() for key in keys])
+
+
+@mcp.tool()
+async def cubism_native_edit_animation_scene(document_uid: str, patch: AnimationScenePatch) -> dict[str, Any]:
+    """Change native scene settings with undo. Changing FPS preserves integer keyframe positions."""
+    return await native('edit_animation_scene', document_uid=document_uid, **patch.provided())
+
+
+@mcp.tool()
+async def cubism_native_batch_edit_timeline(document_uid: str, edits: list[TimelineEdit]) -> dict[str, Any]:
+    """Validate then update multiple native parameter curves with one undo entry."""
+    return await native('batch_edit_timeline', document_uid=document_uid, edits=[edit.provided() for edit in edits])
+
+
+@mcp.tool()
+async def cubism_native_export_expression3(document_uid: str, path: str, parameters: list[ExpressionParameter],
+                                            fade_in_seconds: float = 1, fade_out_seconds: float = 1) -> dict[str, Any]:
+    """Write a new SDK expression file using explicit parameter IDs and blend modes."""
+    return await native('export_expression3', document_uid=document_uid, path=path,
+                        parameters=[parameter.provided() for parameter in parameters],
+                        fade_in_seconds=fade_in_seconds, fade_out_seconds=fade_out_seconds)
 
 
 @mcp.tool()

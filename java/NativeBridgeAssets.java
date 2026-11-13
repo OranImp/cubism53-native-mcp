@@ -596,9 +596,40 @@ final class NativeBridgeAssets {
         var blockers = runtimeBlockers(doc.getModelSource(), sdk);
         blockers.addAll(omittedArtPaths(doc.getModelSource()));
         var files = List.<String>of();
+        var diagnostics = new ArrayList<Object>();
         try { files = List.copyOf(runtimeAssets(doc.getModelSource(), workspace, request).files.keySet()); }
+        catch (NativeBridgeSdk.InvalidAttachment error) {
+            blockers.add(error.getMessage());
+            diagnostics.add(error.diagnostic());
+        }
         catch (IOException | IllegalArgumentException error) { blockers.add(error.getMessage()); }
-        return map("sdk_version", sdk, "ready", blockers.isEmpty(), "blockers", blockers, "attachments", files);
+        return map("sdk_version", sdk, "ready", blockers.isEmpty(), "blockers", blockers, "attachments", files,
+            "diagnostics", diagnostics);
+    }
+
+    static Object exportExpression(CModelingDocument doc, Path workspace, Map<String,Object> request) throws IOException {
+        var path = output(workspace, request.get("path"), ".exp3.json");
+        var parameters = new HashSet<String>();
+        for (var parameter : doc.getModelSource().getAllParameters()) parameters.add(parameter.getId().toString());
+        var values = new ArrayList<Object>();
+        for (Object value : (List<?>) request.get("parameters")) {
+            var row = (Map<?,?>) value;
+            if (row.get("blend") == null) throw new IllegalArgumentException("Specify an expression blend mode");
+            values.add(map("Id", row.get("id"), "Value", row.get("value"), "Blend", row.get("blend")));
+        }
+        if (values.isEmpty()) throw new IllegalArgumentException("Provide at least one expression parameter");
+        double fadeIn = expressionFade(request.get("fade_in_seconds"));
+        double fadeOut = expressionFade(request.get("fade_out_seconds"));
+        var data = map("Type", "Live2D Expression", "FadeInTime", fadeIn, "FadeOutTime", fadeOut, "Parameters", values);
+        new NativeBridgeSdk(path, parameters, Set.of()).expression(data);
+        writeNew(path, org.json.simple.JSONValue.toJSONString(data));
+        return map("path", path.toString(), "parameter_count", values.size(), "fade_in_seconds", fadeIn, "fade_out_seconds", fadeOut);
+    }
+
+    private static double expressionFade(Object value) {
+        if (!(value instanceof Number number) || !Float.isFinite(number.floatValue()) || number.doubleValue() < 0)
+            throw new IllegalArgumentException("Expression fade time must be finite and non-negative");
+        return number.doubleValue();
     }
 
     private static List<String> omittedArtPaths(CModelSource source) {
@@ -669,10 +700,7 @@ final class NativeBridgeAssets {
             String group = nonblank(row.get("group"), "motion group");
             var path = input(workspace, row.get("path"), ".motion3.json");
             var asset = readAttachment(path);
-            for (var curve : rows(asset.data, "Curves")) {
-                if ("Parameter".equals(curve.get("Target"))) requireId(parameters, curve.get("Id"), path);
-                if ("PartOpacity".equals(curve.get("Target"))) requireId(parts, curve.get("Id"), path);
-            }
+            new NativeBridgeSdk(path, parameters, parts).motion(asset.data);
             String file = addAttachment(files, "motions", path, asset.bytes);
             motions.computeIfAbsent(group, ignored -> new ArrayList<>()).add(map("File", file));
         }
@@ -682,23 +710,14 @@ final class NativeBridgeAssets {
             if (!names.add(name.toLowerCase(Locale.ROOT))) throw new IllegalArgumentException("Duplicate expression name: " + name);
             var path = input(workspace, row.get("path"), ".exp3.json");
             var asset = readAttachment(path);
-            for (var parameter : rows(asset.data, "Parameters")) requireId(parameters, parameter.get("Id"), path);
+            new NativeBridgeSdk(path, parameters, parts).expression(asset.data);
             expressions.add(map("Name", name, "File", addAttachment(files, "expressions", path, asset.bytes)));
         }
         String physics = null;
         if (request.get("physics_path") != null) {
             var path = input(workspace, request.get("physics_path"), ".physics3.json");
             var asset = readAttachment(path);
-            for (var setting : rows(asset.data, "PhysicsSettings")) {
-                for (var row : rows(setting, "Input")) {
-                    if (!(row.get("Source") instanceof Map<?,?> ref)) throw new IllegalArgumentException("Physics input lacks a source");
-                    requireId(parameters, ref.get("Id"), path);
-                }
-                for (var row : rows(setting, "Output")) {
-                    if (!(row.get("Destination") instanceof Map<?,?> ref)) throw new IllegalArgumentException("Physics output lacks a destination");
-                    requireId(parameters, ref.get("Id"), path);
-                }
-            }
+            new NativeBridgeSdk(path, parameters, parts).physics(asset.data);
             physics = addAttachment(files, "physics", path, asset.bytes);
         }
         return new RuntimeAssets(files, motions, expressions, physics);
@@ -709,23 +728,8 @@ final class NativeBridgeAssets {
     private static Attachment readAttachment(Path path) throws IOException {
         byte[] bytes = Files.readAllBytes(path);
         if (!(org.json.simple.JSONValue.parse(new String(bytes, StandardCharsets.UTF_8)) instanceof Map<?,?> data))
-            throw new IllegalArgumentException("Invalid JSON attachment: " + path.getFileName());
+            throw new NativeBridgeSdk.InvalidAttachment(path, "$", "Invalid JSON attachment");
         return new Attachment(bytes, data);
-    }
-
-    private static List<Map<?,?>> rows(Map<?,?> data, String key) {
-        if (!(data.get(key) instanceof List<?> rows)) throw new IllegalArgumentException("Attachment requires " + key);
-        var result = new ArrayList<Map<?,?>>();
-        for (var row : rows) {
-            if (!(row instanceof Map<?,?> entry)) throw new IllegalArgumentException("Invalid attachment row in " + key);
-            result.add(entry);
-        }
-        return result;
-    }
-
-    private static void requireId(Set<String> known, Object id, Path path) {
-        if (!(id instanceof String key) || !known.contains(key))
-            throw new IllegalArgumentException(path.getFileName() + " references an unknown model ID: " + id);
     }
 
     private static String addAttachment(Map<String,byte[]> files, String folder, Path path, byte[] bytes) {

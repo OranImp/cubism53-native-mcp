@@ -1,5 +1,29 @@
 # 验证记录
 
+## v0.3.0 功能与性能
+
+Cubism 5.3.03 和 5.3.04 使用同一份 Windows x64 便携 ZIP。测试在独立编辑器进程、工作区和端口运行。客户端 PATH 只包含 Windows 系统目录。两版通过 stdio 发现 84 项工具，对照 v0.2.1 比较原有 75 项工具定义和可选参数。
+
+5.3.03 在 FREE 版验收。测试模型把三个表情及动画参数分配到两个 ArtMesh，每个对象最多绑定两个参数，以满足原生保存限制。
+
+| 检查 | 验证内容 |
+| --- | --- |
+| 原生模型编辑 | 部件遮罩像素、ArtMesh 与 Warp 镜像、删除计划过期和级联、Glue 与共享材质、原生撤销重做、ArtPath 自定义笔刷和控制点保存重开。 |
+| 场景与文件 | CAN3 属性修改和多曲线单次撤销、缩短场景时的轨道与事件冲突、Motion3 帧率及单轨时长、循环、淡入淡出。移动已打开的 CMO3 和 CAN3 后仍能打开另一文件及对有效路径去重。 |
+| SDK | 共享附件预检和实际打包，覆盖无效表情混合、截断曲线、物理粒子索引和合法省略字段。用官方 Viewer 随附 SDK 加载原生 MOC3、Motion3 和生成的 Expression3，检查部件遮罩和表情叠加后的参数值。验证 SDK 5.0 的部件离屏诊断及现有 ArtPath 导出限制。 |
+| 物理 | 原型在两版上以 241 帧对照 v0.2.1，逐帧结果相同。正式 MCP 对比同步、作业与汇总输出。 |
+| 高分辨率 | 对 3840 × 2160 和 7680 × 4320 PNG 进行同姿态差分。Java 检查涵盖大图独占、额度释放和低堆内存拒绝。 |
+| 旧版回归 | 旧桥接升级、批量建模、PSD 历史层恢复、原生撤销导致的缓存失效、双客户端与双端口预览、物理、MOC3 和 Motion3 导出。 |
+
+下表为最终 ZIP 在测试机的单次记录。耗时包含基准渲染和同姿态差分，峰值为编辑器进程累计工作集。两版在两种尺寸的差分像素数均为零。Python 7 项测试、Java 作业调度和 Glue 检查均通过。
+
+| 构建 | 分辨率 | 渲染与差分 | 渲染期间状态查询 | 峰值工作集 |
+| --- | --- | --- | --- | --- |
+| 5.3.03 FREE | 3840 × 2160 | 2.467 秒 | 0.075 秒 | 848 MiB |
+| 5.3.03 FREE | 7680 × 4320 | 5.363 秒 | 0.068 秒 | 1382 MiB |
+| 5.3.04 | 3840 × 2160 | 2.036 秒 | 0.076 秒 | 901 MiB |
+| 5.3.04 | 7680 × 4320 | 5.477 秒 | 0.079 秒 | 1343 MiB |
+
 ## v0.2.1 修复回归
 
 同一份 Windows x64 ZIP 分别用于 Cubism 5.3.03 和 5.3.04 的独立编辑器进程、工作区、端口和 profile。便携客户端进程的 PATH 只含 Windows 系统目录。对照 v0.2.0 的 75 项工具定义，并用旧包实际启动同构建旧桥接，验证新版拒绝复用、旧包停止桥接及新版重新连接。
@@ -45,10 +69,10 @@ java -cp .state/test-classes cubism53.mcp.GlueSearchCheck
 
 `NativeJobsCheck.java` 使用已编译的桥接 JAR 和 Cubism 安装目录中的 `app/lib/*`、`app/lib/jogl/*` 作为 classpath，运行入口为 `cubism53.mcp.NativeJobsCheck`。
 
-便携实机用例需要测试环境安装 Pillow 与 psd-tools。准备空白的独立测试环境并解压 ZIP，命令会启动一个专用编辑器进程。
+便携实机用例需要测试环境安装 Pillow 与 psd-tools。启用高分辨率统计时还需安装 psutil。准备空白的独立测试环境并解压 ZIP，命令会启动一个专用编辑器进程。
 
 ```powershell
-python -B tests/portable_smoke.py --package 'C:/path/to/Cubism53-Native-MCP' --editor-home 'C:/path/to/Live2D Cubism 5.3' --native-probe
+python -B tests/portable_smoke.py --package 'C:/path/to/Cubism53-Native-MCP' --editor-home 'C:/path/to/Live2D Cubism 5.3' --native-probe --high-resolution
 ```
 
-分别用两个受支持的 `--editor-home` 执行同一份便携包。`--native-probe` 使用测试机的 JDK 17 编译测试代理，并仅附加到该次用例启动的进程。传入 `--previous-package` 指向解出的 v0.2.0 便携包以重现升级，传入 `--baseline-server` 指向该包的 `app/server.py` 以比较工具定义。5.3.03 还可用 `--legacy-server` 指向独立解出的 `2611ec9/server.py`，生成旧版 PSD 重导入样本。
+分别用两个受支持的 `--editor-home` 执行同一份便携包。`--native-probe` 使用测试机的 JDK 17 编译测试代理和 SDK 检查程序。测试代理仅附加到该次用例启动的进程。传入 `--previous-package` 指向解出的 v0.2.1 便携包以重现升级，传入 `--baseline-server` 指向该包的 `app/server.py` 以比较工具定义。5.3.03 还可用 `--legacy-server` 指向独立解出的 `2611ec9/server.py`，生成旧版 PSD 重导入样本。

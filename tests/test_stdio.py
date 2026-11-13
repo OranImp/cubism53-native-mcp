@@ -44,7 +44,7 @@ class StdioTest(unittest.IsolatedAsyncioTestCase):
                 async with stdio_client(options) as (reader, writer), ClientSession(reader, writer) as session:
                     await session.initialize()
                     listing = await session.list_tools()
-                    self.assertEqual(len({tool.name for tool in listing.tools}), 75)
+                    self.assertEqual(len({tool.name for tool in listing.tools}), 84)
                     self.assertIsNone(listing.nextCursor)
                     result = await session.call_tool('cubism_native_status', {})
                     self.assertTrue(result.structuredContent['editor_thread'])

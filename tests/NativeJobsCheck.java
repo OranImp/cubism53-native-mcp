@@ -65,6 +65,24 @@ public final class NativeJobsCheck {
         clock.addAndGet(Duration.ofDays(7).toNanos());
         retention.prune();
         if (retention.expired("mesh-job", null)) throw new AssertionError("Expiry marker was retained too long");
-        System.out.println("Native job capacity, replay, polling, drain and expiry verified");
+        try (var render = NativeBridgeRendering.reserve(3840, 2160, 0, false)) {
+            if (!render.large) throw new AssertionError("UHD render should be exclusive");
+            try (var ignored = NativeBridgeRendering.reserve(256, 256, 0, false)) {
+                throw new AssertionError("A second render was admitted while UHD held the permit");
+            } catch (IllegalStateException expected) {
+                if (!expected.getMessage().contains("Render capacity")) throw expected;
+            }
+        }
+        try (var render = NativeBridgeRendering.reserve(256, 256, 0, false)) {
+            if (render.large) throw new AssertionError("Small render should not be exclusive");
+        }
+        if (Runtime.getRuntime().maxMemory() <= 512L * 1024 * 1024) {
+            try (var ignored = NativeBridgeRendering.reserve(7680, 4320, 7680L * 4320, false)) {
+                throw new AssertionError("8K diff exceeded the test heap budget");
+            } catch (IllegalStateException expected) {
+                if (!expected.getMessage().contains("Insufficient editor heap")) throw expected;
+            }
+        }
+        System.out.println("Native job capacity, replay, polling, drain, expiry and render admission verified");
     }
 }

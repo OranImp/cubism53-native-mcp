@@ -4,6 +4,7 @@ import com.live2d.cubism.doc.model.CModelSource;
 import com.live2d.cubism.doc.model.param.CParameterSet;
 import com.live2d.cubism.doc.modeling.CModelingDocument;
 import java.awt.image.BufferedImage;
+import java.io.IOException;
 import java.nio.file.*;
 import java.security.MessageDigest;
 import java.util.*;
@@ -14,6 +15,62 @@ import org.json.simple.JSONValue;
 import static cubism53.mcp.NativeBridge.*;
 
 final class NativeBridgeRendering {
+    private static final long MIB = 1024L * 1024L;
+    private static final long UHD_PIXELS = 3840L * 2160L;
+    private static final Object budget = new Object();
+    private static long reserved;
+    private static int active;
+    private static int waitingLarge;
+    private static boolean exclusive;
+
+    static final class Permit implements AutoCloseable {
+        final boolean large;
+        final long bytes;
+
+        private Permit(boolean large, long bytes) { this.large = large; this.bytes = bytes; }
+
+        public void close() {
+            synchronized (budget) {
+                reserved -= bytes;
+                active--;
+                if (large) exclusive = false;
+                budget.notifyAll();
+            }
+        }
+    }
+
+    static Permit reserve(int width, int height, long differencePixels, boolean wait) throws InterruptedException {
+        if (width < 1 || height < 1 || width > 8192 || height > 8192)
+            throw new IllegalArgumentException("Image size out of range");
+        long pixels = (long) width * height;
+        boolean large = pixels >= UHD_PIXELS;
+        long padded = ((width + 15L) / 16 * 16) * ((height + 15L) / 16 * 16);
+        // A matching baseline may be a 16-bit RGBA PNG.
+        long estimate = padded * 8 + differencePixels * 12 + 32 * MIB;
+        synchronized (budget) {
+            if (large) waitingLarge++;
+            try {
+                while (exclusive || (large ? active > 0 : waitingLarge > 0)) {
+                    if (!wait) throw new IllegalStateException("Render capacity is occupied by a high-resolution job");
+                    budget.wait();
+                }
+                var runtime = Runtime.getRuntime();
+                long used = runtime.totalMemory() - runtime.freeMemory();
+                long headroom = Math.max(128 * MIB, runtime.maxMemory() / 10);
+                if (estimate > runtime.maxMemory() - used - reserved - headroom)
+                    throw new IllegalStateException("Insufficient editor heap for render buffers (estimated "
+                        + ((estimate + MIB - 1) / MIB) + " MiB). Reduce the resolution or free editor memory.");
+                active++;
+                exclusive = large;
+                reserved += estimate;
+                return new Permit(large, estimate);
+            } finally {
+                if (large) waitingLarge--;
+                budget.notifyAll();
+            }
+        }
+    }
+
     private record Frame(String name, CParameterSet pose, Map<String,Double> parameters) {}
 
     private record RenderPlan(CModelSource snapshot, NativeRenderSession renderer, int width, int height,
@@ -77,11 +134,37 @@ final class NativeBridgeRendering {
 
     static Object renderSet(Callable<CModelingDocument> document, Path workspace, Map<String,Object> request) throws Exception {
         var output = NativeBridgeAssets.output(workspace, request.get("directory"), "");
+        int[] size = onEditorThread(() -> {
+            var canvas = document.call().getModelSource().getCanvas();
+            return new int[]{integer(request, "width", canvas.getPixelWidth()),
+                integer(request, "height", canvas.getPixelHeight())};
+        }, 0);
+        long difference = request.get("baseline_manifest") == null ? 0 : (long) size[0] * size[1];
+        if (difference > 0 && request.get("crop") instanceof List<?> crop && crop.size() == 4) {
+            long width = ((Number) crop.get(2)).intValue() - (long) ((Number) crop.get(0)).intValue();
+            long height = ((Number) crop.get(3)).intValue() - (long) ((Number) crop.get(1)).intValue();
+            if (width > 0 && width <= size[0] && height > 0 && height <= size[1]) difference = width * height;
+        }
+        try (var permit = reserve(size[0], size[1], difference, true)) {
+            return renderReserved(document, workspace, output, request, size, permit);
+        }
+    }
+
+    private static Object renderReserved(Callable<CModelingDocument> document, Path workspace, Path output,
+                                         Map<String,Object> request, int[] size, Permit permit) throws Exception {
         Files.createDirectories(output.getParent());
         Path staging = Files.createTempDirectory(output.getParent(), ".cubism-render-");
         try {
             int count;
-            try (var plan = onEditorThread(() -> prepare(document.call(), request), 0)) {
+            try (var plan = onEditorThread(() -> {
+                var doc = document.call();
+                var canvas = doc.getModelSource().getCanvas();
+                if (size[0] != integer(request, "width", canvas.getPixelWidth())
+                        || size[1] != integer(request, "height", canvas.getPixelHeight()))
+                    throw new IllegalStateException("Canvas changed before rendering began");
+                if (permit.large) closeRenderSessions(null);
+                return prepare(doc, request);
+            }, 0)) {
                 writeSet(plan, workspace, staging, request);
                 count = plan.frames.size();
             }
@@ -93,6 +176,7 @@ final class NativeBridgeRendering {
     private static void writeSet(RenderPlan plan, Path workspace, Path staging, Map<String,Object> request) throws Exception {
         var bounds = List.of(plan.x, plan.y, plan.x + plan.w, plan.y + plan.h);
         Path previous = null;
+        var references = new HashMap<String,Path>();
         if (request.get("baseline_manifest") != null) {
             previous = NativeBridgeAssets.input(workspace, request.get("baseline_manifest"), ".json");
             if (!(JSONValue.parse(Files.readString(previous)) instanceof Map<?,?> baseline)
@@ -106,7 +190,7 @@ final class NativeBridgeRendering {
                     .map(v -> (Map<?,?>) v).findFirst().orElseThrow(() -> new IllegalArgumentException("Missing baseline pose " + frame.name));
                 if (!frame.parameters.equals(match.get("parameters")))
                     throw new IllegalArgumentException("Baseline parameters differ for " + frame.name);
-                NativeBridgeAssets.input(workspace, previous.resolveSibling(frame.name + ".png").toString(), ".png");
+                references.put(frame.name, NativeBridgeAssets.input(workspace, previous.resolveSibling(frame.name + ".png").toString(), ".png"));
             }
         }
         var result = new ArrayList<Object>();
@@ -124,9 +208,9 @@ final class NativeBridgeRendering {
                 var row = map("name", frame.name, "path", file, "parameters", frame.parameters, "sha256", hash(target));
                 if (previous != null) {
                     String diff = frame.name + ".diff.png";
-                    var reference = ImageIO.read(previous.resolveSibling(file).toFile());
+                    var reference = readBaseline(references.get(frame.name), plan.w, plan.h);
                     try { row.put("difference", difference(pixels, reference, staging.resolve(diff))); }
-                    finally { if (reference != null) reference.flush(); }
+                    finally { reference.flush(); }
                 }
                 result.add(row);
             } finally { image.flush(); }
@@ -143,6 +227,21 @@ final class NativeBridgeRendering {
         return HexFormat.of().formatHex(digest.digest());
     }
 
+    private static BufferedImage readBaseline(Path file, int width, int height) throws IOException {
+        try (var stream = ImageIO.createImageInputStream(file.toFile())) {
+            if (stream == null) throw new IOException("Cannot open baseline PNG: " + file.getFileName());
+            var readers = ImageIO.getImageReadersByFormatName("PNG");
+            if (!readers.hasNext()) throw new IOException("PNG reader unavailable");
+            var reader = readers.next();
+            try {
+                reader.setInput(stream, true, true);
+                if (reader.getWidth(0) != width || reader.getHeight(0) != height)
+                    throw new IllegalArgumentException("Baseline image dimensions differ: " + file.getFileName());
+                return reader.read(0);
+            } finally { reader.dispose(); }
+        }
+    }
+
     private static Object difference(BufferedImage actual, BufferedImage expected, Path path) throws Exception {
         int width = actual.getWidth(), height = actual.getHeight();
         if (expected == null || expected.getWidth() != width || expected.getHeight() != height)
@@ -150,9 +249,11 @@ final class NativeBridgeRendering {
         var diff = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
         long changed = 0;
         int maximum = 0;
+        int[] a = new int[width];
+        int[] b = new int[width];
         for (int y = 0; y < height; y++) {
-            int[] a = actual.getRGB(0, y, width, 1, null, 0, width);
-            int[] b = expected.getRGB(0, y, width, 1, null, 0, width);
+            actual.getRGB(0, y, width, 1, a, 0, width);
+            expected.getRGB(0, y, width, 1, b, 0, width);
             for (int x = 0; x < width; x++) {
                 int pixel = 0;
                 for (int shift = 0; shift < 32; shift += 8)
@@ -163,7 +264,8 @@ final class NativeBridgeRendering {
             }
             diff.setRGB(0, y, width, 1, a, 0, width);
         }
-        ImageIO.write(diff, "PNG", path.toFile());
+        try { ImageIO.write(diff, "PNG", path.toFile()); }
+        finally { diff.flush(); }
         return map("path", path.getFileName().toString(), "changed_pixels", changed, "max_channel_delta", maximum);
     }
 }

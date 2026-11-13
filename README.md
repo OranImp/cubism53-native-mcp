@@ -1,6 +1,6 @@
 # Cubism 5.3 Native MCP
 
-在 Windows x64 上通过 MCP stdio 操作 Live2D Cubism Editor **5.3.03** 和 **5.3.04**，共 75 个工具。桥接器在已运行的官方编辑器进程中调用原生建模、动画、物理、渲染和导出接口。两项临时画布预览工具使用 Cubism 官方本机 WebSocket API。
+在 Windows x64 上通过 MCP stdio 操作 Live2D Cubism Editor **5.3.03** 和 **5.3.04**，共 84 个工具。桥接器在已运行的官方编辑器进程中调用原生建模、动画、物理、渲染和导出接口。两项临时画布预览工具使用 Cubism 官方本机 WebSocket API。
 
 ## 下载
 
@@ -118,7 +118,7 @@ python portable/build.py --python-zip python-3.13.17-embed-amd64.zip --wheelhous
 | --- | --- |
 | `connect` | 发现并连接已经运行的指定版本编辑器 |
 | `status`、`document` | 文档路径、UID、对象数量及撤销状态 |
-| `objects`、`object` | 部件标识、参数范围、关键形、UV、网格数据 |
+| `objects`、`object` | 部件标识、参数范围、关键形、UV、网格数据，支持按需筛选 |
 | `import_png` | 原生材质与 ArtMesh 导入，输入 PNG 像素到画布的仿射矩阵 |
 | `export_mesh_texture` | 无损导出已嵌入的 ArtMesh 材质 PNG，返回图像到源网格变换；不改写源模型 |
 | `replace_mesh_texture` | 用同尺寸 PNG 替换内嵌材质像素，共享该材质的 ArtMesh 会一同更新 |
@@ -162,6 +162,12 @@ python portable/build.py --python-zip python-3.13.17-embed-amd64.zip --wheelhous
 | `preflight_runtime_export`、`export_runtime_package` | 检查目标 SDK 兼容性并组装原生模型、动作、表情和物理 |
 | `set_form_colors`、`replace_mesh_texture_resized` | 编辑关键形乘算色和滤色，为指定 ArtMesh 更换异尺寸贴图 |
 | `create_blend_shape` | 以普通 ArtMesh 关键形为基准创建原生 Blend Shape |
+| `export_expression3` | 按参数 ID、混合模式和淡入淡出时间写入 SDK 表情文件 |
+| `edit_animation_scene`、`batch_edit_timeline` | 编辑场景帧率、时长、循环、淡入淡出，或一次撤销中编辑多条参数曲线 |
+| `edit_part_rendering` | 设置部件离屏渲染、裁剪、反向遮罩和绘制顺序组 |
+| `mirror_keyforms` | 按画布像素轴心把 ArtMesh 或 Warp 关键形镜像到明确指定的目标关键形 |
+| `plan_delete_objects`、`delete_objects` | 查看对象删除的影响并按同一预检凭据执行原生撤销组 |
+| `inspect_art_paths`、`create_art_path` | 查询路径、笔刷、点和绑定，或从画布坐标创建原生 ArtPath |
 
 
 ## 调用约定
@@ -172,6 +178,11 @@ python portable/build.py --python-zip python-3.13.17-embed-amd64.zip --wheelhous
 - PSD 重导入先用 `plan_psd_reimport` 检查冲突。缺失层保留原对象。图层重新出现且可唯一匹配同一来源的历史层时，会更新原材质。发生冲突时，把候选的 `key` 填入 `layer_map` 并重新预检。历史候选键形如 `来源GUID:图层键`。需要明确创建新层时，映射值可用 `new`。
 - `edit_batch` 先用 `mode=plan` 获取凭据，再提交同一组编辑与 `plan_id`。部件移动按顺序预检，计划在相关文档状态改变后失效。
 - 5.3.03 的原生 SDK 导出会移除 ArtPath。`export_runtime_package` 会拦截使用可见 ArtPath 或将其用于裁剪的模型。`export_runtime_model` 会返回有关丢失的警告。
+- `objects` 可指定 `sections`、`part_guid`、`parameter_id` 及 `object_types`。类型使用返回的名称，例如 `CArtMeshSource`。`parameter_id` 匹配对象的直接普通参数或 Blend Shape 绑定。`object` 可用 `form_guids` 限定关键形，或用 `geometry=false` 省略顶点、网格和 UV。
+- `simulate_physics` 默认返回逐帧轨迹。`result_mode=summary` 返回选定输出的范围，`output_parameter_ids` 用来限定输出，`execution=job` 配合 `request_id` 可异步轮询。4K 及以上的渲染作业独占渲染额度，内存不足时会在分配缓冲前报错。
+- 表情文件的 `Add` 是增量，`Multiply` 是倍率，`Overwrite` 是绝对值。运行包预检和打包使用相同的附件校验，诊断包含出错文件及字段。
+- `edit_animation_scene` 改帧率时保留关键帧的整数帧位。单轨 `export_motion3` 仍按轨道区间导出，场景时长可独立修改。
+- 镜像的 `axis=x` 翻转横坐标，`axis=y` 翻转纵坐标。`vertex_indices` 按目标顶点顺序提供源顶点索引。删除预检默认阻止未包含的子对象或存活引用，可用 `cascade` 和 `detach_references` 明确扩展删除范围。存活 ArtPath 的点绑定需要先在编辑器中处理。新模型没有自定义笔刷时，可省略 `brush_guid` 使用原生默认线条。
 
 ## 验证
 

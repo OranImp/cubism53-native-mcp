@@ -128,7 +128,8 @@ public final class NativeBridge {
             } else if ("job_status".equals(operation)) {
                 reply(socket, map("ok", true, "result", NativeBridgeJobs.status(request)));
             } else if (Set.of("render_pose_set", "export_runtime_package").contains(operation)
-                    || "job".equals(request.get("execution")) && Set.of("reimport_psd", "export_runtime_model").contains(operation)) {
+                    || "job".equals(request.get("execution"))
+                        && Set.of("reimport_psd", "export_runtime_model", "simulate_physics").contains(operation)) {
                 boolean background = !"reimport_psd".equals(operation);
                 reply(socket, map("ok", true, "result", NativeBridgeJobs.submit(operation, request, background,
                     () -> background ? executeBackground(operation, request, 0) : execute(operation, request))));
@@ -152,7 +153,7 @@ public final class NativeBridge {
             Object result;
             if ("stop".equals(operation)) {
                 result = stop(deadline);
-            } else if ("export_runtime_model".equals(operation)) {
+            } else if (Set.of("export_runtime_model", "simulate_physics").contains(operation)) {
                 NativeBridgeJobs.beginWork();
                 try { result = executeBackground(operation, request, deadline); }
                 finally { NativeBridgeJobs.endWork(); }
@@ -198,6 +199,10 @@ public final class NativeBridge {
             return doc;
         };
         if ("render_pose_set".equals(operation)) return NativeBridgeRendering.renderSet(document, workspace, request);
+        if ("simulate_physics".equals(operation)) {
+            var simulation = onEditorThread(() -> NativeBridgePhysics.prepare(document.call(), request), deadline);
+            return NativeBridgePhysics.solve(simulation, deadline);
+        }
         var destination = NativeBridgeAssets.output(workspace, request.get("directory"), "");
         var export = onEditorThread(() -> NativeBridgeAssets.prepareRuntime(document.call(), workspace, request), deadline);
         return NativeBridgeAssets.writeRuntime(export, destination, deadline);
@@ -267,11 +272,11 @@ public final class NativeBridge {
             String suffix = requestedPath.toLowerCase(Locale.ROOT).endsWith(".can3") ? ".can3" : ".cmo3";
             Path file = NativeBridgeAssets.input(workspace, requestedPath, suffix);
             for (CModelingDocument doc : app.getAllModelDocs()) {
-                if (doc.getFile() != null && doc.getFile().toPath().toRealPath().equals(file)) return describe(doc);
+                if (sameOpenFile(doc.getFile(), file)) return describe(doc);
             }
             for (var doc : NativeBridgeAnimation.scenes(app)) {
                 var path = doc.getAnimationContent().getFile();
-                if (path != null && path.toPath().toRealPath().equals(file)) return NativeBridgeAnimation.describe(doc);
+                if (sameOpenFile(path, file)) return NativeBridgeAnimation.describe(doc);
             }
             if (file.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".can3"))
                 return NativeBridgeAnimation.open(app, file);
@@ -343,6 +348,11 @@ public final class NativeBridge {
             case "add_glue_pairs": return addGluePairs(doc, request);
             case "suggest_glue_pairs": return suggestGluePairs(source, request);
             case "inspect_model_dependencies": return NativeBridgeModel.dependencies(source, request);
+            case "edit_part_rendering": return NativeBridgeAuthoring.editPart(doc, request);
+            case "mirror_keyforms": return NativeBridgeAuthoring.mirror(doc, request);
+            case "inspect_art_paths": return NativeBridgeAuthoring.paths(source, request);
+            case "create_art_path": return NativeBridgeAuthoring.createPath(doc, request);
+            case "plan_delete_objects", "delete_objects": return NativeBridgeAuthoring.delete(doc, op, request);
             case "set_form_colors": return NativeBridgeModel.setColors(doc, request);
             case "create_blend_shape": return NativeBridgeModel.createBlendShape(doc, request);
             case "replace_mesh_texture_resized": return NativeBridgeAssets.replaceResized(doc, workspace, request);
@@ -351,6 +361,7 @@ public final class NativeBridge {
             case "plan_psd_reimport", "reimport_psd": return NativeBridgeAssets.reimportPsd(doc, workspace, request, op);
             case "edit_texture_atlas": return NativeBridgeAssets.editAtlas(doc, request);
             case "export_physics3": return NativeBridgeAssets.exportPhysics(doc, workspace, request);
+            case "export_expression3": return NativeBridgeAssets.exportExpression(doc, workspace, request);
             case "preflight_runtime_export": return NativeBridgeAssets.preflightRuntime(doc, workspace, request);
             case "auto_generate_mesh": return startAutoMesh(doc, request);
             case "auto_mesh_status": return NativeBridgeJobs.meshStatus(doc.getDocumentUID(), (String) request.get("job_id"));
@@ -451,49 +462,6 @@ public final class NativeBridge {
                     finishEdit(doc,undo);return physicsInfo(source);
                 } catch (Throwable error) { undo.undo(); refresh(doc); throw error; }
             }
-            case "simulate_physics": {
-                var settings=source.getPhysicsSettingsSourceSet().deepCopy(new com.live2d.core.a());
-                if (settings.getSources().isEmpty()) throw new IllegalArgumentException("No physics groups");
-                var pose=source.getCurrentInstance().getParameterSet().deepCopy(new com.live2d.core.a());
-                float dt=request.get("delta_seconds") instanceof Number n ? n.floatValue() : 1f/60;
-                if (!Float.isFinite(dt) || dt<=0 || dt>.1f) throw new IllegalArgumentException("Physics time step must be 0..0.1 seconds");
-                int warmup=integer(request,"warmup_frames",120);List<?> frames=(List<?>)request.get("frames");
-                if (warmup<0 || warmup>3600 || frames==null || frames.isEmpty() || frames.size()>36000)
-                    throw new IllegalArgumentException("Invalid frame count");
-                var solver=new com.live2d.cubism.doc.gameData.physics.b();
-                solver.a().setX(settings.getGravity().getX());solver.a().setY(settings.getGravity().getY());
-                Set<String> outputs=new LinkedHashSet<>();
-                for (var group:settings.getSources()) {
-                    solver.a(group.getVertices(),settings.getGravity());
-                    for (var output:group.getOutputs()) outputs.add(source.getParameterSourceSet().get(output.getDestination()).getId().toString());
-                }
-                List<Object> trace=new ArrayList<>();
-                for (int frame=-warmup;frame<frames.size();frame++) {
-                    pose.setDefaultValues();Map<?,?> values=frame<0 ? Map.of() : (Map<?,?>)frames.get(frame);
-                    for (var entry:values.entrySet()) {
-                        var p=findParameter(source,(String)entry.getKey());float value=((Number)entry.getValue()).floatValue();
-                        checkParameterValue(p,value);pose.setValue(p.getGuid(),value);
-                    }
-                    for (var group:settings.getSources()) if (group.getEnable())
-                        solver.a(group,pose,settings.getGravity(),settings.getWind(),dt,
-                            ignored -> kotlin.Unit.INSTANCE,false,null,null,null);
-                    if (frame>=0) {
-                        Map<String,Object> valuesOut=new LinkedHashMap<>();
-                        for (String id:outputs) {
-                            float value=pose.get(findParameter(source,id).getGuid()).getValue();
-                            if (!Float.isFinite(value)) throw new IllegalStateException("Nonfinite physics output: "+id);
-                            valuesOut.put(id,value);
-                        }
-                        trace.add(map("frame",frame,"outputs",valuesOut));
-                    }
-                }
-                List<Object> ranges=new ArrayList<>();
-                for (var group:settings.getSources()) for (var output:group.getOutputs())
-                    ranges.add(map("group",group.getName(),"parameter",source.getParameterSourceSet().get(output.getDestination()).getId().toString(),
-                        "raw_minimum",output.getValueBelowMinimum(),"raw_maximum",output.getValueExceededMaximum()));
-                return map("native_solver","Cubism5.3 physics.b","delta_seconds",dt,"warmup_frames",warmup,
-                    "frames",trace,"output_ranges",ranges,"document_modified",false);
-            }
             case "import_png": {
                 Path file = NativeBridgeAssets.input(workspace, request.get("path"), ".png");
                 String name = (String)request.get("name");
@@ -553,25 +521,13 @@ public final class NativeBridge {
                 drawable.setInvertClippingMask(Boolean.TRUE.equals(request.get("invert")));
                 finishEdit(doc,undo); return objectInfo(item,true);
             }
-            case "objects": {
-                List<Object> objects = new ArrayList<>();
-                for (var item : source.getDrawableSourceSet().getSources()) objects.add(objectInfo(item, false));
-                for (var item : source.getDeformerSourceSet().getSources()) objects.add(objectInfo(item, false));
-                List<Object> parts = new ArrayList<>();
-                for (var part : source.getPartSourceSet().getSources()) parts.add(map("guid",part.getGuid().getUuidString(),
-                    "name",part.getLocalName(),"visible",part.isVisible(),"visible_in_hierarchy",part.isVisibleInHierarchy(),
-                    "parent_part_guid",part.getParent() == null ? null : part.getParent().getGuid().getUuidString()));
-                List<Object> parameters = new ArrayList<>();
-                for (var p : source.getParameterSourceSet().getSources()) parameters.add(map("id",p.getId().toString(),
-                    "name",p.getName(),"description",p.getDescription(),"minimum",p.getMinValue(),"maximum",p.getMaxValue(),"default",p.getDefaultValue(),
-                    "group_guid",p.getParentGroupGuid().getUuidString(),
-                    "current",source.getCurrentInstance().getParameterSet().get(p.getGuid()).getValue()));
-                return map("objects", objects, "parts",parts,"parameters",parameters,
-                    "parameter_groups",source.getParameterGroupSet().getGuidMap().values().stream()
-                        .sorted(Comparator.comparing(group -> group.getGuid().getUuidString()))
-                        .map(NativeBridge::parameterGroupInfo).toList());
+            case "objects": return listObjects(source, request);
+            case "object": {
+                var item = findObject(source, (String) request.get("object_guid"));
+                var forms = request.get("form_guids") instanceof List<?> ids ? new LinkedHashSet<>(ids) : null;
+                if (forms != null) for (var id : forms) findForm(item, nonblank(id, "form GUID"));
+                return objectInfo(item, !Boolean.FALSE.equals(request.get("geometry")), forms);
             }
-            case "object": return objectInfo(findObject(source, (String)request.get("object_guid")), true);
             case "replace_mesh_texture": {
                 var item=findObject(source,(String)request.get("object_guid"));
                 if (!(item instanceof CArtMeshSource mesh)) throw new IllegalArgumentException("ArtMesh required");
@@ -636,25 +592,39 @@ public final class NativeBridge {
             case "render_png": {
                 Path path = NativeBridgeAssets.output(workspace, request.get("path"), ".png");
                 int width = integer(request,"width",1024), height = integer(request,"height",2011);
-                if (width < 1 || height < 1 || width > 8192 || height > 8192) throw new IllegalArgumentException("Image size out of range");
                 Map<?,?> values = (Map<?,?>)request.getOrDefault("parameters",Map.of());
                 var pose = pose(source, (String) request.get("base_pose"), values);
                 pruneRenderSessions(app);
-                String key=doc.getDocumentUID()+":"+width+"x"+height;
-                boolean reused=renderSessions.containsKey(key);
-                if (!reused) {
-                    while (renderSessions.size()>=2) {
-                        String first=renderSessions.keySet().iterator().next();renderSessions.remove(first).close();
+                try (var permit = NativeBridgeRendering.reserve(width, height, 0, false)) {
+                    String key = doc.getDocumentUID() + ":" + width + "x" + height;
+                    var cached = renderSessions.get(key);
+                    boolean reused = cached != null;
+                    NativeRenderSession renderer;
+                    if (permit.large) {
+                        closeRenderSessions(null);
+                        renderer = new NativeRenderSession(doc.getDocumentUID(), source, width, height, pose);
+                    } else if (reused) {
+                        renderer = cached.renderer;
+                    } else {
+                        while (renderSessions.size() >= 2) {
+                            String first = renderSessions.keySet().iterator().next();
+                            renderSessions.remove(first).close();
+                        }
+                        renderer = new NativeRenderSession(doc.getDocumentUID(), source, width, height, pose);
+                        renderSessions.put(key, new CachedRender(doc, renderer));
                     }
-                    renderSessions.put(key,new CachedRender(doc, new NativeRenderSession(doc.getDocumentUID(),source,width,height,pose)));
+                    try {
+                        var image = renderer.render(pose);
+                        if (image == null) throw new IllegalStateException("Cubism offscreen renderer returned no image");
+                        try { Files.createDirectories(path.getParent()); image.writeImage(path.toFile()); }
+                        finally { image.flush(); }
+                        return map("path", path.toString(), "width", width, "height", height, "bytes", Files.size(path),
+                            "parameters", values, "renderer_reused", reused, "renderer_frames", renderer.frames,
+                            "live_renderers", renderSessions.size());
+                    } finally {
+                        if (permit.large) renderer.close();
+                    }
                 }
-                var renderer=renderSessions.get(key).renderer;
-                var image = renderer.render(pose);
-                if (image == null) throw new IllegalStateException("Cubism offscreen renderer returned no image");
-                try { Files.createDirectories(path.getParent()); image.writeImage(path.toFile()); }
-                finally { image.flush(); }
-                return map("path",path.toString(),"width",width,"height",height,"bytes",Files.size(path),"parameters",values,
-                    "renderer_reused",reused,"renderer_frames",renderer.frames,"live_renderers",renderSessions.size());
             }
             case "reparent": {
                 var item = findObject(source,(String)request.get("object_guid"));
@@ -855,6 +825,12 @@ public final class NativeBridge {
         throw new IllegalArgumentException("Document not found: " + uid);
     }
 
+    private static boolean sameOpenFile(java.io.File candidate, Path target) throws IOException {
+        if (candidate == null) return false;
+        try { return candidate.toPath().toRealPath().equals(target); }
+        catch (NoSuchFileException missing) { return false; }
+    }
+
     static Map<String,Object> describe(CModelingDocument doc) {
         CModelSource source = doc.getModelSource();
         List<Object> deformers = new ArrayList<>();
@@ -1050,7 +1026,7 @@ public final class NativeBridge {
         return patch.containsKey(key) ? finite(patch.get(key), key) : fallback;
     }
 
-    private static float finite(Object value, String label) {
+    static float finite(Object value, String label) {
         if (!(value instanceof Number number) || !Float.isFinite(number.floatValue()))
             throw new IllegalArgumentException(label + " must be finite");
         return number.floatValue();
@@ -1608,7 +1584,67 @@ public final class NativeBridge {
             throw new IllegalArgumentException("Parameter outside defined range: " + parameter.getId());
     }
 
-    static Map<String,Object> objectInfo(ACParameterControllableSource item,boolean geometry) {
+    private static Object listObjects(CModelSource source, Map<String,Object> request) {
+        var sections = request.get("sections") instanceof List<?> values ? values
+            : List.of("objects", "parts", "parameters", "parameter_groups");
+        CPartSource partFilter = null;
+        if (request.get("part_guid") instanceof String guid) {
+            var part = source.getRootPart();
+            partFilter = part.getGuid().getUuidString().equals(guid) ? null : requirePart(source, guid);
+        }
+        var types = request.get("object_types") instanceof List<?> values ? values : null;
+        var parameter = request.get("parameter_id") instanceof String id ? findParameter(source, id) : null;
+        var result = new LinkedHashMap<String,Object>();
+        if (sections.contains("objects")) {
+            List<Object> objects = new ArrayList<>();
+            for (var item : source.getDrawableSourceSet().getSources())
+                if (selectedObject(item, partFilter, types, parameter)) objects.add(objectInfo(item, false));
+            for (var item : source.getDeformerSourceSet().getSources())
+                if (selectedObject(item, partFilter, types, parameter)) objects.add(objectInfo(item, false));
+            result.put("objects", objects);
+        }
+        if (sections.contains("parts")) {
+            List<Object> parts = new ArrayList<>();
+            for (var part : source.getPartSourceSet().getSources()) if (inPart(part, partFilter))
+                parts.add(map("guid", part.getGuid().getUuidString(), "name", part.getLocalName(), "visible", part.isVisible(),
+                    "visible_in_hierarchy", part.isVisibleInHierarchy(),
+                    "parent_part_guid", part.getParent() == null ? null : part.getParent().getGuid().getUuidString()));
+            result.put("parts", parts);
+        }
+        if (sections.contains("parameters")) {
+            List<Object> parameters = new ArrayList<>();
+            for (var p : source.getParameterSourceSet().getSources()) if (parameter == null || p == parameter)
+                parameters.add(map("id", p.getId().toString(), "name", p.getName(), "description", p.getDescription(),
+                    "minimum", p.getMinValue(), "maximum", p.getMaxValue(), "default", p.getDefaultValue(),
+                    "group_guid", p.getParentGroupGuid().getUuidString(),
+                    "current", source.getCurrentInstance().getParameterSet().get(p.getGuid()).getValue()));
+            result.put("parameters", parameters);
+        }
+        if (sections.contains("parameter_groups")) result.put("parameter_groups",
+            source.getParameterGroupSet().getGuidMap().values().stream()
+                .sorted(Comparator.comparing(group -> group.getGuid().getUuidString()))
+                .map(NativeBridge::parameterGroupInfo).toList());
+        return result;
+    }
+
+    private static boolean inPart(ACParameterControllableSource item, CPartSource part) {
+        if (part == null || item == part) return true;
+        for (var parent : item.getAllParents()) if (parent == part) return true;
+        return false;
+    }
+
+    private static boolean selectedObject(ACParameterControllableSource item, CPartSource part, List<?> types,
+                                          CParameterSource parameter) {
+        return inPart(item, part) && (types == null || types.contains(item.getClass().getSimpleName()))
+            && (parameter == null || item.getKeyformGridSource().findKeyformBinding(parameter.getGuid()) != null
+                || item.getKeyformMorphTargetSet().getBoundParameterGuids().contains(parameter.getGuid()));
+    }
+
+    static Map<String,Object> objectInfo(ACParameterControllableSource item, boolean geometry) {
+        return objectInfo(item, geometry, null);
+    }
+
+    private static Map<String,Object> objectInfo(ACParameterControllableSource item, boolean geometry, Set<?> selectedForms) {
         var result = map("guid",item.getGuid().getUuidString(),"id",item.getId().toString(),"name",item.getLocalName(),
             "type",item.getClass().getSimpleName(),"parent_guid",item.getTargetDeformerGuid().getUuidString(),
             "visible",item.isVisible(),"visible_in_hierarchy",item.isVisibleInHierarchy(),
@@ -1626,10 +1662,13 @@ public final class NativeBridge {
             result.put("offscreen", part.getUseOffscreen());
             result.put("draw_order_group", part.getEnableDrawOrderGroup());
         }
-        if (geometry) {
+        if (geometry || selectedForms != null) {
             List<Object> forms = new ArrayList<>();
             for (var form : item.getKeyforms()) {
-                var data = map("guid",form.getGuid().getUuidString(),"keys",formKeys(item, form),"positions",formPositions(form));
+                String guid = form.getGuid().getUuidString();
+                if (selectedForms != null && !selectedForms.contains(guid)) continue;
+                var data = map("guid", guid, "keys", formKeys(item, form));
+                if (geometry) data.put("positions", formPositions(form));
                 if (form instanceof ACDrawableForm drawable) {
                     data.put("opacity",drawable.getOpacity());
                     data.put("draw_order",drawable.getDrawOrder());
@@ -1640,6 +1679,8 @@ public final class NativeBridge {
                 forms.add(data);
             }
             result.put("forms",forms);
+        }
+        if (geometry) {
             if (item instanceof CArtMeshSource mesh) {
                 result.put("indices",mesh.getIndices()); result.put("uvs",mesh.getUvs());
                 result.put("source_positions",mesh.getPositions());
@@ -1650,7 +1691,7 @@ public final class NativeBridge {
         return result;
     }
 
-    private static List<Object> formKeys(ACParameterControllableSource item, ACForm form) {
+    static List<Object> formKeys(ACParameterControllableSource item, ACForm form) {
         List<Object> keys = new ArrayList<>();
         for (KeyformOnGrid point : item.getKeyformGridSource().getKeyformOnGridFor(form.getGuid())) {
             Map<String,Object> parameters = new LinkedHashMap<>();
@@ -1660,7 +1701,7 @@ public final class NativeBridge {
         return keys;
     }
 
-    private static float[] positions(ACForm form) {
+    static float[] positions(ACForm form) {
         if (form instanceof CArtMeshForm mesh) return mesh.getPositions().clone();
         if (form instanceof CWarpDeformerForm warp) return warp.getPositions().clone();
         throw new IllegalArgumentException("Only mesh and warp vertices supported; actual=" + (form == null ? "null" : form.getClass().getName()));
@@ -1918,6 +1959,10 @@ public final class NativeBridge {
         return result;
     }
 
+    static void evaluateDetached(CModel model) {
+        com.live2d.cubism.view.ay.a.a(model, new com.live2d.cubism.doc.model.ax(null), null, null, null, false);
+    }
+
     static final class NativeRenderSession implements AutoCloseable {
         final String documentUid;
         final CModel model;
@@ -2008,7 +2053,7 @@ public final class NativeBridge {
         }
     }
 
-    private static void closeRenderSessions(String documentUid) {
+    static void closeRenderSessions(String documentUid) {
         var entries=renderSessions.entrySet().iterator();
         while (entries.hasNext()) {
             var entry=entries.next();
