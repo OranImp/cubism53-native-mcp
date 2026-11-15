@@ -12,12 +12,16 @@ final class NativeBridgeGlueSearch {
     private record Cell(long x, long y) {}
 
     static Matches find(float[] a, float[] b, double tolerance) {
+        return find(a, b, tolerance, Integer.MAX_VALUE);
+    }
+
+    static Matches find(float[] a, float[] b, double tolerance, int limit) {
         // The original distance uses float subtraction. A cell twice as wide
         // leaves room for that rounding at the tolerance and grid boundaries.
         double width = tolerance * 2;
         var aCells = cells(a, width);
         var bCells = cells(b, width);
-        if (aCells == null || bCells == null) return bruteForce(a, b, tolerance);
+        if (aCells == null || bCells == null) return bruteForce(a, b, tolerance, limit);
         var buckets = new HashMap<Cell,List<Integer>>();
         for (int j = 0; j < bCells.length; j++)
             buckets.computeIfAbsent(bCells[j], key -> new ArrayList<>()).add(j);
@@ -32,12 +36,13 @@ final class NativeBridgeGlueSearch {
                     var bucket = buckets.get(new Cell(cell.x + dx, cell.y + dy));
                     if (bucket == null) continue;
                     for (int j : bucket) {
-                        compare(a, b, tolerance, i, j, candidates, aCounts, bCounts);
+                        compare(a, b, tolerance, i, j, start < limit ? candidates : null, aCounts, bCounts);
                         comparisons++;
                     }
                 }
             }
             candidates.subList(start, candidates.size()).sort(Comparator.comparingInt(Candidate::b));
+            if (candidates.size() > limit) candidates.subList(limit, candidates.size()).clear();
         }
         return new Matches(candidates, aCounts, bCounts, comparisons);
     }
@@ -54,11 +59,15 @@ final class NativeBridgeGlueSearch {
     }
 
     static Matches bruteForce(float[] a, float[] b, double tolerance) {
+        return bruteForce(a, b, tolerance, Integer.MAX_VALUE);
+    }
+
+    private static Matches bruteForce(float[] a, float[] b, double tolerance, int limit) {
         var candidates = new ArrayList<Candidate>();
         int[] aCounts = new int[a.length / 2], bCounts = new int[b.length / 2];
         for (int i = 0; i < aCounts.length; i++)
             for (int j = 0; j < bCounts.length; j++)
-                compare(a, b, tolerance, i, j, candidates, aCounts, bCounts);
+                compare(a, b, tolerance, i, j, candidates.size() < limit ? candidates : null, aCounts, bCounts);
         return new Matches(candidates, aCounts, bCounts, (long) aCounts.length * bCounts.length);
     }
 
@@ -68,7 +77,7 @@ final class NativeBridgeGlueSearch {
         if (distance <= tolerance) {
             aCounts[i]++;
             bCounts[j]++;
-            candidates.add(new Candidate(i, j, distance));
+            if (candidates != null) candidates.add(new Candidate(i, j, distance));
         }
     }
 }

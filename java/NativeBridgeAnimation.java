@@ -12,6 +12,7 @@ import com.live2d.cubism.doc.animation.movie.track.CMvTrack_Live2DModel_Source;
 import com.live2d.cubism.doc.modeling.CModelingDocument;
 import com.live2d.undo.SimpleUndo;
 import com.live2d.undo.GroupUndo;
+import com.live2d.undo.LambdaUndo;
 import java.nio.file.*;
 import java.util.*;
 
@@ -57,12 +58,15 @@ final class NativeBridgeAnimation {
         var movie = scene.getMovieInfo();
         var tracks = scene.getAllTracks().stream().filter(CMvTrack_Live2DModel_Source.class::isInstance)
             .map(CMvTrack_Live2DModel_Source.class::cast)
-            .map(track -> map("guid", track.getGuid().getUuidString(), "name", track.getName())).toList();
+            .map(NativeBridgeAnimation::trackInfo).toList();
         return map("document_uid", doc.getDocumentUID(), "document_type", "animation_scene",
             "file", content.getFile() == null ? null : content.getFile().toString(),
             "scene_guid", scene.getGuid().getUuidString(), "name", scene.getSceneName(),
-            "fps", movie.getFps(), "duration_frames", movie.getDuration(), "tracks", tracks,
-            "modified", content.isModifiedAfterSaving(), "undo_position", doc.getUndoManager().getCurrentPos());
+            "fps", movie.getFps(), "start_frame", movie.getStartFrame(), "duration_frames", movie.getDuration(),
+            "loop", movie.isLoopMotion(), "fade_in_seconds", movie.getFadeInMSec() / 1000.0,
+            "fade_out_seconds", movie.getFadeOutMSec() / 1000.0, "tracks", tracks,
+            "modified", content.isModifiedAfterSaving(), "undo_position", doc.getUndoManager().getCurrentPos(),
+            "revision", revision(doc));
     }
 
     static Object create(CEAppCtrl app, Path workspace, CModelingDocument model, Map<String,Object> request) throws Exception {
@@ -105,18 +109,22 @@ final class NativeBridgeAnimation {
     }
 
     static Object execute(CEAppCtrl app, CSceneDocument doc, Path workspace, String op, Map<String,Object> request) throws Exception {
+        checkRevision(doc, request);
         switch (op) {
             case "describe": return describe(doc);
             case "set_timeline_keys": return setKeys(doc, request);
             case "edit_animation_scene": return editScene(doc, request);
+            case "edit_animation_tracks": return editTracks(doc, workspace, request);
+            case "edit_animation_events": return editEvents(doc, request);
             case "batch_edit_timeline": return batchCurves(doc, request);
             case "get_timeline_keys", "remove_timeline_keys", "sample_timeline_parameters": return curves(doc, op, request);
             case "export_motion3": return exportMotion(doc, workspace, request);
             case "save_as_new": {
                 var path = NativeBridgeAssets.output(workspace, request.get("path"), ".can3");
                 Files.createDirectories(path.getParent());
-                boolean saved = doc.getAnimationContent().saveDocument(path.toFile(), false);
-                return map("saved", saved, "path", path.toString(), "bytes", saved ? Files.size(path) : 0);
+                var content = doc.getAnimationContent();
+                return NativeBridgeAssets.saved(path, content.saveDocument(path.toFile(), false),
+                    content.getFile(), content.isModifiedAfterSaving(), null);
             }
             case "close_saved":
                 if (doc.getAnimationContent().isModifiedAfterSaving() || doc.getAnimationContent().getFile() == null)
@@ -148,6 +156,112 @@ final class NativeBridgeAnimation {
         return doc.getSceneSource().getAllTracks().stream().filter(CMvTrack_Live2DModel_Source.class::isInstance)
             .map(CMvTrack_Live2DModel_Source.class::cast).filter(track -> guid.equals(track.getGuid().getUuidString()))
             .findFirst().orElseThrow(() -> new IllegalArgumentException("Model track not found: " + guid));
+    }
+
+    private static Map<String,Object> trackInfo(CMvTrack_Live2DModel_Source track) {
+        return map("guid", track.getGuid().getUuidString(), "name", track.getName(),
+            "start_frame", track.getStart(), "duration_frames", track.getDuration(),
+            "internal_offset", track.getInternalOffset());
+    }
+
+    private static int option(Map<String,Object> request, String name, int fallback) {
+        return request.get(name) == null ? fallback : integer(request.get(name), name);
+    }
+
+    private static long frameOffset(CMvTrack_Live2DModel_Source track) {
+        return (long) track.getStart() - track.getInternalOffset();
+    }
+
+    private static int localFrame(CSceneDocument doc, CMvTrack_Live2DModel_Source track, int frame, boolean scene) {
+        var movie = doc.getSceneSource().getMovieInfo();
+        if (!scene) {
+            if (frame < 0 || frame >= movie.getDuration()) throw new IllegalArgumentException("Frame is outside the scene");
+            return frame;
+        }
+        if (frame < movie.getStartFrame() || frame >= (long) movie.getStartFrame() + movie.getDuration()
+                || frame < track.getStart() || frame >= (long) track.getStart() + track.getDuration())
+            throw new IllegalArgumentException("Frame is outside the visible model track");
+        return Math.toIntExact(frame - frameOffset(track));
+    }
+
+    private static long displayFrame(CMvTrack_Live2DModel_Source track, int frame, boolean scene) {
+        return scene ? frame + frameOffset(track) : frame;
+    }
+
+    private static Object editTracks(CSceneDocument doc, Path workspace, Map<String,Object> request) throws Exception {
+        String action = nonblank(request.get("action"), "action");
+        if ("inspect".equals(action)) return describe(doc);
+        var scene = doc.getSceneSource();
+        var movie = scene.getMovieInfo();
+        boolean append = "append".equals(action);
+        if (!append && !"update".equals(action)) throw new IllegalArgumentException("Unknown track action");
+        var existing = append ? null : track(doc, request.get("track_guid"));
+        int start = option(request, "start_frame", append ? movie.getStartFrame() : existing.getStart());
+        long sceneEnd = (long) movie.getStartFrame() + movie.getDuration();
+        if (start < movie.getStartFrame() || start >= sceneEnd) throw new IllegalArgumentException("Track start is outside the scene");
+        int length = option(request, "duration_frames", append ? Math.toIntExact(sceneEnd - start) : existing.getDuration());
+        int offset = option(request, "internal_offset", append ? 0 : existing.getInternalOffset());
+        if (length < 1 || (long) start + length > sceneEnd || offset < 0 || (long) offset + length > Integer.MAX_VALUE)
+            throw new IllegalArgumentException("Track interval must be inside the scene with a non-negative offset");
+        if (existing != null) {
+            long end = (long) offset + length;
+            var conflicts = Arrays.stream(existing.getKeyFrames()).filter(frame -> frame < offset || frame >= end).boxed().toList();
+            var events = existing.getUserData().keySet().stream().filter(frame -> frame < offset || frame >= end).sorted().toList();
+            if (!conflicts.isEmpty() || !events.isEmpty()) return map("applied", false, "key_frames", conflicts, "event_frames", events);
+            int oldStart = existing.getStart(), oldLength = existing.getDuration(), oldOffset = existing.getInternalOffset();
+            var undo = new LambdaUndo<>("Native bridge: update model track", existing,
+                value -> { setInterval(existing, start, length, offset); return kotlin.Unit.INSTANCE; },
+                value -> { setInterval(existing, oldStart, oldLength, oldOffset); return kotlin.Unit.INSTANCE; }, null);
+            finishTrackEdit(doc, undo);
+            return map("applied", true, "track", trackInfo(existing));
+        }
+        var file = NativeBridgeAssets.input(workspace, request.get("model_path"), ".cmo3").toFile();
+        var added = CMvTrack_Live2DModel_Source.Companion.a(scene, file);
+        if (added == null) throw new IllegalArgumentException("Cubism could not load the linked CMO3");
+        setInterval(added, start, length, offset);
+        var root = scene.getRootTrack();
+        var undo = new LambdaUndo<>("Native bridge: append model track", added,
+            value -> { root.addChild(added, -1, true); return kotlin.Unit.INSTANCE; },
+            value -> { root.removeChild(added, true); return kotlin.Unit.INSTANCE; }, null);
+        finishTrackEdit(doc, undo);
+        return map("applied", true, "track", trackInfo(added));
+    }
+
+    private static void setInterval(CMvTrack_Live2DModel_Source track, int start, int length, int offset) {
+        track.setStart(start);
+        track.setDuration(length);
+        track.setInternalOffset(offset);
+    }
+
+    private static void finishTrackEdit(CSceneDocument doc, com.live2d.undo.ACUndoable undo) {
+        undo.addUndoRedoListener(event -> { refreshScene(doc); return kotlin.Unit.INSTANCE; });
+        finishSceneEdit(doc, undo);
+    }
+
+    private static Object editEvents(CSceneDocument doc, Map<String,Object> request) {
+        var track = track(doc, request.get("track_guid"));
+        var before = new HashMap<>(track.getUserData());
+        var after = new HashMap<>(before);
+        var touched = new HashSet<Integer>();
+        for (Object row : (List<?>) request.get("events")) {
+            var event = (Map<?,?>) row;
+            int frame = localFrame(doc, track, integer(event.get("frame"), "frame"), true);
+            if (!touched.add(frame)) throw new IllegalArgumentException("Duplicate event frame");
+            after.put(frame, nonblank(event.get("text"), "event text"));
+        }
+        for (Object value : (List<?>) request.get("remove_frames")) {
+            int frame = localFrame(doc, track, integer(value, "frame"), true);
+            if (!touched.add(frame) || after.remove(frame) == null)
+                throw new IllegalArgumentException("Removal must name an existing, distinct event");
+        }
+        if (!before.equals(after)) {
+            var undo = new LambdaUndo<>("Native bridge: edit animation events", track,
+                value -> { track.getUserData().clear(); track.getUserData().putAll(after); return kotlin.Unit.INSTANCE; },
+                value -> { track.getUserData().clear(); track.getUserData().putAll(before); return kotlin.Unit.INSTANCE; }, null);
+            finishTrackEdit(doc, undo);
+        }
+        return map("track_guid", track.getGuid().getUuidString(), "events", after.entrySet().stream()
+            .sorted(Map.Entry.comparingByKey()).map(entry -> map("frame", displayFrame(track, entry.getKey(), true), "text", entry.getValue())).toList());
     }
 
     private record Key(int frame, double value, CCurveType type) {}
@@ -225,60 +339,69 @@ final class NativeBridgeAnimation {
         String id = nonblank(request.get("parameter_id"), "parameter_id");
         var sequence = curve(track, id);
         var response = map("document_uid", doc.getDocumentUID(), "track_guid", track.getGuid().getUuidString(), "parameter_id", id);
+        boolean scene = "scene".equals(request.get("frame_space"));
         if ("get_timeline_keys".equals(operation)) {
-            response.put("keys", timelineKeys(sequence));
+            int start = option(request, "start_frame", Integer.MIN_VALUE);
+            int end = option(request, "end_frame", Integer.MAX_VALUE);
+            if (end < start) throw new IllegalArgumentException("End frame precedes start frame");
+            var movie = doc.getSceneSource().getMovieInfo();
+            long sceneStart = Math.max(movie.getStartFrame(), track.getStart());
+            long sceneEnd = Math.min((long) movie.getStartFrame() + movie.getDuration(), (long) track.getStart() + track.getDuration());
+            response.put("keys", timelineKeys(sequence, track, scene,
+                scene ? Math.max(start, sceneStart) : start, scene ? Math.min(end, sceneEnd - 1) : end));
             return response;
         }
-        int duration = doc.getSceneSource().getMovieInfo().getDuration();
         var frames = new LinkedHashSet<Integer>();
         for (Object value : (List<?>) request.get("frames")) {
-            int frame = integer(value, "frame");
-            if (frame < 0 || frame >= duration || !frames.add(frame))
-                throw new IllegalArgumentException("Frames must be distinct and inside the scene");
+            int frame = localFrame(doc, track, integer(value, "frame"), scene);
+            if (!frames.add(frame)) throw new IllegalArgumentException("Frames must be distinct");
         }
         if (frames.isEmpty()) throw new IllegalArgumentException("Provide at least one frame");
         if ("sample_timeline_parameters".equals(operation)) {
-            response.put("samples", frames.stream().map(frame -> map("frame", frame, "value", sequence.getDoubleValue(frame))).toList());
+            response.put("samples", frames.stream().map(frame -> map("frame", displayFrame(track, frame, scene), "value", sequence.getDoubleValue(frame))).toList());
             return response;
         }
         var existing = Arrays.stream(sequence.getPoints()).map(point -> point.getPos()).toList();
         if (!existing.containsAll(frames)) throw new IllegalArgumentException("One or more timeline keys are missing");
         editCurve(doc, track, sequence, "Remove timeline keys", () -> frames.forEach(sequence::removeDoubleValueAuto));
-        response.put("keys", timelineKeys(sequence));
+        response.put("keys", timelineKeys(sequence, track, scene, Long.MIN_VALUE, Long.MAX_VALUE));
         return response;
     }
 
-    private static List<?> timelineKeys(CMutableSequence sequence) {
-        return Arrays.stream(sequence.getPoints()).map(point -> {
+    private static List<?> timelineKeys(CMutableSequence sequence, CMvTrack_Live2DModel_Source track,
+                                        boolean scene, long start, long end) {
+        return Arrays.stream(sequence.getPoints()).filter(point -> {
+            long frame = displayFrame(track, point.getPos(), scene);
+            return frame >= start && frame <= end;
+        }).map(point -> {
             int frame = point.getPos();
             var type = sequence.getCurveType(frame);
-            return map("frame", frame, "value", point.getValue(), "interpolation", type.name().toLowerCase(Locale.ROOT));
+            return map("frame", displayFrame(track, frame, scene), "value", point.getValue(), "interpolation", type.name().toLowerCase(Locale.ROOT));
         }).toList();
     }
 
     private static Object setKeys(CSceneDocument doc, Map<String,Object> request) {
         var track = track(doc, request.get("track_guid"));
         String id = nonblank(request.get("parameter_id"), "parameter_id");
-        var keys = parseKeys(doc, track, id, (List<?>) request.get("keys"));
+        boolean scene = "scene".equals(request.get("frame_space"));
+        var keys = parseKeys(doc, track, id, (List<?>) request.get("keys"), scene);
         if (keys.isEmpty()) throw new IllegalArgumentException("At least one keyframe is required");
         var sequence = curve(track, id);
         editCurve(doc, track, sequence, "Set timeline keys", () -> applyKeys(sequence, keys.values()));
         return map("document_uid", doc.getDocumentUID(), "track_guid", track.getGuid().getUuidString(), "parameter_id", id,
-            "keys", keys.values().stream().map(key -> map("frame", key.frame, "value", sequence.getDoubleValue(key.frame),
+            "keys", keys.values().stream().map(key -> map("frame", displayFrame(track, key.frame, scene), "value", sequence.getDoubleValue(key.frame),
                 "interpolation", key.type.name().toLowerCase(Locale.ROOT))).toList());
     }
 
-    private static Map<Integer,Key> parseKeys(CSceneDocument doc, CMvTrack_Live2DModel_Source track, String id, List<?> rows) {
+    private static Map<Integer,Key> parseKeys(CSceneDocument doc, CMvTrack_Live2DModel_Source track, String id, List<?> rows, boolean scene) {
         var parameter = track.getParameterSourceSet().getSources().stream()
             .filter(candidate -> id.equals(candidate.getId().toString())).findFirst()
             .orElseThrow(() -> new IllegalArgumentException("Parameter is absent from the linked model: " + id));
-        int duration = doc.getSceneSource().getMovieInfo().getDuration();
         var keys = new TreeMap<Integer,Key>();
         for (var value : rows) {
             var row = (Map<?,?>) value;
-            int frame = integer(row.get("frame"), "frame");
+            int frame = localFrame(doc, track, integer(row.get("frame"), "frame"), scene);
             double number = number(row.get("value"), "value");
-            if (frame < 0 || frame >= duration) throw new IllegalArgumentException("Keyframe is outside the scene");
             if (number < parameter.getMinValue() || number > parameter.getMaxValue())
                 throw new IllegalArgumentException("Keyframe value is outside the parameter range");
             var type = CCurveType.valueOf(nonblank(row.get("interpolation"), "interpolation").toUpperCase(Locale.ROOT));
@@ -299,6 +422,7 @@ final class NativeBridgeAnimation {
                              Map<Integer,Key> keys, Set<Integer> remove) {}
 
     private static Object batchCurves(CSceneDocument doc, Map<String,Object> request) {
+        boolean scene = "scene".equals(request.get("frame_space"));
         var edits = new ArrayList<CurveEdit>();
         var seen = new HashSet<List<String>>();
         for (Object value : (List<?>) request.get("edits")) {
@@ -308,12 +432,12 @@ final class NativeBridgeAnimation {
             if (!seen.add(List.of(track.getGuid().getUuidString(), id)))
                 throw new IllegalArgumentException("Only one edit per track and parameter is allowed");
             var sequence = curve(track, id);
-            var keys = parseKeys(doc, track, id, (List<?>) row.get("keys"));
+            var keys = parseKeys(doc, track, id, (List<?>) row.get("keys"), scene);
             var existing = new HashSet<Integer>();
             for (var point : sequence.getPoints()) existing.add(point.getPos());
             var remove = new LinkedHashSet<Integer>();
             for (Object frameValue : (List<?>) row.get("remove_frames")) {
-                int frame = integer(frameValue, "frame");
+                int frame = scene ? localFrame(doc, track, integer(frameValue, "frame"), true) : integer(frameValue, "frame");
                 if (!existing.contains(frame) || keys.containsKey(frame) || !remove.add(frame))
                     throw new IllegalArgumentException("Removal must name a distinct existing key outside the upserts: " + frame);
             }
@@ -326,25 +450,25 @@ final class NativeBridgeAnimation {
             for (var edit : edits) undo.plusAssign(applyCurve(doc, edit.track, edit.sequence, "Edit timeline curve", () -> {
                 edit.remove.forEach(edit.sequence::removeDoubleValueAuto);
                 applyKeys(edit.sequence, edit.keys.values());
-            }));
+            }, false));
         } catch (RuntimeException | Error error) {
             undo.undo();
             refreshScene(doc);
             throw error;
         }
-        finishSceneEdit(doc, undo);
+        finishTrackEdit(doc, undo);
         return map("document_uid", doc.getDocumentUID(), "curves", edits.stream().map(edit ->
             map("track_guid", edit.track.getGuid().getUuidString(), "parameter_id", edit.parameter,
-                "keys", timelineKeys(edit.sequence))).toList());
+                "keys", timelineKeys(edit.sequence, edit.track, scene, Long.MIN_VALUE, Long.MAX_VALUE))).toList());
     }
 
     private static void editCurve(CSceneDocument doc, CMvTrack_Live2DModel_Source track,
                                   CMutableSequence sequence, String name, Runnable apply) {
-        finishSceneEdit(doc, applyCurve(doc, track, sequence, name, apply));
+        finishSceneEdit(doc, applyCurve(doc, track, sequence, name, apply, true));
     }
 
     private static SimpleUndo applyCurve(CSceneDocument doc, CMvTrack_Live2DModel_Source track,
-                                         CMutableSequence sequence, String name, Runnable apply) {
+                                         CMutableSequence sequence, String name, Runnable apply, boolean refresh) {
         var effect = track.getKeyParam();
         var undo = new SimpleUndo("Native bridge: " + name, sequence, new com.live2d.core.a());
         try {
@@ -357,7 +481,7 @@ final class NativeBridgeAnimation {
         }
         undo.addUndoRedoListener(event -> {
             effect.setDirty();
-            refreshScene(doc);
+            if (refresh) refreshScene(doc);
             return kotlin.Unit.INSTANCE;
         });
         return undo;
@@ -377,7 +501,7 @@ final class NativeBridgeAnimation {
         Path path = NativeBridgeAssets.output(workspace, request.get("path"), ".motion3.json");
         var track = track(doc, request.get("track_guid"));
         var exporter = new q();
-        var exported = exporter.a(doc, track, true, 2, 2, 1, 1, 1, false, true, true);
+        var exported = exporter.a(doc, track, true, 2, 2, 1, 1, 1, true, true, true);
         if (!(exported instanceof q.b.c result)) throw new IllegalStateException("Cubism could not export motion: " + exported);
         var json = result.a();
         if (!(org.json.simple.JSONValue.parse(json) instanceof Map<?,?> root))

@@ -206,7 +206,9 @@ async def exercise(spec, env, work, legacy, expected_version, probe, preview_por
     async with stdio_client(config) as (r,w), ClientSession(r,w) as mcp:
         await mcp.initialize()
         definitions = {tool.name: tool.model_dump(mode='json') for tool in (await mcp.list_tools()).tools}
-        assert len(definitions) == 84
+        assert len(definitions) == 93
+        successful = set()
+
         async def invoke(op, *, reject=None, **kwargs):
             result = await mcp.call_tool('cubism_native_'+op, kwargs)
             if reject is not None:
@@ -214,6 +216,7 @@ async def exercise(spec, env, work, legacy, expected_version, probe, preview_por
                 return None
             if result.isError:
                 raise RuntimeError(result.content[0].text)
+            successful.add('cubism_native_' + op)
             return result.structuredContent
 
         first, second = await asyncio.gather(invoke('connect'), invoke('connect'))
@@ -389,6 +392,13 @@ async def exercise(spec, env, work, legacy, expected_version, probe, preview_por
             await current('set_preview_parameters', parameters={'ParamAngleZ': 5}, reject='approve')
             await probe('approve-preview')
             assert (await current('set_preview_parameters', parameters={'ParamAngleZ': 5}))['applied']
+            views = await current('list_preview_views')
+            assert len(views['model_uids']) == 1
+            values = await current('get_preview_parameters', model_uid=views['model_uids'][0], parameter_ids=['ParamAngleZ'])
+            assert 'ParamAngleZ' in json.dumps(values['result']), values
+            all_parameters = await current('get_preview_parameters')
+            assert 'ParamAngleZ' in json.dumps(all_parameters['result']), all_parameters
+            await current('get_preview_parameters', model_uid='invalid-view', reject='does not belong')
             async with stdio_client(config) as (reader, writer), ClientSession(reader, writer) as second:
                 await second.initialize()
                 applied = await second.call_tool('cubism_native_set_preview_parameters',
@@ -463,6 +473,9 @@ async def exercise(spec, env, work, legacy, expected_version, probe, preview_por
         print('PSD_UNDO_REDO_REOPEN_PIXELS_OK', flush=True)
         print('PHYSICS_RUNTIME_AND_ANIMATION_EXPORT_OK', flush=True)
         await check_expansion(invoke, work, editor, pid, probe, high_resolution)
+        if probe:
+            assert successful == set(definitions), sorted(set(definitions) - successful)
+            print(f'ALL_{len(successful)}_TOOLS_INVOKED_SUCCESSFULLY', flush=True)
         return definitions
 
 async def schemas(server):
@@ -541,10 +554,22 @@ def main():
             assert definitions == asyncio.run(schemas(ROOT / 'server.py'))
             if baseline:
                 previous = asyncio.run(schemas(baseline))
-                assert len(previous) == 75 and previous.keys() <= definitions.keys()
-                additions = {'objects': {'sections', 'part_guid', 'object_types', 'parameter_id'},
-                             'object': {'form_guids', 'geometry'},
-                             'simulate_physics': {'output_parameter_ids', 'result_mode', 'execution', 'request_id'}}
+                assert len(previous) == 84 and previous.keys() <= definitions.keys()
+                additions = {'status': {'lightweight'}, 'objects': {'offset', 'limit'},
+                             'open_project': {'wait_seconds'}, 'close_saved': {'wait_seconds'},
+                             'undo': {'expected_revision'}, 'redo': {'expected_revision'}, 'edit_batch': {'expected_revision'},
+                             'create_warp': {'part_guid', 'parent_guid', 'index'},
+                             'create_rotation': {'part_guid', 'parent_guid', 'index'},
+                             'list_glues': {'include_pairs'}, 'import_physics3': {'preflight'},
+                             'evaluate': {'poses'}, 'simulate_physics': {'trace_path'},
+                             'set_form_positions': {'compact'}, 'set_form_properties': {'compact'},
+                             'suggest_glue_pairs': {'max_candidates'}, 'job_status': {'frame_offset', 'frame_limit'},
+                             'edit_texture_atlas': {'preflight'}, 'set_mesh_topology': {'preflight'},
+                             'update_parameter': {'preflight'}, 'update_physics_group': {'expected_inputs', 'expected_outputs'},
+                             'set_timeline_keys': {'frame_space'},
+                             'get_timeline_keys': {'frame_space', 'start_frame', 'end_frame'},
+                             'remove_timeline_keys': {'frame_space'}, 'sample_timeline_parameters': {'frame_space'},
+                             'batch_edit_timeline': {'frame_space'}}
                 for name, old in previous.items():
                     current = definitions[name]
                     if name == 'cubism_native_connect':
@@ -554,8 +579,12 @@ def main():
                         old_fields = old['inputSchema']['properties']
                         current_fields = current['inputSchema']['properties']
                         assert current_fields.keys() - old_fields.keys() == extra
-                        current = {**current, 'inputSchema': {**current['inputSchema'],
-                            'properties': {key: current_fields[key] for key in old_fields}}}
+                        assert not extra.intersection(current['inputSchema'].get('required', []))
+                        schema = {**current['inputSchema'], 'properties': {key: current_fields[key] for key in old_fields}}
+                        current_defs = schema.pop('$defs', {})
+                        if '$defs' in old['inputSchema']:
+                            schema['$defs'] = {key: current_defs[key] for key in old['inputSchema']['$defs']}
+                        current = {**current, 'inputSchema': schema}
                     assert current == old, name
             print(json.dumps({'editor_version':expected, 'portable_tools':len(definitions), 'system_python_java_git_on_path':False,
                 'source_schema_match':True,'cc_switch_and_dsh_specs_match':True}),flush=True)

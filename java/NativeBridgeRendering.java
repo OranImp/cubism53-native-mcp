@@ -40,13 +40,17 @@ final class NativeBridgeRendering {
     }
 
     static Permit reserve(int width, int height, long differencePixels, boolean wait) throws InterruptedException {
+        return reserve(width, height, differencePixels, wait, 0);
+    }
+
+    private static Permit reserve(int width, int height, long differencePixels, boolean wait, long snapshotBytes) throws InterruptedException {
         if (width < 1 || height < 1 || width > 8192 || height > 8192)
             throw new IllegalArgumentException("Image size out of range");
         long pixels = (long) width * height;
         boolean large = pixels >= UHD_PIXELS;
         long padded = ((width + 15L) / 16 * 16) * ((height + 15L) / 16 * 16);
         // A matching baseline may be a 16-bit RGBA PNG.
-        long estimate = padded * 8 + differencePixels * 12 + 32 * MIB;
+        long estimate = padded * 8 + differencePixels * 12 + 32 * MIB + snapshotBytes;
         synchronized (budget) {
             if (large) waitingLarge++;
             try {
@@ -134,18 +138,25 @@ final class NativeBridgeRendering {
 
     static Object renderSet(Callable<CModelingDocument> document, Path workspace, Map<String,Object> request) throws Exception {
         var output = NativeBridgeAssets.output(workspace, request.get("directory"), "");
-        int[] size = onEditorThread(() -> {
-            var canvas = document.call().getModelSource().getCanvas();
-            return new int[]{integer(request, "width", canvas.getPixelWidth()),
-                integer(request, "height", canvas.getPixelHeight())};
+        long[] dimensions = onEditorThread(() -> {
+            var source = document.call().getModelSource();
+            var canvas = source.getCanvas();
+            long textures = 0;
+            for (var material : source.getTextureManager().getAllModelImages())
+                textures += (long) material.getWidth() * material.getHeight() * Integer.BYTES;
+            long poseCount = ((List<?>) request.get("poses")).size();
+            long parameters = poseCount * source.getAllParameters().size() * 256L;
+            return new long[]{integer(request, "width", canvas.getPixelWidth()),
+                integer(request, "height", canvas.getPixelHeight()), textures + parameters};
         }, 0);
+        int[] size = {(int) dimensions[0], (int) dimensions[1]};
         long difference = request.get("baseline_manifest") == null ? 0 : (long) size[0] * size[1];
         if (difference > 0 && request.get("crop") instanceof List<?> crop && crop.size() == 4) {
             long width = ((Number) crop.get(2)).intValue() - (long) ((Number) crop.get(0)).intValue();
             long height = ((Number) crop.get(3)).intValue() - (long) ((Number) crop.get(1)).intValue();
             if (width > 0 && width <= size[0] && height > 0 && height <= size[1]) difference = width * height;
         }
-        try (var permit = reserve(size[0], size[1], difference, true)) {
+        try (var permit = reserve(size[0], size[1], difference, true, dimensions[2])) {
             return renderReserved(document, workspace, output, request, size, permit);
         }
     }

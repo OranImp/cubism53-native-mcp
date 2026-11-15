@@ -1,6 +1,7 @@
 package cubism53.mcp;
 
 import java.nio.file.Path;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 
 import static cubism53.mcp.NativeBridge.map;
@@ -83,7 +84,9 @@ final class NativeBridgeSdk {
     void motion(Map<?,?> data) {
         require(integer(data.get("Version"), "Version") == 3, "Version", "Expected Motion3 version 3");
         var meta = object(data.get("Meta"), "Meta");
-        require(number(meta.get("Duration"), "Meta.Duration") >= 0, "Meta.Duration", "Expected a non-negative duration");
+        double duration = number(meta.get("Duration"), "Meta.Duration");
+        require(duration >= 0, "Meta.Duration", "Expected a non-negative duration");
+        boolean restricted = Boolean.TRUE.equals(meta.get("AreBeziersRestricted"));
         require(number(meta.get("Fps"), "Meta.Fps") > 0, "Meta.Fps", "Expected a positive frame rate");
         var curves = list(data.get("Curves"), "Curves");
         require(integer(meta.get("CurveCount"), "Meta.CurveCount") == curves.size(), "Meta.CurveCount", "Does not match Curves");
@@ -112,6 +115,12 @@ final class NativeBridgeSdk {
                 for (int j = 1; j <= length; j++) number(raw.get(p + j), dataField + "[" + (p + j) + "]");
                 double next = ((Number) raw.get(p + length - 1)).doubleValue();
                 require(next >= time, dataField + "[" + (p + length - 1) + "]", "Segment time moves backwards");
+                if (kind == 1 && restricted) {
+                    double first = ((Number) raw.get(p + 1)).doubleValue();
+                    double second = ((Number) raw.get(p + 3)).doubleValue();
+                    require(time <= first && first <= second && second <= next,
+                        dataField + "[" + (p + 1) + "]", "Restricted Bezier control times must be ordered within the segment");
+                }
                 time = next;
                 p += length + 1;
                 segments++;
@@ -122,11 +131,38 @@ final class NativeBridgeSdk {
             "Meta.TotalSegmentCount", "Does not match parsed segments");
         require(integer(meta.get("TotalPointCount"), "Meta.TotalPointCount") == points,
             "Meta.TotalPointCount", "Does not match parsed points");
+        if (data.containsKey("UserData") || meta.containsKey("UserDataCount") || meta.containsKey("TotalUserDataSize")) {
+            var events = data.get("UserData") == null ? List.of() : list(data.get("UserData"), "UserData");
+            long bytes = 0;
+            for (int i = 0; i < events.size(); i++) {
+                String field = "UserData[" + i + "]";
+                var event = object(events.get(i), field);
+                double time = number(event.get("Time"), field + ".Time");
+                require(time >= 0 && time <= duration + 0.00001, field + ".Time", "Event time is outside the motion");
+                require(event.get("Value") instanceof String, field + ".Value", "Expected text");
+                bytes += ((String) event.get("Value")).getBytes(StandardCharsets.UTF_8).length;
+            }
+            if (meta.containsKey("UserDataCount"))
+                require(integer(meta.get("UserDataCount"), "Meta.UserDataCount") == events.size(),
+                    "Meta.UserDataCount", "Does not match events");
+            if (meta.containsKey("TotalUserDataSize"))
+                require(integer(meta.get("TotalUserDataSize"), "Meta.TotalUserDataSize") == bytes,
+                    "Meta.TotalUserDataSize", "Does not match UTF-8 event data size");
+        }
     }
 
     void physics(Map<?,?> data) {
         require(integer(data.get("Version"), "Version") == 3, "Version", "Expected Physics3 version 3");
         var meta = object(data.get("Meta"), "Meta");
+        if (meta.get("EffectiveForces") != null) {
+            var forces = object(meta.get("EffectiveForces"), "Meta.EffectiveForces");
+            for (String name : List.of("Gravity", "Wind")) {
+                String field = "Meta.EffectiveForces." + name;
+                var vector = object(forces.get(name), field);
+                number(vector.get("X"), field + ".X");
+                number(vector.get("Y"), field + ".Y");
+            }
+        }
         var settings = list(data.get("PhysicsSettings"), "PhysicsSettings");
         require(integer(meta.get("PhysicsSettingCount"), "Meta.PhysicsSettingCount") == settings.size(),
             "Meta.PhysicsSettingCount", "Does not match PhysicsSettings");
@@ -134,6 +170,11 @@ final class NativeBridgeSdk {
         for (int i = 0; i < settings.size(); i++) {
             String field = "PhysicsSettings[" + i + "]";
             var setting = object(settings.get(i), field);
+            if (setting.get("Normalization") != null) {
+                var normalization = object(setting.get("Normalization"), field + ".Normalization");
+                normalization(normalization, "Position", field + ".Normalization");
+                normalization(normalization, "Angle", field + ".Normalization");
+            }
             var particles = list(setting.get("Vertices"), field + ".Vertices");
             for (int j = 0; j < particles.size(); j++) {
                 String at = field + ".Vertices[" + j + "]";
@@ -160,6 +201,15 @@ final class NativeBridgeSdk {
         require(integer(meta.get("TotalInputCount"), "Meta.TotalInputCount") == inputs, "Meta.TotalInputCount", "Does not match inputs");
         require(integer(meta.get("TotalOutputCount"), "Meta.TotalOutputCount") == outputs, "Meta.TotalOutputCount", "Does not match outputs");
         require(integer(meta.get("VertexCount"), "Meta.VertexCount") == vertices, "Meta.VertexCount", "Does not match particles");
+    }
+
+    private void normalization(Map<?,?> row, String name, String prefix) {
+        String field = prefix + "." + name;
+        var range = object(row.get(name), field);
+        double min = number(range.get("Minimum"), field + ".Minimum");
+        double max = number(range.get("Maximum"), field + ".Maximum");
+        double fallback = number(range.get("Default"), field + ".Default");
+        require(min <= fallback && fallback <= max, field, "Expected Minimum <= Default <= Maximum");
     }
 
     private Map<?,?> physicsReference(Object value, String field, String key) {

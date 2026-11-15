@@ -1,5 +1,27 @@
 # 验证记录
 
+## v0.4.0 修复与扩展
+
+验收使用同一份 Windows x64 便携包，分别在 5.3.03 和 5.3.04 中启动独立编辑器、profile、工作区和端口。测试通过 MCP stdio 核对 93 项工具发现与调用，逐项对照 v0.3.0 的 84 项定义及默认参数，重新验证旧桥接的升级。CC Switch、DeepSeek Harness、Codex 和 Claude Code 使用同一个由安装器生成的 stdio 命令。
+
+| 检查 | 覆盖内容 |
+| --- | --- |
+| 保存、PSD、依赖 | 按隔离编辑器实际生效的 FREE 限制验收保存拒绝回执，历史 PSD 层恢复，遮罩和 ArtPath 反向依赖，文件关闭和重开 |
+| 建模 | 原生自动布网和撤销，网格、Glue、替图与图集冲突，原生物理组增删重排，跨对象 Blend Shape 绑定与解除，ArtPath 控制点和绑定保存重开 |
+| 动画 | 有起点和内部偏移的多轨 CAN3、整数帧采样与删键、轨道事件的原生撤销和重开、官方 Viewer 随附 SDK 接收 Motion3 事件并应用表情混合 |
+| 运行 | 物理轨迹与汇总、长轨迹暂存和分页、两客户端和双端口预览回读、SDK 附件诊断、4K 和 8K 零像素差分 |
+
+最终 ZIP 在两版均记录 `ALL_93_TOOLS_INVOKED_SUCCESSFULLY` 和 `VIEWER_SDK_MOTION_EVENT_OK`。Python 7 项、Java 作业与渲染调度检查及 Glue 搜索检查均通过。预发布测试中的 5.3.04 FREE 实例实际报告 `native_edit_restriction`，验证失败时未创建目标 CMO3。测试按编辑器实时报告的 FREE 限制执行该分支。
+
+最终 ZIP 两版测得的单次 4K 与 8K 基准渲染和同姿态差分如下。内存为编辑器进程累计峰值工作集。
+
+| 编辑器 | 分辨率 | 成对渲染耗时 | 查询响应时间 | 峰值工作集 |
+| --- | --- | ---: | ---: | ---: |
+| 5.3.03 | 3840 × 2160 | 2.399 秒 | 0.077 秒 | 858 MiB |
+| 5.3.03 | 7680 × 4320 | 5.798 秒 | 0.089 秒 | 1331 MiB |
+| 5.3.04 | 3840 × 2160 | 2.387 秒 | 0.079 秒 | 855 MiB |
+| 5.3.04 | 7680 × 4320 | 6.171 秒 | 0.101 秒 | 1360 MiB |
+
 ## v0.3.0 功能与性能
 
 Cubism 5.3.03 和 5.3.04 使用同一份 Windows x64 便携 ZIP。测试在独立编辑器进程、工作区和端口运行。客户端 PATH 只包含 Windows 系统目录。两版通过 stdio 发现 84 项工具，对照 v0.2.1 比较原有 75 项工具定义和可选参数。
@@ -75,4 +97,4 @@ java -cp .state/test-classes cubism53.mcp.GlueSearchCheck
 python -B tests/portable_smoke.py --package 'C:/path/to/Cubism53-Native-MCP' --editor-home 'C:/path/to/Live2D Cubism 5.3' --native-probe --high-resolution
 ```
 
-分别用两个受支持的 `--editor-home` 执行同一份便携包。`--native-probe` 使用测试机的 JDK 17 编译测试代理和 SDK 检查程序。测试代理仅附加到该次用例启动的进程。传入 `--previous-package` 指向解出的 v0.2.1 便携包以重现升级，传入 `--baseline-server` 指向该包的 `app/server.py` 以比较工具定义。5.3.03 还可用 `--legacy-server` 指向独立解出的 `2611ec9/server.py`，生成旧版 PSD 重导入样本。
+分别用两个受支持的 `--editor-home` 执行同一份便携包。`--native-probe` 使用测试机的 JDK 17 编译测试代理和 SDK 检查程序。测试代理仅附加到该次用例启动的进程。传入 `--previous-package` 指向解出的 v0.3.0 便携包以重现升级，传入 `--baseline-server` 指向该包的 `app/server.py` 以比较 84 项已有工具定义。5.3.03 还可用 `--legacy-server` 指向独立解出的 `2611ec9/server.py`，生成旧版 PSD 重导入样本。

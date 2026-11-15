@@ -244,14 +244,15 @@ async def check_expansion(invoke, work, editor, pid, probe, high_resolution):
     bad_physics['PhysicsSettings'][0]['Output'][0]['VertexIndex'] = 200
     (work/'bad.physics3.json').write_text(json.dumps(bad_physics), encoding='utf8')
     assert (await model('preflight_runtime_export', physics_path='bad.physics3.json'))['diagnostics'][0]['field'].endswith('.VertexIndex')
+    combined = await model('preflight_runtime_export', motions=[{'group':'Idle', 'path':'bad.motion3.json'}],
+                           expressions=invalid['expressions'], physics_path='bad.physics3.json')
+    assert len(combined['diagnostics']) == 3
     attachments = dict(motions=[{'group':'Idle','path':'expanded.motion3.json'}],
                        expressions=[{'name':'Blend','path':'blend.exp3.json'}], physics_path='expanded.physics3.json')
     preflight = await model('preflight_runtime_export', **attachments)
     assert preflight['ready'], preflight
     ticket = await model('export_runtime_package', directory='expanded-sdk', request_id='sdk', name='expanded', **attachments)
     package = await finish_job(ticket)
-    if probe:
-        await sdk_check(editor, work, Path(package['model3']))
     if high_resolution:
         import psutil
         for width,height in [(3840,2160),(7680,4320)]:
@@ -281,9 +282,257 @@ async def check_expansion(invoke, work, editor, pid, probe, high_resolution):
     await model('close_saved')
     assert not (await invoke('status'))['documents']
     print('EXPANSION_MCP_STDIO_OK', flush=True)
+    await check_v040(invoke, work)
+    await check_legacy_gaps(invoke, work)
+    if probe:
+        await sdk_check(editor, work, Path(package['model3']), work/'offset.motion3.json')
 
 
-async def sdk_check(editor, work, model3):
+async def check_v040(invoke, work):
+    opened = await invoke('open_project', path='expanded.cmo3', wait_seconds=12)
+    doc = opened['document_uid']
+
+    async def model(op, **args):
+        return await invoke(op, document_uid=doc, **args)
+
+    listing = (await model('objects'))['objects']
+    assert (await model('objects', sections=['objects'], offset=1, limit=1))['objects'] == listing[1:2]
+    paint, old = [next(row['guid'] for row in listing if row['name'] == name) for name in ('Paint', 'Old')]
+    before = await model('document')
+    plan = await model('preflight_model_edit', texture_objects=[paint],
+                       parameter_keys=[{'object_guid': paint, 'parameter_id': 'ParamAngleZ', 'values': [10]}])
+    assert plan['impact'][0]['parameter_count'] == 3 and plan['impact'][1]['affected_mesh_guids']
+    assert (await model('document'))['revision'] == before['revision']
+    assert bool(plan['blockers']) == plan['free_model_limits'], plan
+    if plan['free_model_limits']:
+        assert plan['blockers'][0]['kind'] == 'native_parameter_binding_limit', plan
+        await model('add_parameter_keys', object_guid=paint, parameter_id='ParamAngleZ', values=[10])
+        blocked = await model('save_as_new', path='free-rejected.cmo3')
+        assert blocked['saved'] is False and blocked['bytes'] == 0 and blocked['reason'] == 'native_edit_restriction', blocked
+        assert not (work/'free-rejected.cmo3').exists()
+        print('FREE_SAVE_RESTRICTION_REPORTED', flush=True)
+        await model('undo')
+        before = await model('document')
+    masks = (await model('inspect_model_dependencies', kind='object', id=old))['objects'][0]['mask_user_guids']
+    assert masks
+    await model('set_part_offscreen', part_guid=masks[0], enabled=False, reject='clipping')
+    source = await model('object', object_guid=paint)
+    await model('set_form_properties', object_guid=paint, form_guid=source['default_form_guid'],
+                properties={'draw_order': 1.5}, reject='integer')
+    # Put the new parameter on a mesh whose FREE binding count allows it; native authoring still handles existing settings.
+    mesh = await model('object', object_guid=old)
+    mesh_positions = next(row['positions'] for row in mesh['forms'] if row['guid'] == mesh['default_form_guid'])
+    temporary_mesh = (await model('duplicate_objects', object_guids=[old]))['guid_map'][old]
+    blend = await model('create_blend_shape', object_guid=old, base_form_guid=mesh['default_form_guid'],
+                        parameter_id='ParamAuditBlend', name='Audit Blend', positions=mesh_positions)
+    bound = await model('edit_blend_shape', object_guid=temporary_mesh, parameter_id=blend['parameter_id'],
+                        action='bind', positions=mesh_positions)
+    assert bound['parameter_guid'] == blend['parameter_guid']
+    await model('undo', expected_revision=before['revision'], reject='revision changed')
+    await model('edit_blend_shape', object_guid=temporary_mesh, parameter_id=blend['parameter_id'],
+                action='update', form_guid=bound['form_guid'], positions=mesh_positions)
+    await model('edit_blend_shape', object_guid=temporary_mesh, parameter_id=blend['parameter_id'], action='unbind')
+    await model('undo')
+    await model('redo')
+    plan = await model('plan_delete_objects', object_guids=[temporary_mesh])
+    await model('delete_objects', object_guids=[temporary_mesh], plan_id=plan['plan_id'])
+    await model('undo')
+    await model('redo')
+
+    path = (await model('inspect_art_paths'))['art_paths'][0]
+    point, form = path['forms'][0]['points'][0]['guid'], path['forms'][0]['guid']
+    edited = await model('edit_art_path', object_guid=path['guid'], form_guid=form,
+                         points=[{'point_guid': point, 'x': 55, 'y': 78}])
+    assert edited['forms'] != path['forms'] and edited['forms'][0]['points'][0]['guid'] == point
+    await model('undo')
+    assert (await model('inspect_art_paths'))['art_paths'][0]['forms'] == path['forms']
+    await model('redo')
+    vertices = (await model('evaluate', object_guids=[paint], base_pose='default'))['objects'][0]['canvas_positions']
+    triangle = source['indices'][:3]
+    xy = [sum(vertices[index * 2 + axis] for index in triangle) / 3 for axis in range(2)]
+    linked = await model('edit_art_path', object_guid=path['guid'], form_guid=form,
+                         points=[{'point_guid': point, 'x': xy[0], 'y': xy[1]}],
+                         bindings=[{'point_guid': point, 'mesh_guid': paint}])
+    assert linked['bindings'] == [{'point_guid': point, 'mesh_guid': paint}], linked
+    impact = await model('inspect_model_dependencies', kind='object', id=paint)
+    assert impact['objects'][0]['art_path_bindings'][0]['path_guid'] == path['guid']
+    await model('auto_generate_mesh', object_guid=paint, preset='small', reject='ArtPath')
+    await model('undo')
+    assert not (await model('inspect_art_paths'))['art_paths'][0]['bindings']
+    await model('redo')
+
+    checked = await model('import_physics3', path='probe.physics3.json', replace=True, preflight=True)
+    assert checked['ready'] and checked['replaced_group_guids']
+    saved_groups = await model('physics')
+    particles = [{'position': [0, 0]}, {'position': [0, 10], 'radius': 10}]
+    replaced = await model('edit_physics_groups', edits=[{'action': 'add', 'name': 'Audit Physics', 'particles': particles,
+        'inputs': [{'parameter_id': 'ParamAngleZ', 'type': 'angle'}],
+        'outputs': [{'parameter_id': 'ParamAngleX', 'type': 'angle', 'vertex_index': 1}]}], fps=60)
+    assert len(replaced['groups']) == len(saved_groups['groups']) + 1 and replaced['fps'] == 60
+    added_group = replaced['groups'][-1]['guid']
+    await model('edit_physics_groups', edits=[{'action': 'move', 'group_guid': added_group, 'index': 0}])
+    await model('undo')
+    await model('redo')
+    changed = await model('edit_physics_groups', edits=[{'action': 'remove', 'group_guid': added_group}])
+    assert all(row['guid'] != added_group for row in changed['groups'])
+    for _ in range(3):
+        await model('undo')
+    assert (await model('physics')) == saved_groups
+
+    # Use an existing saved file for the whole multi-track persistence case.
+    animation = (await invoke('open_project', path='expanded-moved.can3', wait_seconds=12))['document_uid']
+
+    async def anim(op, **args):
+        return await invoke(op, document_uid=animation, **args)
+
+    added = await anim('edit_animation_tracks', action='append', model_path='expanded.cmo3', start_frame=10,
+                       duration_frames=20, internal_offset=3)
+    track = added['track']['guid']
+    await anim('undo')
+    assert all(row['guid'] != track for row in (await anim('document'))['tracks'])
+    await anim('redo')
+    await anim('set_timeline_keys', track_guid=track, parameter_id='ParamAngleX', frame_space='scene',
+               keys=[{'frame': 13, 'value': 9}])
+    sampled = await anim('sample_timeline_parameters', track_guid=track, parameter_id='ParamAngleX', frame_space='scene', frames=[13])
+    assert sampled['samples'] == [{'frame': 13, 'value': 9}]
+    local = await anim('get_timeline_keys', track_guid=track, parameter_id='ParamAngleX')
+    assert any(row['frame'] == 6 for row in local['keys']), local
+    events = await anim('edit_animation_events', track_guid=track, events=[{'frame': 14, 'text': 'Cue'}])
+    assert events['events'] == [{'frame': 14, 'text': 'Cue'}], events
+    await anim('undo')
+    assert not (await anim('edit_animation_events', track_guid=track))['events']
+    await anim('redo')
+    saved = await anim('save_as_new', path='offset.can3')
+    assert saved['saved'], saved
+    assert (await anim('close_saved', wait_seconds=6))['closed']
+    animation = (await invoke('open_project', path='offset.can3', wait_seconds=12))['document_uid']
+    assert (await anim('edit_animation_events', track_guid=track))['events'] == events['events']
+    await anim('export_motion3', track_guid=track, path='offset.motion3.json')
+    motion = json.loads((work / 'offset.motion3.json').read_text(encoding='utf8'))
+    assert motion['UserData'] == [{'Time': .117, 'Value': 'Cue'}], motion
+    assert motion['Meta']['UserDataCount'] == 1 and motion['Meta']['TotalUserDataSize'] == 3
+    await anim('remove_timeline_keys', track_guid=track, parameter_id='ParamAngleX', frame_space='scene', frames=[13])
+    await anim('undo')
+    await anim('save_as_new', path='offset-audit.can3')
+    await anim('close_saved', wait_seconds=6)
+    assert (await model('save_as_new', path='audited.cmo3'))['saved']
+    assert (await model('close_saved', wait_seconds=6))['closed']
+    doc = (await invoke('open_project', path='audited.cmo3', wait_seconds=12))['document_uid']
+    assert (await model('inspect_art_paths'))['art_paths'][0]['bindings'] == linked['bindings']
+    large = await model('simulate_physics', frames=[{'ParamAngleZ': 1}] * 8100, warmup_frames=0,
+                        execution='job', request_id='large-physics-trace')
+    for _ in range(200):
+        result = await invoke('job_status', job_id=large['job_id'], frame_offset=8099, frame_limit=1)
+        if result['state'] in ('succeeded', 'failed'):
+            break
+        await asyncio.sleep(.1)
+    assert result['state'] == 'succeeded' and result['result']['frame_count'] == 8100, result
+    assert result['result']['frames'][0]['frame'] == 8099
+    await model('close_saved', wait_seconds=6)
+    jobs = await invoke('list_jobs', operation='simulate_physics', state='succeeded', limit=1)
+    assert jobs['jobs'][0]['operation'] == 'simulate_physics'
+    paged = await invoke('job_status', job_id=jobs['jobs'][0]['job_id'], frame_offset=10, frame_limit=2)
+    assert [row['frame'] for row in paged['result']['frames']] == [10, 11]
+    assert paged['result']['next_frame_offset'] == 12
+    print('V040_NATIVE_AND_STDIO_CHECKS_OK', flush=True)
+
+
+async def check_legacy_gaps(invoke, work):
+    from PIL import ImageDraw
+    image = Image.new('RGBA', (96, 96))
+    ImageDraw.Draw(image).ellipse((9, 12, 84, 86), fill=(250, 40, 50, 255))
+    image.save(work/'mesh-audit.png')
+    padded = Image.new('RGBA', (160, 160))
+    padded.paste(image, (32, 32))
+    padded.save(work/'mesh-audit-large.png')
+    uid = (await invoke('create_blank_project', width=256, height=256))['document_uid']
+
+    async def edit(op, **kwargs):
+        return await invoke(op, document_uid=uid, **kwargs)
+
+    first, second = [
+        (await edit('import_png', path='mesh-audit.png', name=f'Mesh {i}', affine=[1, 0, 0, 1, i * 16, 0]))['guid']
+        for i in range(2)
+    ]
+    ticket = await edit('auto_generate_mesh', object_guid=first, preset='small')
+    for _ in range(200):
+        result = await edit('auto_mesh_status', job_id=ticket['job_id'])
+        if result['state'] in ('succeeded', 'failed'):
+            break
+        await asyncio.sleep(.1)
+    assert result['state'] == 'succeeded' and result['after']['triangles'], result
+    await edit('undo')
+    await edit('redo')
+    png = await edit('export_mesh_texture', object_guid=first, path='mesh-audit-copy.png')
+    assert png['width'] == 96
+    await edit('replace_mesh_texture', object_guid=first, path='mesh-audit-copy.png')
+    await edit('replace_mesh_texture_resized', object_guid=second, path='mesh-audit-large.png', origin_offset=[-32, -32])
+
+    parameter = await edit('create_parameter', id='ParamAudit', name='Audit')
+    await edit('update_parameter', parameter_id=parameter['id'], patch={'name': 'Audit Rename'})
+    group = await edit('create_parameter_group', name='Audit Group')
+    moved = await edit('move_parameter_to_group', parameter_id=parameter['id'], group_guid=group['guid'])
+    assert moved['group_guid'] == group['guid']
+    await edit('add_parameter_keys', object_guid=first, parameter_id=parameter['id'], values=[-1, 1])
+    await edit('move_parameter_keys', object_guid=first, parameter_id=parameter['id'],
+               moves=[{'from_value': 1, 'to_value': .5}])
+    await edit('remove_parameter_keys', object_guid=first, parameter_id=parameter['id'], values=[.5])
+    mesh = await edit('object', object_guid=first)
+    base = next(form for form in mesh['forms'] if form['guid'] == mesh['default_form_guid'])
+    await edit('set_form_positions', object_guid=first, form_guid=base['guid'], positions=base['positions'], compact=True)
+    await edit('set_form_colors', object_guid=first, form_guid=base['guid'], multiply_color=[.8, .8, .8])
+    await edit('set_form_properties', object_guid=first, form_guid=base['guid'], properties={'opacity': .9})
+    await edit('set_blend_mode', object_guid=first, blend_mode='NORMAL')
+    clipped = await edit('set_clipping', object_guid=first, mask_guids=[second, second])
+    assert clipped['mask_guids'] == [second]
+    await edit('set_clipping', object_guid=first, mask_guids=[])
+    await edit('evaluate', object_guids=[first], poses=[{'name': 'control'}, {'name': 'other', 'parameters': {'ParamAudit': -1}}])
+    await edit('release_renderers')
+
+    a = mesh['vertex_uids']
+    b = (await edit('object', object_guid=second))['vertex_uids']
+    pairs = [{'a_uid': a[i], 'b_uid': b[i], 'weight_a': .5, 'weight_b': .5} for i in range(2)]
+    glue = await edit('create_glue', mesh_a_guid=first, mesh_b_guid=second, pairs=pairs[:1])
+    await edit('add_glue_pairs', glue_guid=glue['guid'], pairs=pairs[1:])
+    await edit('update_glue_weights', glue_guid=glue['guid'], pairs=[{**pairs[0], 'weight_a': .7}])
+    await edit('set_glue_intensity', glue_guid=glue['guid'], intensity=.5)
+    assert (await edit('list_glues', include_pairs=False))['glues'][0]['pair_count'] == 2
+    for pair in pairs:
+        await edit('remove_glue_pairs', glue_guid=glue['guid'], pairs=[{key: pair[key] for key in ('a_uid', 'b_uid')}])
+
+    part = await edit('create_part', name='Audit Part')
+    await edit('set_part_offscreen', part_guid=part['guid'], enabled=True)
+    warp = await edit('create_warp', name='Audit Warp', x=15, y=15, width=24, height=24, part_guid=part['guid'])
+    await edit('reparent', object_guid=first, parent_guid=warp['guid'])
+    await edit('fit_warp_to_children', object_guid=warp['guid'])
+    await edit('undo')
+    rotation = await edit('create_rotation', name='Audit Rotation', x=25, y=25, parent_guid=warp['guid'], part_guid=part['guid'])
+    assert rotation['parent_guid'] == warp['guid']
+    await edit('edit_part_rendering', part_guid=part['guid'], patch={'offscreen': False, 'draw_order_group': False})
+
+    physics = await edit('import_physics3', path='probe.physics3.json')
+    await edit('update_physics_group', group_guid=physics['groups'][0]['guid'],
+               patch={'inputs': [{'index': 0, 'weight': 90}]}, expected_inputs={0: 'ParamAngleZ'})
+    trace = await edit('simulate_physics', frames=[{'ParamAngleZ': 1}], trace_path='mesh-audit-trace.json')
+    assert trace['frame_count'] == 1 and 'frames' not in trace
+    assert len(json.loads((work/'mesh-audit-trace.json').read_text(encoding='utf8'))['frames']) == 1
+    atlas = await edit('edit_texture_atlas', action='create_page', name='Audit Atlas', width=512, height=512)
+    mat_a = (await edit('export_mesh_texture', object_guid=first, path='mesh-audit-texture-a.png'))['material_guid']
+    mat_b = (await edit('export_mesh_texture', object_guid=second, path='mesh-audit-texture-b.png'))['material_guid']
+    page = atlas['pages'][0]['guid']
+    placements = [{'material_guid': guid, 'page_guid': page, 'x': 0, 'y': 0} for guid in (mat_a, mat_b)]
+    conflict = await edit('edit_texture_atlas', action='place', placements=placements, preflight=True)
+    assert not conflict['ready'] and conflict['conflicts'][0]['other_material_guid'] == mat_a, conflict
+    placements[1]['x'] = 110
+    placed = await edit('edit_texture_atlas', action='place', placements=placements)
+    assert len(placed['pages'][0]['placements']) == 2
+    save = await edit('save_as_new', path='mesh-audit.cmo3')
+    assert save['saved'], save
+    await edit('close_saved', wait_seconds=6)
+    print('LEGACY_TOOL_GAPS_STDIO_OK', flush=True)
+
+
+async def sdk_check(editor, work, model3, motion_with_events):
     refs = json.loads(model3.read_text(encoding='utf8'))['FileReferences']
     classes = work/'sdk-classes'
     classes.mkdir()
@@ -294,5 +543,5 @@ async def sdk_check(editor, work, model3):
     sdk_paths = [refs['Moc'], refs['Motions']['Idle'][0]['File'], refs['Expressions'][0]['File']]
     command = [str(editor/'app/jre/bin/java.exe'), '-Djava.library.path=app/dll64;app/dll64/windows-amd64',
                '-cp',os.pathsep.join((str(classes),lib)), 'cubism53.mcp.NativeSdkCheck',
-               *(str(model3.parent/path) for path in sdk_paths), 'require-mask']
+               *(str(model3.parent/path) for path in sdk_paths), 'require-mask', str(motion_with_events)]
     await asyncio.to_thread(subprocess.run, command, cwd=editor, check=True, timeout=25)

@@ -1,6 +1,16 @@
 package cubism53.mcp;
 
 import com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSourceSet;
+import com.live2d.cubism.doc.gameData.physics.CPhysicsSettingsSource;
+import com.live2d.cubism.doc.gameData.physics.CPhysicsInput;
+import com.live2d.cubism.doc.gameData.physics.CPhysicsOutput;
+import com.live2d.cubism.doc.gameData.physics.CPhysicsVertex;
+import com.live2d.cubism.doc.gameData.physics.CPhysicsController.CPhysicsSourceType;
+import com.live2d.cubism.doc.model.CModelSource;
+import com.live2d.cubism.doc.model.id.CPhysicsSettingId;
+import com.live2d.graphics3d.type.GVector2;
+import com.live2d.type.CArrayList;
+import com.live2d.undo.SimpleUndo;
 import com.live2d.cubism.doc.model.param.CParameter;
 import com.live2d.cubism.doc.model.param.CParameterSet;
 import com.live2d.cubism.doc.modeling.CModelingDocument;
@@ -10,6 +20,132 @@ import java.util.*;
 import static cubism53.mcp.NativeBridge.*;
 
 final class NativeBridgePhysics {
+    static Object editGroups(CModelingDocument doc, Map<String,Object> request) {
+        var source = doc.getModelSource();
+        var settings = source.getPhysicsSettingsSourceSet();
+        var edits = (List<?>) request.get("edits");
+        Integer fps = request.get("fps") == null ? null : integer(request, "fps", 0);
+        if (fps != null && fps < 1) throw new IllegalArgumentException("FPS must be a positive integer");
+        var gravity = request.get("gravity") == null ? null : vector(request.get("gravity"));
+        var wind = request.get("wind") == null ? null : vector(request.get("wind"));
+        if (edits.isEmpty() && fps == null && gravity == null && wind == null)
+            throw new IllegalArgumentException("Provide at least one physics edit");
+        var candidate = settings.deepCopy(new com.live2d.core.a());
+        for (Object value : edits) applyGroup(source, candidate, (Map<?,?>) value);
+        var undo = new SimpleUndo("Native bridge: edit physics groups", settings, new com.live2d.core.a());
+        try {
+            settings.reinit(candidate, new com.live2d.core.a());
+            if (fps != null) settings.setSettingFPS(fps);
+            if (gravity != null) settings.setGravity(gravity);
+            if (wind != null) settings.setWind(wind);
+            for (var group : settings.getSources()) group.updatePhysicsSettings();
+        } catch (RuntimeException | Error failure) {
+            undo.undo();
+            refresh(doc);
+            throw failure;
+        }
+        finishEdit(doc, undo);
+        return physicsInfo(source);
+    }
+
+    private static void applyGroup(CModelSource source, CPhysicsSettingsSourceSet settings, Map<?,?> row) {
+        String action = nonblank(row.get("action"), "action");
+        var group = "add".equals(action) ? null : settings.getSources().stream()
+            .filter(value -> value.getGuid().getUuidString().equals(row.get("group_guid"))).findFirst()
+            .orElseThrow(() -> new IllegalArgumentException("Physics group not found: " + row.get("group_guid")));
+        if ("remove".equals(action)) {
+            settings.remove(group);
+            return;
+        }
+        if ("move".equals(action)) {
+            int index = groupIndex(row, settings.getSources().size() - 1);
+            settings.remove(group);
+            settings.add(group, index);
+            return;
+        }
+        boolean add = "add".equals(action);
+        if (!add && !"update".equals(action)) throw new IllegalArgumentException("Unknown physics group action");
+        if (add) group = new CPhysicsSettingsSource(new CPhysicsSettingId("Physics" + UUID.randomUUID().toString().replace("-", "")));
+        if (add || row.containsKey("name")) group.setName(nonblank(row.get("name"), "name"));
+        if (row.get("particles") instanceof List<?> particles) {
+            if (particles.size() < 2) throw new IllegalArgumentException("Provide at least two physics particles");
+            var list = new CArrayList<CPhysicsVertex>();
+            for (Object value : particles) {
+                var item = (Map<?,?>) value;
+                var vertex = new CPhysicsVertex();
+                vertex.setPosition(vector(item.get("position")));
+                vertex.setMobility(bounded(item.get("mobility"), "mobility", 0, 1));
+                vertex.setDelay(bounded(item.get("delay"), "delay", 0, 1));
+                vertex.setAcceleration(bounded(item.get("acceleration"), "acceleration", 0, Float.MAX_VALUE));
+                vertex.setRadius(bounded(item.get("radius"), "radius", 0, Float.MAX_VALUE));
+                list.add(vertex);
+            }
+            group.setVertices(list);
+        }
+        if (group.getVertices().size() < 2) throw new IllegalArgumentException("This physics group needs at least two particles");
+        if (row.get("inputs") instanceof List<?> inputs) {
+            var list = new CArrayList<CPhysicsInput>();
+            for (Object value : inputs) {
+                var link = (Map<?,?>) value;
+                var input = new CPhysicsInput();
+                input.setSource(findParameter(source, nonblank(link.get("parameter_id"), "parameter_id")).getGuid());
+                input.setType(linkType(link));
+                input.setWeight(bounded(link.get("weight"), "weight", 0, 100));
+                input.setReverse(Boolean.TRUE.equals(link.get("reverse")));
+                list.add(input);
+            }
+            group.setInputs(list);
+        }
+        if (row.get("outputs") instanceof List<?> outputs) {
+            var list = new CArrayList<CPhysicsOutput>();
+            for (Object value : outputs) {
+                var link = (Map<?,?>) value;
+                var output = new CPhysicsOutput();
+                output.setDestination(findParameter(source, nonblank(link.get("parameter_id"), "parameter_id")).getGuid());
+                var type = linkType(link);
+                output.setType(type);
+                output.setWeight(bounded(link.get("weight"), "weight", 0, 100));
+                output.setReverse(Boolean.TRUE.equals(link.get("reverse")));
+                output.setVertexIndex(groupIndex(link, "vertex_index", group.getVertices().size() - 1));
+                float scale = finite(link.get("scale"), "scale");
+                if (type == CPhysicsSourceType.SRC_TO_G_ANGLE) output.setAngleScale(scale);
+                else output.setTranslationScale(new GVector2(scale, scale));
+                list.add(output);
+            }
+            group.setOutputs(list);
+        }
+        for (var output : group.getOutputs())
+            if (output.getVertexIndex() < 1 || output.getVertexIndex() >= group.getVertices().size())
+                throw new IllegalArgumentException("Output particle index is outside the group");
+        if (add) settings.add(group, row.containsKey("index") ? groupIndex(row, settings.getSources().size()) : settings.getSources().size());
+    }
+
+    private static int groupIndex(Map<?,?> row, int max) {
+        return groupIndex(row, "index", max);
+    }
+
+    private static int groupIndex(Map<?,?> row, String name, int max) {
+        if (!(row.get(name) instanceof Number value) || value.intValue() != value.doubleValue()
+                || value.intValue() < 0 || value.intValue() > max)
+            throw new IllegalArgumentException("Invalid physics " + name);
+        return value.intValue();
+    }
+
+    private static CPhysicsSourceType linkType(Map<?,?> link) {
+        return switch (nonblank(link.get("type"), "link type")) {
+            case "x" -> CPhysicsSourceType.SRC_TO_X;
+            case "y" -> CPhysicsSourceType.SRC_TO_Y;
+            case "angle" -> CPhysicsSourceType.SRC_TO_G_ANGLE;
+            default -> throw new IllegalArgumentException("Unknown physics link type");
+        };
+    }
+
+    private static GVector2 vector(Object value) {
+        var coordinates = floatArray(value);
+        if (coordinates.length != 2) throw new IllegalArgumentException("An XY vector is required");
+        return new GVector2(coordinates[0], coordinates[1]);
+    }
+
     private record Driver(CParameterGuid guid, float value) {}
     private record Range(CParameterGuid guid, float min, float max) {}
     private record OutputRange(String group, String parameter, int groupIndex, int outputIndex) {}
@@ -77,7 +213,7 @@ final class NativeBridgePhysics {
         return new Simulation(settings, pose, frames, outputs, ranges, warmup, delta, "summary".equals(request.get("result_mode")));
     }
 
-    static Object solve(Simulation simulation, long deadline) {
+    static Map<String,Object> solve(Simulation simulation, long deadline) {
         var settings = simulation.settings;
         var pose = simulation.pose;
         var solver = new com.live2d.cubism.doc.gameData.physics.b();

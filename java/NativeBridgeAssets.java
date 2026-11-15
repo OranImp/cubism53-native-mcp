@@ -65,8 +65,50 @@ final class NativeBridgeAssets {
     }
 
     static void writeNew(Path path, String contents) throws IOException {
+        publishFile(path, ".json", temporary -> Files.writeString(temporary, contents, StandardCharsets.UTF_8));
+    }
+
+    @FunctionalInterface
+    interface FileWriter {
+        void write(Path path) throws IOException;
+    }
+
+    static void publishFile(Path path, String suffix, FileWriter writer) throws IOException {
         Files.createDirectories(path.getParent());
-        Files.writeString(path, contents, StandardCharsets.UTF_8, StandardOpenOption.CREATE_NEW);
+        Path temporary = Files.createTempFile(path.getParent(), ".cubism-output-", suffix);
+        try {
+            writer.write(temporary);
+            if (Files.size(temporary) == 0) throw new IOException("Cubism produced an empty output file");
+            Files.move(temporary, path);
+        } finally {
+            Files.deleteIfExists(temporary);
+        }
+    }
+
+    static Map<String,Object> saved(Path path, boolean nativeResult, java.io.File documentFile,
+                                    boolean modified, String refusal) throws IOException {
+        long bytes = Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) ? Files.size(path) : 0;
+        boolean saved = nativeResult && bytes > 0 && documentFile != null
+            && Files.isSameFile(path, documentFile.toPath()) && !modified;
+        var response = map("saved", saved, "path", path.toString(), "bytes", bytes);
+        if (!saved) response.put("reason", refusal == null ? "native_write_unconfirmed" : refusal);
+        return response;
+    }
+
+    static java.awt.image.BufferedImage readPng(Path path) throws IOException {
+        var input = javax.imageio.ImageIO.read(path.toFile());
+        if (input == null) throw new IllegalArgumentException("Image could not be decoded");
+        if (input.getType() == java.awt.image.BufferedImage.TYPE_INT_ARGB) return input;
+        try {
+            int width = input.getWidth(), height = input.getHeight();
+            var result = new java.awt.image.BufferedImage(width, height, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+            var row = new int[width];
+            for (int y = 0; y < height; y++) {
+                input.getRGB(0, y, width, 1, row, 0, width);
+                result.setRGB(0, y, width, 1, row, 0, width);
+            }
+            return result;
+        } finally { input.flush(); }
     }
 
     static Object replaceResized(CModelingDocument doc, Path workspace, Map<String,Object> request) throws Exception {
@@ -78,8 +120,7 @@ final class NativeBridgeAssets {
             throw new IllegalArgumentException("Resizable replacement requires model-image texture mode");
         var previous = input.getModelImage();
         var path = input(workspace, request.get("path"), ".png");
-        var pixels = javax.imageio.ImageIO.read(path.toFile());
-        if (pixels == null) throw new IllegalArgumentException("Image could not be decoded");
+        var pixels = readPng(path);
         var offsets = (List<?>) request.get("origin_offset");
         if (offsets.size() != 2) throw new IllegalArgumentException("Origin offset requires [x,y]");
         var dx = ((Number) offsets.get(0)).intValue();
@@ -100,9 +141,6 @@ final class NativeBridgeAssets {
             if (sampled[i] < -.001f || sampled[i + 1] < -.001f || sampled[i] > pixels.getWidth() + .001f || sampled[i + 1] > pixels.getHeight() + .001f)
                 throw new IllegalArgumentException("The replacement would crop existing mesh samples");
         }
-        var packed = new java.awt.image.BufferedImage(pixels.getWidth(), pixels.getHeight(), java.awt.image.BufferedImage.TYPE_INT_ARGB);
-        packed.setRGB(0, 0, pixels.getWidth(), pixels.getHeight(),
-            pixels.getRGB(0, 0, pixels.getWidth(), pixels.getHeight(), null, 0, pixels.getWidth()), 0, pixels.getWidth());
         var transform = new CAffine(previous.getModelImageLocalToCanvasTransform());
         transform.translate((float) dx, (float) dy);
         var undo = new GroupUndo("Native bridge: resize mesh texture");
@@ -110,7 +148,7 @@ final class NativeBridgeAssets {
         var oldGuid = previous.getGuid();
         var newGuid = new com.live2d.type.CModelImageGuid();
         try {
-            var resource = new com.live2d.graphics.CImageResource(packed, false);
+            var resource = new com.live2d.graphics.CImageResource(pixels, false);
             var material = CModelImage.Companion.a(source, previous.getName() + " (resized)", resource, "Native original artwork", newGuid);
             var transformPort = com.live2d.cubism.doc.model.extension.textureInput.inputFilter.ModelImageFilterEnv.Companion.d();
             var output = material.getInputFilter().getExternalOutputs().get(transformPort.getId());
@@ -118,7 +156,7 @@ final class NativeBridgeAssets {
             material.reset();
             if (page != null) {
                 page.getModelImages().add(new CTextureAtlas.ModelImageEntry(page, newGuid, placementTransform(material, placement)));
-                validateAtlas(source, page);
+                validateAtlas(atlasMaterials(source), page);
             }
             var newImage = material.getCachedImage(cacheParam);
             for (int i = 0; i < sampled.length; i += 2) {
@@ -273,14 +311,33 @@ final class NativeBridgeAssets {
         throw new IllegalArgumentException("Select source_psd_guid from " + descriptions);
     }
 
-    private static ReimportPlan plan(CModelingDocument doc, Path path, Map<String,Object> request) throws Exception {
+    record PsdInput(byte[] hash, CLayeredImage image) {}
+
+    static PsdInput snapshotPsd(Path workspace, Object value) throws Exception {
+        Path path = input(workspace, value, ".psd");
+        var modified = Files.getLastModifiedTime(path);
+        var digest = MessageDigest.getInstance("SHA-256");
+        Path snapshot = Files.createTempFile("cubism-reimport-", ".psd");
+        try {
+            try (var stream = new DigestInputStream(Files.newInputStream(path), digest)) {
+                Files.copy(stream, snapshot, StandardCopyOption.REPLACE_EXISTING);
+            }
+            var parsed = com.live2d.graphics.psd.CPsdDocument.a.a(snapshot.toFile(), false, false);
+            String name = path.getFileName().toString();
+            var incoming = new CLayeredImage(parsed, path.toFile(), name.substring(0, name.length() - 4));
+            incoming.setPsdFileLastModified(modified.toMillis());
+            return new PsdInput(digest.digest(), incoming);
+        } finally {
+            Files.deleteIfExists(snapshot);
+        }
+    }
+
+    private static ReimportPlan plan(CModelingDocument doc, PsdInput snapshot, Map<String,Object> request) throws Exception {
         var model = doc.getModelSource();
         var previous = sourcePsd(model, request.get("source_psd_guid"));
         var digest = MessageDigest.getInstance("SHA-256");
-        try (var stream = new DigestInputStream(Files.newInputStream(path), digest)) {
-            stream.transferTo(java.io.OutputStream.nullOutputStream());
-        }
-        var incoming = readPsd(path);
+        digest.update(snapshot.hash());
+        var incoming = snapshot.image();
         String current = previous.getImage().getGuid().getUuidString();
         var activeLayerIds = new HashSet<com.live2d.type.CLayerGuid>();
         var linkedSources = new HashMap<String,Set<String>>();
@@ -362,11 +419,11 @@ final class NativeBridgeAssets {
             }
         }
         var missing = proven.stream().filter(row -> !used.contains(row)).toList();
-        var snapshot = map("document", doc.getDocumentUID(), "undo", doc.getUndoManager().getCurrentPos(),
+        var modelState = map("document", doc.getDocumentUID(), "modified", doc.getLastModifiedTime(), "undo", doc.getUndoManager().getCurrentPos(),
             "source", current, "materials", materialSnapshot, "layers", oldLayers.stream().map(HistoryLayer::info).toList(),
             "matches", matches.stream().map(Match::info).toList(), "additions", added.stream().map(LayerRow::info).toList(),
             "conflicts", conflicts);
-        digest.update(org.json.simple.JSONValue.toJSONString(snapshot).getBytes(StandardCharsets.UTF_8));
+        digest.update(org.json.simple.JSONValue.toJSONString(modelState).getBytes(StandardCharsets.UTF_8));
         return new ReimportPlan(HexFormat.of().formatHex(digest.digest()), previous, incoming, matches, added, missing, conflicts);
     }
 
@@ -379,9 +436,8 @@ final class NativeBridgeAssets {
         return layers.stream().filter(layer -> layer.row.path.equals(incoming.path)).toList();
     }
 
-    static Object reimportPsd(CModelingDocument doc, Path workspace, Map<String,Object> request, String op) throws Exception {
-        Path path = input(workspace, request.get("path"), ".psd");
-        var plan = plan(doc, path, request);
+    static Object reimportPsd(CModelingDocument doc, PsdInput input, Map<String,Object> request, String op) throws Exception {
+        var plan = plan(doc, input, request);
         if ("plan_psd_reimport".equals(op)) return plan.info();
         if (!plan.id.equals(request.get("plan_id"))) throw new IllegalArgumentException("PSD plan is stale; run preflight again");
         if (!plan.conflicts.isEmpty()) throw new IllegalArgumentException("Resolve PSD layer conflicts with explicit mappings first");
@@ -393,7 +449,7 @@ final class NativeBridgeAssets {
         var undo = new GroupUndo("Native bridge: reimport PSD");
         List<String> changed = new ArrayList<>();
         try {
-            var wrapper = new LayeredImageWrapper(plan.incoming, System.currentTimeMillis(), path.toFile().lastModified(), false);
+            var wrapper = new LayeredImageWrapper(plan.incoming, System.currentTimeMillis(), plan.incoming.getPsdFileLastModified(), false);
             undo.plusAssign(manager.getHandler().a(wrapper, 0));
             boolean wasReplaced = plan.previous.isReplaced();
             // The pinned build exposes a synthetic Kotlin setter to reflection.
@@ -452,17 +508,20 @@ final class NativeBridgeAssets {
     }
 
     @SuppressWarnings({"rawtypes", "unchecked"})
-    static boolean saveModel(CModelingDocument doc, Path path) throws Exception {
+    static Object nativeEditionChecks() throws ReflectiveOperationException {
+        return Class.forName("com.live2d.cubism.view.b.a").getField("a").get(null);
+    }
+
+    static Object saveModel(CModelingDocument doc, Path path) throws Exception {
         var source = doc.getModelSource();
+        Object validator = nativeEditionChecks();
+        Class<?> checks = validator.getClass();
+        // A null prompt suppresses the native warning while preserving the native edition check.
+        if ((boolean) checks.getMethod("a", CModelSource.class, String.class).invoke(validator, source, null))
+            return saved(path, false, doc.getFile(), doc.isModifiedAfterSaving(), "native_edit_restriction");
         if (source.getTextureManager().getHandler().b().isEmpty())
-            return doc.saveDocument(path.toFile(), false);
-        // The stock command asks whether to delete unused PSD sources. Keep
-        // them and call the same native save callback after the same edit check.
-        Class<?> checks = Class.forName("com.live2d.cubism.view.b.a");
-        Object validator = checks.getField("a").get(null);
-        String reason = (String) checks.getMethod("c").invoke(validator);
-        if ((boolean) checks.getMethod("a", CModelSource.class, String.class).invoke(validator, source, reason))
-            return false;
+            return saved(path, doc.saveDocument(path.toFile(), false), doc.getFile(), doc.isModifiedAfterSaving(), null);
+        // Keep historical PSD sources and call the normal native save callback.
         var constructor = Class.forName("com.live2d.cubism.doc.modeling.b")
             .getDeclaredConstructor(CModelingDocument.class, java.io.File.class, boolean.class);
         constructor.setAccessible(true);
@@ -470,7 +529,7 @@ final class NativeBridgeAssets {
         com.live2d.util.ak.a.b(callback);
         doc.getCompletePack().updateProject();
         doc.getCompletePack().repaintCanvas(com.live2d.cubism.CEUpdateManager.b.a);
-        return true;
+        return saved(path, true, doc.getFile(), doc.isModifiedAfterSaving(), null);
     }
 
     static Object exportPhysics(CModelingDocument doc, Path workspace, Map<String,Object> request) throws Exception {
@@ -500,7 +559,9 @@ final class NativeBridgeAssets {
         var artPathWarnings = omittedArtPaths(source);
         if ("export_runtime_package".equals(request.get("operation"))) blockers.addAll(artPathWarnings);
         if (!blockers.isEmpty()) throw new IllegalArgumentException("Runtime preflight failed: " + blockers);
-        var assets = runtimeAssets(source, workspace, request);
+        var diagnostics = new ArrayList<Map<String,Object>>();
+        var assets = runtimeAssets(source, workspace, request, diagnostics);
+        if (!diagnostics.isEmpty()) throw new IllegalArgumentException("Runtime attachment preflight failed: " + diagnostics);
         var options = new CModelExportSettingDialogData();
         options.setVersion("5.3".equals(sdk) ? CModelExportSettingDialogData.FormatVersion.VERSION_53 : CModelExportSettingDialogData.FormatVersion.VERSION_50);
         var exporter = new com.live2d.cubism.doc.model.exporter.w();
@@ -595,16 +656,11 @@ final class NativeBridgeAssets {
         String sdk = targetVersion(request);
         var blockers = runtimeBlockers(doc.getModelSource(), sdk);
         blockers.addAll(omittedArtPaths(doc.getModelSource()));
-        var files = List.<String>of();
-        var diagnostics = new ArrayList<Object>();
-        try { files = List.copyOf(runtimeAssets(doc.getModelSource(), workspace, request).files.keySet()); }
-        catch (NativeBridgeSdk.InvalidAttachment error) {
-            blockers.add(error.getMessage());
-            diagnostics.add(error.diagnostic());
-        }
-        catch (IOException | IllegalArgumentException error) { blockers.add(error.getMessage()); }
-        return map("sdk_version", sdk, "ready", blockers.isEmpty(), "blockers", blockers, "attachments", files,
-            "diagnostics", diagnostics);
+        var diagnostics = new ArrayList<Map<String,Object>>();
+        var assets = runtimeAssets(doc.getModelSource(), workspace, request, diagnostics);
+        for (var diagnostic : diagnostics) blockers.add((String) diagnostic.get("message"));
+        return map("sdk_version", sdk, "ready", blockers.isEmpty(), "blockers", blockers,
+            "attachments", List.copyOf(assets.files.keySet()), "diagnostics", diagnostics);
     }
 
     static Object exportExpression(CModelingDocument doc, Path workspace, Map<String,Object> request) throws IOException {
@@ -654,8 +710,9 @@ final class NativeBridgeAssets {
         if (atlases.isEmpty()) blockers.add("Create and populate a texture atlas before exporting");
         var placed = new HashSet<com.live2d.type.CModelImageGuid>();
         var pageIds = new HashSet<com.live2d.type.CTextureAtlasGuid>();
+        var materials = atlasMaterials(source);
         for (var page : atlases) {
-            try { validateAtlas(source, page); }
+            try { validateAtlas(materials, page); }
             catch (IllegalArgumentException error) { blockers.add(page.getName() + ": " + error.getMessage()); }
             for (var entry : page.getModelImages()) placed.add(entry.getModelImageGuid());
             pageIds.add(page.getGuid());
@@ -663,14 +720,14 @@ final class NativeBridgeAssets {
         var drawableIds = new HashSet<com.live2d.type.CDrawableGuid>();
         for (var drawable : source.getDrawableSourceSet().getSources()) drawableIds.add(drawable.getGuid());
         for (var drawable : source.getDrawableSourceSet().getSources()) {
-            for (var mask : drawable.getClipGuidList()) {
+            for (var mask : NativeBridgeModel.masks(drawable)) {
                 if (!drawableIds.contains(mask)) blockers.add("Missing clipping reference on " + drawable.getId() + ": " + mask.getUuidString());
             }
         }
         for (var part : source.getAllParts()) {
             if ("5.0".equals(sdk) && part.getUseOffscreen())
                 blockers.add("Offscreen part requires SDK 5.3: " + part.getId());
-            for (var mask : part.getClipGuidList()) {
+            for (var mask : NativeBridgeModel.masks(part)) {
                 if (!drawableIds.contains(mask)) blockers.add("Missing clipping reference on part " + part.getId());
             }
         }
@@ -684,9 +741,45 @@ final class NativeBridgeAssets {
         return blockers;
     }
 
+    static Object preflightPhysics(CModelSource source, Path path, boolean replace) throws IOException {
+        var blockers = new ArrayList<Object>();
+        var data = readAttachment(path).data;
+        var parameters = new HashSet<String>();
+        for (var parameter : source.getAllParameters()) parameters.add(parameter.getId().toString());
+        try { new NativeBridgeSdk(path, parameters, Set.of()).physics(data); }
+        catch (NativeBridgeSdk.InvalidAttachment error) { blockers.add(error.diagnostic()); }
+        var missing = new LinkedHashSet<String>();
+        var names = new LinkedHashSet<String>();
+        var existing = source.getPhysicsSettingsSourceSet().getSources();
+        if (data.get("PhysicsDictionary") instanceof List<?> rows) {
+            var existingIds = existing.stream().map(group -> group.getId().toString()).collect(java.util.stream.Collectors.toSet());
+            var existingNames = existing.stream().map(group -> group.getName()).collect(java.util.stream.Collectors.toSet());
+            for (Object value : rows) if (value instanceof Map<?,?> row
+                    && (existingIds.contains(row.get("Id")) || existingNames.contains(row.get("Name"))))
+                names.add(String.valueOf(row.get("Name")));
+        }
+        if (data.get("PhysicsSettings") instanceof List<?> rows) for (Object value : rows) {
+            if (!(value instanceof Map<?,?> row)) continue;
+            collectMissingPhysics(row.get("Input"), "Source", parameters, missing);
+            collectMissingPhysics(row.get("Output"), "Destination", parameters, missing);
+        }
+        if (!existing.isEmpty() && !replace)
+            blockers.add(map("field", "replace", "message", "Existing physics groups: explicit replace required"));
+        return map("ready", blockers.isEmpty(), "blockers", blockers, "missing_parameter_ids", missing.stream().toList(),
+            "conflicting_groups", names.stream().toList(), "replaced_group_guids",
+            replace ? existing.stream().map(group -> group.getGuid().getUuidString()).toList() : List.of());
+    }
+
+    private static void collectMissingPhysics(Object value, String kind, Set<String> known, Set<String> missing) {
+        if (value instanceof List<?> rows) for (Object item : rows)
+            if (item instanceof Map<?,?> row && row.get(kind) instanceof Map<?,?> ref
+                    && ref.get("Id") instanceof String id && !known.contains(id)) missing.add(id);
+    }
+
     private record RuntimeAssets(Map<String,byte[]> files, Map<String,List<Object>> motions, List<Object> expressions, String physics) {}
 
-    private static RuntimeAssets runtimeAssets(CModelSource source, Path workspace, Map<String,Object> request) throws IOException {
+    private static RuntimeAssets runtimeAssets(CModelSource source, Path workspace, Map<String,Object> request,
+                                               List<Map<String,Object>> diagnostics) {
         var files = new LinkedHashMap<String,byte[]>();
         var motions = new LinkedHashMap<String,List<Object>>();
         var expressions = new ArrayList<Object>();
@@ -697,30 +790,47 @@ final class NativeBridgeAssets {
         for (var part : source.getAllParts()) parts.add(part.getId().toString());
         for (var value : (List<?>) request.getOrDefault("motions", List.of())) {
             var row = (Map<?,?>) value;
-            String group = nonblank(row.get("group"), "motion group");
-            var path = input(workspace, row.get("path"), ".motion3.json");
-            var asset = readAttachment(path);
-            new NativeBridgeSdk(path, parameters, parts).motion(asset.data);
-            String file = addAttachment(files, "motions", path, asset.bytes);
-            motions.computeIfAbsent(group, ignored -> new ArrayList<>()).add(map("File", file));
+            try {
+                String group = nonblank(row.get("group"), "motion group");
+                var path = input(workspace, row.get("path"), ".motion3.json");
+                var asset = readAttachment(path);
+                new NativeBridgeSdk(path, parameters, parts).motion(asset.data);
+                String file = addAttachment(files, "motions", path, asset.bytes);
+                motions.computeIfAbsent(group, ignored -> new ArrayList<>()).add(map("File", file));
+            } catch (IOException | IllegalArgumentException error) {
+                diagnostics.add(attachmentError(row.get("path"), error));
+            }
         }
         for (var value : (List<?>) request.getOrDefault("expressions", List.of())) {
             var row = (Map<?,?>) value;
-            String name = nonblank(row.get("name"), "expression name");
-            if (!names.add(name.toLowerCase(Locale.ROOT))) throw new IllegalArgumentException("Duplicate expression name: " + name);
-            var path = input(workspace, row.get("path"), ".exp3.json");
-            var asset = readAttachment(path);
-            new NativeBridgeSdk(path, parameters, parts).expression(asset.data);
-            expressions.add(map("Name", name, "File", addAttachment(files, "expressions", path, asset.bytes)));
+            try {
+                String name = nonblank(row.get("name"), "expression name");
+                if (!names.add(name.toLowerCase(Locale.ROOT))) throw new IllegalArgumentException("Duplicate expression name: " + name);
+                var path = input(workspace, row.get("path"), ".exp3.json");
+                var asset = readAttachment(path);
+                new NativeBridgeSdk(path, parameters, parts).expression(asset.data);
+                expressions.add(map("Name", name, "File", addAttachment(files, "expressions", path, asset.bytes)));
+            } catch (IOException | IllegalArgumentException error) {
+                diagnostics.add(attachmentError(row.get("path"), error));
+            }
         }
         String physics = null;
         if (request.get("physics_path") != null) {
-            var path = input(workspace, request.get("physics_path"), ".physics3.json");
-            var asset = readAttachment(path);
-            new NativeBridgeSdk(path, parameters, parts).physics(asset.data);
-            physics = addAttachment(files, "physics", path, asset.bytes);
+            try {
+                var path = input(workspace, request.get("physics_path"), ".physics3.json");
+                var asset = readAttachment(path);
+                new NativeBridgeSdk(path, parameters, parts).physics(asset.data);
+                physics = addAttachment(files, "physics", path, asset.bytes);
+            } catch (IOException | IllegalArgumentException error) {
+                diagnostics.add(attachmentError(request.get("physics_path"), error));
+            }
         }
         return new RuntimeAssets(files, motions, expressions, physics);
+    }
+
+    private static Map<String,Object> attachmentError(Object file, Exception error) {
+        if (error instanceof NativeBridgeSdk.InvalidAttachment invalid) return invalid.diagnostic();
+        return map("file", file, "field", "$", "message", error.getMessage());
     }
 
     private record Attachment(byte[] bytes, Map<?,?> data) {}
@@ -796,6 +906,30 @@ final class NativeBridgeAssets {
         String action = (String) request.get("action");
         if ("inspect".equals(action)) return atlasInfo(source);
         var manager = source.getTextureManager();
+        var materialsByGuid = atlasMaterials(source);
+        var pagesByGuid = new LinkedHashMap<String,CTextureAtlas>();
+        for (var page : manager.getTextureAtlases()) pagesByGuid.put(page.getGuid().getUuidString(), page);
+        var placements = new ArrayList<AtlasPlacement>();
+        boolean preflight = Boolean.TRUE.equals(request.get("preflight"));
+        if (preflight && !Set.of("place", "resize_page").contains(action))
+            throw new IllegalArgumentException("Atlas preflight applies to place and resize_page");
+        if ("place".equals(action)) {
+            var seen = new HashSet<String>();
+            for (Object item : (List<?>) request.get("placements")) {
+                var row = (Map<?,?>) item;
+                var material = requireAtlasItem(materialsByGuid, row.get("material_guid"), "material_guid");
+                var page = requireAtlasItem(pagesByGuid, row.get("page_guid"), "page_guid");
+                if (!seen.add(material.getGuid().getUuidString()))
+                    throw new IllegalArgumentException("Material appears twice in placements");
+                placements.add(new AtlasPlacement(material, page, placementTransform(material, row)));
+            }
+            if (placements.isEmpty()) throw new IllegalArgumentException("At least one placement is required");
+        }
+        if (Set.of("resize_page", "place").contains(action)) {
+            var conflicts = inspectAtlasEdits(pagesByGuid, materialsByGuid, placements, request, action);
+            if (preflight) return map("ready", conflicts.isEmpty(), "conflicts", conflicts);
+            if (!conflicts.isEmpty()) throw new IllegalArgumentException("Atlas placement conflicts: " + conflicts);
+        }
         var undo = new GroupUndo("Native bridge: " + action + " texture atlas");
         try {
             switch (action) {
@@ -805,13 +939,13 @@ final class NativeBridgeAssets {
                     undo.plusAssign(manager.getHandler().a(page, -1));
                 }
                 case "resize_page" -> {
-                    var page = atlasPage(source, request.get("page_guid"));
+                    var page = requireAtlasItem(pagesByGuid, request.get("page_guid"), "page_guid");
                     undo.plusAssign(new SimpleUndo("Resize texture atlas", page, new com.live2d.core.a()));
                     page.setWidth(atlasSize(request.get("width")));
                     page.setHeight(atlasSize(request.get("height")));
                 }
                 case "auto_layout" -> {
-                    var page = atlasPage(source, request.get("page_guid"));
+                    var page = requireAtlasItem(pagesByGuid, request.get("page_guid"), "page_guid");
                     var assignedElsewhere = new HashSet<com.live2d.type.CModelImageGuid>();
                     for (var other : manager.getTextureAtlases()) {
                         if (other == page) continue;
@@ -824,34 +958,26 @@ final class NativeBridgeAssets {
                     autoLayout(source, page, materials);
                 }
                 case "place" -> {
-                    var placements = (List<?>) request.get("placements");
-                    if (placements.isEmpty()) throw new IllegalArgumentException("At least one placement is required");
-                    var requested = new LinkedHashMap<CModelImage,Map<?,?>>();
-                    for (var item : placements) {
-                        var placement = (Map<?,?>) item;
-                        var material = atlasMaterial(source, placement.get("material_guid"));
-                        if (requested.putIfAbsent(material, placement) != null)
-                            throw new IllegalArgumentException("Material appears twice in placements");
-                        atlasPage(source, placement.get("page_guid"));
+                    var moved = new HashSet<com.live2d.type.CModelImageGuid>();
+                    var targets = new HashSet<CTextureAtlas>();
+                    for (var placement : placements) {
+                        moved.add(placement.material.getGuid());
+                        targets.add(placement.page);
                     }
-                    for (var page : manager.getTextureAtlases()) {
-                        boolean touched = page.getModelImages().stream().anyMatch(entry -> requested.keySet().stream()
-                            .anyMatch(material -> material.getGuid().equals(entry.getModelImageGuid())));
-                        if (touched || requested.values().stream().anyMatch(value -> page.getGuid().getUuidString().equals(value.get("page_guid"))))
+                    for (var page : pagesByGuid.values()) {
+                        boolean loses = page.getModelImages().stream().anyMatch(entry -> moved.contains(entry.getModelImageGuid()));
+                        if (loses || targets.contains(page)) {
                             undo.plusAssign(new SimpleUndo("Place atlas materials", page, new com.live2d.core.a()));
+                            if (loses) page.getModelImages().removeIf(entry -> moved.contains(entry.getModelImageGuid()));
+                        }
                     }
-                    for (var entry : requested.entrySet()) {
-                        var material = entry.getKey();
-                        var placement = entry.getValue();
-                        var page = atlasPage(source, placement.get("page_guid"));
-                        for (var other : manager.getTextureAtlases())
-                            other.getModelImages().removeIf(existing -> material.getGuid().equals(existing.getModelImageGuid()));
-                        page.getModelImages().add(new CTextureAtlas.ModelImageEntry(page, material.getGuid(), placementTransform(material, placement)));
-                    }
+                    for (var placement : placements)
+                        placement.page.getModelImages().add(new CTextureAtlas.ModelImageEntry(
+                            placement.page, placement.material.getGuid(), placement.transform));
                 }
                 default -> throw new IllegalArgumentException("Unknown atlas action: " + action);
             }
-            for (var page : manager.getTextureAtlases()) validateAtlas(source, page);
+            for (var page : manager.getTextureAtlases()) validateAtlas(materialsByGuid, page);
             refreshTextures(source);
         } catch (Exception | Error error) {
             undo.undo();
@@ -881,10 +1007,48 @@ final class NativeBridgeAssets {
             .findFirst().orElseThrow(() -> new IllegalArgumentException("Texture atlas page not found: " + guid));
     }
 
-    private static CModelImage atlasMaterial(CModelSource source, Object value) {
-        String guid = nonblank(value, "material_guid");
-        return source.getTextureManager().getAllModelImages().stream().filter(material -> guid.equals(material.getGuid().getUuidString()))
-            .findFirst().orElseThrow(() -> new IllegalArgumentException("Material not found: " + guid));
+    private static Map<String,CModelImage> atlasMaterials(CModelSource source) {
+        var result = new HashMap<String,CModelImage>();
+        for (var material : source.getTextureManager().getAllModelImages())
+            result.put(material.getGuid().getUuidString(), material);
+        return result;
+    }
+
+    private static <T> T requireAtlasItem(Map<String,T> index, Object value, String name) {
+        String guid = nonblank(value, name);
+        var item = index.get(guid);
+        if (item == null) throw new IllegalArgumentException("Unknown " + name + ": " + guid);
+        return item;
+    }
+
+    private record AtlasPlacement(CModelImage material, CTextureAtlas page, CAffine transform) {}
+    private record AtlasRectangle(String guid, Rectangle2D bound) {}
+
+    private static List<Object> inspectAtlasEdits(Map<String,CTextureAtlas> pages, Map<String,CModelImage> materials,
+                                                   List<AtlasPlacement> placements, Map<String,Object> request, String action) {
+        CTextureAtlas resized = "resize_page".equals(action) ? requireAtlasItem(pages, request.get("page_guid"), "page_guid") : null;
+        int width = resized == null ? 0 : atlasSize(request.get("width"));
+        int height = resized == null ? 0 : atlasSize(request.get("height"));
+        var moved = new HashSet<String>();
+        var additions = new HashMap<CTextureAtlas,List<AtlasRectangle>>();
+        for (var placement : placements) {
+            String guid = placement.material.getGuid().getUuidString();
+            moved.add(guid);
+            additions.computeIfAbsent(placement.page, key -> new ArrayList<>())
+                .add(new AtlasRectangle(guid, atlasBounds(placement.material, placement.transform)));
+        }
+        var conflicts = new ArrayList<Object>();
+        for (var page : pages.values()) {
+            var rectangles = new ArrayList<AtlasRectangle>();
+            for (var entry : page.getModelImages()) {
+                String guid = entry.getModelImageGuid().getUuidString();
+                if (!moved.contains(guid)) rectangles.add(new AtlasRectangle(guid, atlasBounds(materials, entry)));
+            }
+            rectangles.addAll(additions.getOrDefault(page, List.of()));
+            conflicts.addAll(atlasConflicts(page, rectangles, page == resized ? width : page.getWidth(),
+                page == resized ? height : page.getHeight()));
+        }
+        return conflicts;
     }
 
     private static int atlasSize(Object size) {
@@ -904,33 +1068,50 @@ final class NativeBridgeAssets {
         return new CAffine(transform);
     }
 
-    private static Rectangle2D atlasBounds(CModelSource source, CTextureAtlas.ModelImageEntry entry) {
-        var material = atlasMaterial(source, entry.getModelImageGuid().getUuidString());
-        var rectangle = new Rectangle2D.Double(0, 0, material.getWidth(), material.getHeight());
-        return entry.calcModelImageLocalToAtlasTransform().createTransformedShape(rectangle).getBounds2D();
+    private static Rectangle2D atlasBounds(Map<String,CModelImage> materials, CTextureAtlas.ModelImageEntry entry) {
+        return atlasBounds(requireAtlasItem(materials, entry.getModelImageGuid().getUuidString(), "material_guid"),
+            entry.calcModelImageLocalToAtlasTransform());
     }
 
-    private static void validateAtlas(CModelSource source, CTextureAtlas page) {
-        var bounds = new ArrayList<Rectangle2D>();
-        for (var entry : page.getModelImages()) {
-            var rectangle = atlasBounds(source, entry);
-            if (rectangle.getMinX() < -0.01 || rectangle.getMinY() < -0.01
-                    || rectangle.getMaxX() > page.getWidth() + 0.01 || rectangle.getMaxY() > page.getHeight() + 0.01)
-                throw new IllegalArgumentException("Material is outside the texture atlas: " + entry.getModelImageGuid().getUuidString());
-            if (bounds.stream().anyMatch(other -> other.intersects(rectangle)))
-                throw new IllegalArgumentException("Material overlaps another atlas placement: " + entry.getModelImageGuid().getUuidString());
-            bounds.add(rectangle);
+    private static Rectangle2D atlasBounds(CModelImage material, CAffine transform) {
+        return transform.createTransformedShape(new Rectangle2D.Double(0, 0, material.getWidth(), material.getHeight())).getBounds2D();
+    }
+
+    private static List<Object> atlasConflicts(CTextureAtlas page, List<AtlasRectangle> placements, int width, int height) {
+        var conflicts = new ArrayList<Object>();
+        String pageGuid = page.getGuid().getUuidString();
+        for (int i = 0; i < placements.size(); i++) {
+            var placement = placements.get(i);
+            var bound = placement.bound;
+            if (bound.getMinX() < -0.01 || bound.getMinY() < -0.01
+                    || bound.getMaxX() > width + 0.01 || bound.getMaxY() > height + 0.01)
+                conflicts.add(map("kind", "outside", "page_guid", pageGuid, "material_guid", placement.guid));
+            for (int j = 0; j < i; j++) {
+                var other = placements.get(j);
+                if (bound.intersects(other.bound))
+                    conflicts.add(map("kind", "overlap", "page_guid", pageGuid, "material_guid", placement.guid,
+                        "other_material_guid", other.guid));
+            }
         }
+        return conflicts;
+    }
+
+    private static void validateAtlas(Map<String,CModelImage> materials, CTextureAtlas page) {
+        var rectangles = page.getModelImages().stream().map(entry -> new AtlasRectangle(
+            entry.getModelImageGuid().getUuidString(), atlasBounds(materials, entry))).toList();
+        var conflicts = atlasConflicts(page, rectangles, page.getWidth(), page.getHeight());
+        if (!conflicts.isEmpty()) throw new IllegalArgumentException("Atlas placement conflicts: " + conflicts);
     }
 
     private static Object atlasInfo(CModelSource source) {
         var manager = source.getTextureManager();
         var pages = new ArrayList<Object>();
+        var materials = atlasMaterials(source);
         var assigned = new HashSet<com.live2d.type.CModelImageGuid>();
         for (var page : manager.getTextureAtlases()) {
             var entries = new ArrayList<Object>();
             for (var entry : page.getModelImages()) {
-                var bounds = atlasBounds(source, entry);
+                var bounds = atlasBounds(materials, entry);
                 assigned.add(entry.getModelImageGuid());
                 entries.add(map("material_guid", entry.getModelImageGuid().getUuidString(), "x", bounds.getX(), "y", bounds.getY(),
                     "width", bounds.getWidth(), "height", bounds.getHeight(),

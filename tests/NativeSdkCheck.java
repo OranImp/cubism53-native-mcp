@@ -8,6 +8,7 @@ import com.live2d.sdk.cubism.a.f.j;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.List;
 
 /** Exercise the SDK runtime shipped with the official Viewer. */
 public final class NativeSdkCheck {
@@ -44,6 +45,12 @@ public final class NativeSdkCheck {
             requireClose(parameter(core, "ParamAngleY"), y * .5f);
             requireClose(parameter(core, "ParamAngleZ"), 7);
             System.out.println("VIEWER_SDK_MOTION_AND_EXPRESSION_BLEND_OK");
+            if (args.length > 4) {
+                var events = e.a(bytes(args[4]));
+                if (events == null || !events.a(0f, .12f).equals(List.of("Cue")) || !events.a(.12f, .5f).isEmpty())
+                    throw new AssertionError("Viewer SDK delivered the Motion3 event at the wrong time");
+                System.out.println("VIEWER_SDK_MOTION_EVENT_OK");
+            }
         }
     }
 

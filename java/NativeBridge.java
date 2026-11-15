@@ -127,12 +127,13 @@ public final class NativeBridge {
                 reply(socket, map("ok", true, "result", bridgeIdentity()));
             } else if ("job_status".equals(operation)) {
                 reply(socket, map("ok", true, "result", NativeBridgeJobs.status(request)));
+            } else if ("list_jobs".equals(operation)) {
+                reply(socket, map("ok", true, "result", NativeBridgeJobs.list(request)));
             } else if (Set.of("render_pose_set", "export_runtime_package").contains(operation)
                     || "job".equals(request.get("execution"))
                         && Set.of("reimport_psd", "export_runtime_model", "simulate_physics").contains(operation)) {
-                boolean background = !"reimport_psd".equals(operation);
-                reply(socket, map("ok", true, "result", NativeBridgeJobs.submit(operation, request, background,
-                    () -> background ? executeBackground(operation, request, 0) : execute(operation, request))));
+                reply(socket, map("ok", true, "result", NativeBridgeJobs.submit(operation, request, true,
+                    () -> executeBackground(operation, request, 0))));
             } else {
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(45);
                 try {
@@ -153,7 +154,7 @@ public final class NativeBridge {
             Object result;
             if ("stop".equals(operation)) {
                 result = stop(deadline);
-            } else if (Set.of("export_runtime_model", "simulate_physics").contains(operation)) {
+            } else if (Set.of("export_runtime_model", "simulate_physics", "plan_psd_reimport", "reimport_psd", "render_png").contains(operation)) {
                 NativeBridgeJobs.beginWork();
                 try { result = executeBackground(operation, request, deadline); }
                 finally { NativeBridgeJobs.endWork(); }
@@ -199,9 +200,23 @@ public final class NativeBridge {
             return doc;
         };
         if ("render_pose_set".equals(operation)) return NativeBridgeRendering.renderSet(document, workspace, request);
+        if ("render_png".equals(operation)) return renderPng(document, request, deadline);
+        if (Set.of("plan_psd_reimport", "reimport_psd").contains(operation)) {
+            var snapshot = NativeBridgeAssets.snapshotPsd(workspace, request.get("path"));
+            return onEditorThread(() -> NativeBridgeAssets.reimportPsd(document.call(), snapshot, request, operation), deadline);
+        }
         if ("simulate_physics".equals(operation)) {
             var simulation = onEditorThread(() -> NativeBridgePhysics.prepare(document.call(), request), deadline);
-            return NativeBridgePhysics.solve(simulation, deadline);
+            if (request.get("trace_path") == null) return NativeBridgePhysics.solve(simulation, deadline);
+            if (simulation.summary()) throw new IllegalArgumentException("trace_path requires result_mode=trace");
+            var path = NativeBridgeAssets.output(workspace, request.get("trace_path"), ".json");
+            var result = NativeBridgePhysics.solve(simulation, deadline);
+            NativeBridgeAssets.writeNew(path, JSONValue.toJSONString(result));
+            var receipt = new LinkedHashMap<>(result);
+            receipt.remove("frames");
+            receipt.put("frame_count", simulation.frames().size());
+            receipt.put("trace_path", path.toString());
+            return receipt;
         }
         var destination = NativeBridgeAssets.output(workspace, request.get("directory"), "");
         var export = onEditorThread(() -> NativeBridgeAssets.prepareRuntime(document.call(), workspace, request), deadline);
@@ -255,10 +270,15 @@ public final class NativeBridge {
         if ("status".equals(op)) {
             pruneRenderSessions(app);
             List<Object> documents = new ArrayList<>();
+            boolean lightweight = Boolean.TRUE.equals(request.get("lightweight"));
             for (IDocument doc : app.getAllDocs()) {
-                if (doc instanceof CModelingDocument modelDoc) documents.add(describe(modelDoc));
+                if (doc instanceof CModelingDocument modelDoc) documents.add(lightweight
+                    ? map("document_uid", modelDoc.getDocumentUID(), "document_type", "model")
+                    : describe(modelDoc));
             }
-            for (var scene : NativeBridgeAnimation.scenes(app)) documents.add(NativeBridgeAnimation.describe(scene));
+            for (var scene : NativeBridgeAnimation.scenes(app)) documents.add(lightweight
+                ? map("document_uid", scene.getDocumentUID(), "document_type", "animation_scene")
+                : NativeBridgeAnimation.describe(scene));
             var current = app.getCurrentDoc();
             var status = bridgeIdentity();
             status.putAll(map("adapter", "internal-" + NativeBridgeBuild.VERSION + "-experimental",
@@ -267,7 +287,7 @@ public final class NativeBridge {
                     : current instanceof CSceneDocument d ? d.getDocumentUID() : null));
             return status;
         }
-        if ("open_project".equals(op)) {
+        if ("open_project".equals(op) || "find_open_project".equals(op)) {
             String requestedPath = nonblank(request.get("path"), "path");
             String suffix = requestedPath.toLowerCase(Locale.ROOT).endsWith(".can3") ? ".can3" : ".cmo3";
             Path file = NativeBridgeAssets.input(workspace, requestedPath, suffix);
@@ -278,6 +298,7 @@ public final class NativeBridge {
                 var path = doc.getAnimationContent().getFile();
                 if (sameOpenFile(path, file)) return NativeBridgeAnimation.describe(doc);
             }
+            if ("find_open_project".equals(op)) return null;
             if (file.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".can3"))
                 return NativeBridgeAnimation.open(app, file);
             app.command_open(file.toFile(), false);
@@ -316,6 +337,7 @@ public final class NativeBridge {
         if (scene != null) return NativeBridgeAnimation.execute(app, scene, workspace, op, request);
         CModelingDocument doc = findDocument(app, (String) request.get("document_uid"));
         CModelSource source = doc.getModelSource();
+        checkRevision(doc, request);
         if (activeAutoMesh != null && activeAutoMesh.documentUid.equals(doc.getDocumentUID())
                 && !Set.of("auto_generate_mesh", "auto_mesh_status", "describe", "objects", "object",
                     "physics", "list_glues").contains(op))
@@ -355,22 +377,26 @@ public final class NativeBridge {
             case "plan_delete_objects", "delete_objects": return NativeBridgeAuthoring.delete(doc, op, request);
             case "set_form_colors": return NativeBridgeModel.setColors(doc, request);
             case "create_blend_shape": return NativeBridgeModel.createBlendShape(doc, request);
+            case "edit_blend_shape": return NativeBridgeModel.editBlendShape(doc, request);
+            case "edit_art_path": return NativeBridgeAuthoring.editPath(doc, request);
+            case "preflight_model_edit": return NativeBridgeModel.preflight(source, request);
             case "replace_mesh_texture_resized": return NativeBridgeAssets.replaceResized(doc, workspace, request);
             case "edit_batch": return editBatch(doc, request);
             case "fit_warp_to_children": return fitWarp(doc, request);
-            case "plan_psd_reimport", "reimport_psd": return NativeBridgeAssets.reimportPsd(doc, workspace, request, op);
             case "edit_texture_atlas": return NativeBridgeAssets.editAtlas(doc, request);
             case "export_physics3": return NativeBridgeAssets.exportPhysics(doc, workspace, request);
             case "export_expression3": return NativeBridgeAssets.exportExpression(doc, workspace, request);
             case "preflight_runtime_export": return NativeBridgeAssets.preflightRuntime(doc, workspace, request);
             case "auto_generate_mesh": return startAutoMesh(doc, request);
             case "auto_mesh_status": return NativeBridgeJobs.meshStatus(doc.getDocumentUID(), (String) request.get("job_id"));
-            case "list_glues": return map("glues", glues(source).stream().map(NativeBridge::glueInfo).toList());
+            case "list_glues": return map("glues", glues(source).stream()
+                .map(glue -> glueInfo(glue, !Boolean.FALSE.equals(request.get("include_pairs")))).toList());
             case "create_glue": return createGlue(doc, request);
             case "update_glue_weights", "remove_glue_pairs", "set_glue_intensity": return editGlue(doc, request, op);
             case "update_parameter": return updateParameter(doc, request);
             case "move_parameter_keys", "remove_parameter_keys": return editParameterKeys(doc, request, op);
             case "update_physics_group": return updatePhysicsGroup(doc, request);
+            case "edit_physics_groups": return NativeBridgePhysics.editGroups(doc, request);
             case "move_to_part": {
                 var item = findObject(source, (String) request.get("object_guid"));
                 String partGuid = (String) request.get("part_guid");
@@ -416,10 +442,8 @@ public final class NativeBridge {
                 var part = requirePart(source, (String) request.get("part_guid"));
                 if (part == source.getRootPart()) throw new IllegalArgumentException("Root part is not a drawing group");
                 boolean enabled = (Boolean) request.get("enabled");
-                var undo = part.getHandler().createUndo_forBasicSetting("Native bridge: set part offscreen drawing");
-                part.setUseOffscreen(enabled);
-                part.setEnableDrawOrderGroup(true);
-                finishEdit(doc, undo);
+                NativeBridgeAuthoring.editPart(doc, map("part_guid", request.get("part_guid"),
+                    "offscreen", enabled, "draw_order_group", true));
                 return objectInfo(part, false);
             }
             case "create_parameter": {
@@ -443,6 +467,8 @@ public final class NativeBridge {
             case "import_physics3": {
                 Path path = NativeBridgeAssets.input(workspace, request.get("path"), ".physics3.json");
                 var settings=source.getPhysicsSettingsSourceSet();
+                if (Boolean.TRUE.equals(request.get("preflight")))
+                    return NativeBridgeAssets.preflightPhysics(source, path, Boolean.TRUE.equals(request.get("replace")));
                 if (!settings.getSources().isEmpty() && !Boolean.TRUE.equals(request.get("replace")))
                     throw new IllegalArgumentException("Existing physics groups: explicit replace required");
                 var input=net.arnx.jsonic.JSON.decode(Files.readString(path),
@@ -470,15 +496,11 @@ public final class NativeBridge {
                     if (name.equals(existing.getLocalName())) throw new IllegalArgumentException("Object name already exists");
                 float[] affine = floatArray(request.get("affine"));
                 if (affine.length != 6) throw new IllegalArgumentException("PNG-to-canvas affine requires a,b,c,d,tx,ty");
-                var pixels = javax.imageio.ImageIO.read(file.toFile());
-                if (pixels == null) throw new IllegalArgumentException("Image could not be decoded");
-                // Cubism's image wrapper accepts packed ARGB, not ImageIO's ABGR.
-                var packed = new java.awt.image.BufferedImage(pixels.getWidth(),pixels.getHeight(),java.awt.image.BufferedImage.TYPE_INT_ARGB);
-                packed.setRGB(0,0,pixels.getWidth(),pixels.getHeight(),pixels.getRGB(0,0,pixels.getWidth(),pixels.getHeight(),null,0,pixels.getWidth()),0,pixels.getWidth());
+                var pixels = NativeBridgeAssets.readPng(file);
                 var undo = new com.live2d.undo.GroupUndo("Native bridge: import PNG");
                 undo.plusAssign(new com.live2d.undo.SimpleUndo("Import material",source.getTextureManager(),new com.live2d.core.a()));
                 try {
-                    var resource = new com.live2d.graphics.CImageResource(packed,false);
+                    var resource = new com.live2d.graphics.CImageResource(pixels,false);
                     var material = com.live2d.cubism.doc.model.texture.modelImage.CModelImage.Companion.a(
                         source,name,resource,"Native original artwork",new com.live2d.type.CModelImageGuid());
                     var meshes = source.getHandler().a(null,List.of(material),source.getRootPart(),integer(request,"draw_order",500),1f,undo);
@@ -509,7 +531,7 @@ public final class NativeBridge {
                 if (!(item instanceof com.live2d.cubism.doc.model.drawable.ACDrawableSource drawable))
                     throw new IllegalArgumentException("Drawable required");
                 var masks = new com.live2d.type.CArrayList<com.live2d.type.CDrawableGuid>();
-                for (var guid : (List<?>)request.get("mask_guids")) {
+                for (var guid : new LinkedHashSet<>((List<?>) request.get("mask_guids"))) {
                     var mask = findObject(source,(String)guid);
                     if (!(mask instanceof com.live2d.cubism.doc.model.drawable.ACDrawableSource clipper) || mask == item)
                         throw new IllegalArgumentException("Valid drawable mask required");
@@ -535,13 +557,11 @@ public final class NativeBridge {
                 var input=mesh.getTextureInputExtension().getModelImageInput();
                 var material=input==null ? null : input.getModelImageOrNull();
                 if (material==null) throw new IllegalArgumentException("Embedded model-image material required");
-                var pixels=javax.imageio.ImageIO.read(path.toFile());
-                if (pixels==null || pixels.getWidth()!=material.getWidth() || pixels.getHeight()!=material.getHeight())
+                var pixels = NativeBridgeAssets.readPng(path);
+                if (pixels.getWidth()!=material.getWidth() || pixels.getHeight()!=material.getHeight())
                     throw new IllegalArgumentException("Replacement dimensions must match the embedded material");
                 float[] before=input.getInputImageLocalToCanvasTransform().copy().getMatrix();
-                var packed=new java.awt.image.BufferedImage(pixels.getWidth(),pixels.getHeight(),java.awt.image.BufferedImage.TYPE_INT_ARGB);
-                packed.setRGB(0,0,pixels.getWidth(),pixels.getHeight(),pixels.getRGB(0,0,pixels.getWidth(),pixels.getHeight(),null,0,pixels.getWidth()),0,pixels.getWidth());
-                var resource=new com.live2d.graphics.CImageResource(packed,false);
+                var resource=new com.live2d.graphics.CImageResource(pixels,false);
                 var undo=new MaterialPixelsUndo(doc,material);
                 try {
                     closeRenderSessions(doc.getDocumentUID());
@@ -580,7 +600,7 @@ public final class NativeBridge {
                 var resource = material.getFilteredImage();
                 Files.createDirectories(path.getParent());
                 // The material owns this resource; exporting must not flush or dispose it.
-                resource.getImage().writeImage(path.toFile());
+                NativeBridgeAssets.publishFile(path, ".png", temporary -> resource.getImage().writeImage(temporary.toFile()));
                 var result = map("path",path.toString(),"width",resource.getWidth(),"height",resource.getHeight(),
                     "material_guid",material.getGuid().getUuidString(),"material_name",material.getName(),
                     "image_to_source",input.getInputImageLocalToCanvasTransform().copy().getMatrix());
@@ -589,47 +609,10 @@ public final class NativeBridge {
                         "image01_to_logical01",texture.getTransformImageResource01toLogical01().getMatrix()));
                 return result;
             }
-            case "render_png": {
-                Path path = NativeBridgeAssets.output(workspace, request.get("path"), ".png");
-                int width = integer(request,"width",1024), height = integer(request,"height",2011);
-                Map<?,?> values = (Map<?,?>)request.getOrDefault("parameters",Map.of());
-                var pose = pose(source, (String) request.get("base_pose"), values);
-                pruneRenderSessions(app);
-                try (var permit = NativeBridgeRendering.reserve(width, height, 0, false)) {
-                    String key = doc.getDocumentUID() + ":" + width + "x" + height;
-                    var cached = renderSessions.get(key);
-                    boolean reused = cached != null;
-                    NativeRenderSession renderer;
-                    if (permit.large) {
-                        closeRenderSessions(null);
-                        renderer = new NativeRenderSession(doc.getDocumentUID(), source, width, height, pose);
-                    } else if (reused) {
-                        renderer = cached.renderer;
-                    } else {
-                        while (renderSessions.size() >= 2) {
-                            String first = renderSessions.keySet().iterator().next();
-                            renderSessions.remove(first).close();
-                        }
-                        renderer = new NativeRenderSession(doc.getDocumentUID(), source, width, height, pose);
-                        renderSessions.put(key, new CachedRender(doc, renderer));
-                    }
-                    try {
-                        var image = renderer.render(pose);
-                        if (image == null) throw new IllegalStateException("Cubism offscreen renderer returned no image");
-                        try { Files.createDirectories(path.getParent()); image.writeImage(path.toFile()); }
-                        finally { image.flush(); }
-                        return map("path", path.toString(), "width", width, "height", height, "bytes", Files.size(path),
-                            "parameters", values, "renderer_reused", reused, "renderer_frames", renderer.frames,
-                            "live_renderers", renderSessions.size());
-                    } finally {
-                        if (permit.large) renderer.close();
-                    }
-                }
-            }
             case "reparent": {
                 var item = findObject(source,(String)request.get("object_guid"));
                 String parentGuid = (String)request.get("parent_guid");
-                ACDeformerSource parent = parentGuid == null ? null : (ACDeformerSource)findObject(source,parentGuid);
+                ACDeformerSource parent = parentGuid == null ? null : requireDeformer(source, parentGuid);
                 if (parent == item) throw new IllegalArgumentException("An object cannot parent itself");
                 if (parent != null) for (var ancestor : parent.getAllParentDeformers())
                     if (ancestor == item) throw new IllegalArgumentException("Deformer hierarchy cycle");
@@ -676,7 +659,7 @@ public final class NativeBridge {
                 else if (form instanceof CWarpDeformerForm warp) warp.setPositions(values);
                 form.setUpdated();
                 finishEdit(doc,undo);
-                return objectInfo(item,true);
+                return formEditReceipt(item, form, request);
             }
             case "set_form_properties": {
                 var item = findObject(source,(String)request.get("object_guid"));
@@ -689,6 +672,10 @@ public final class NativeBridge {
                     if (!allowed.contains(entry.getKey())) throw new IllegalArgumentException("Unsupported form property: " + entry.getKey());
                     float value = ((Number)entry.getValue()).floatValue();
                     if (!Float.isFinite(value)) throw new IllegalArgumentException("Finite property values required");
+                    if ("draw_order".equals(entry.getKey())) {
+                        double raw = ((Number) entry.getValue()).doubleValue();
+                        if (raw != (int) raw) throw new IllegalArgumentException("Draw order must be an integer");
+                    }
                     if ("opacity".equals(entry.getKey()) && (value < 0 || value > 1)) throw new IllegalArgumentException("Opacity must be 0..1");
                     if ("scale".equals(entry.getKey()) && value <= 0) throw new IllegalArgumentException("Positive scale required");
                 }
@@ -705,16 +692,17 @@ public final class NativeBridge {
                         }
                     } else if (form instanceof ACDrawableForm drawable) {
                         if ("opacity".equals(entry.getKey())) drawable.setOpacity(value);
-                        else drawable.setDrawOrder((int)value);
+                        else drawable.setDrawOrder(((Number) entry.getValue()).intValue());
                     }
                     else throw new IllegalArgumentException("Drawable or rotation form required");
                 }
                 form.setUpdated(); finishEdit(doc,undo);
-                return objectInfo(item,true);
+                return formEditReceipt(item, form, request);
             }
             case "set_mesh_topology": {
                 var item = findObject(source,(String)request.get("object_guid"));
                 if (!(item instanceof CArtMeshSource mesh)) throw new IllegalArgumentException("ArtMesh required");
+                var dependencies = NativeBridgeModel.topologyReferences(source, mesh);
                 float[] vertices = floatArray(request.get("positions"));
                 List<?> inputIndices = (List<?>)request.get("indices");
                 if (vertices.length < 6 || vertices.length%2 != 0 || inputIndices.size()%3 != 0 || inputIndices.isEmpty())
@@ -726,6 +714,14 @@ public final class NativeBridge {
                     if (n.doubleValue() != indices[i] || indices[i] < 0 || indices[i] >= vertices.length/2)
                         throw new IllegalArgumentException("Invalid triangle vertex index");
                 }
+                for (int offset = 0; offset < indices.length; offset += 3) {
+                    int a = 2 * indices[offset], b = 2 * indices[offset + 1], c = 2 * indices[offset + 2];
+                    double x = (double) vertices[b] - vertices[a], y = (double) vertices[b + 1] - vertices[a + 1];
+                    if (x * ((double) vertices[c + 1] - vertices[a + 1])
+                            == y * ((double) vertices[c] - vertices[a]))
+                        throw new IllegalArgumentException("Degenerate triangle at index " + offset / 3);
+                }
+                if (Boolean.TRUE.equals(request.get("preflight"))) return dependencies;
                 var newMesh = new com.live2d.graphics3d.editableMesh.GEditableMesh2();
                 newMesh.initByIndices(vertices,indices,mesh.getEditableMesh().getCoordType());
                 var undo = mesh.getHandler().a("Native bridge: edit mesh topology");
@@ -740,30 +736,11 @@ public final class NativeBridge {
                     for (var observer : observers) observer.fireTopologyChanged(model,true);
                     finishEdit(doc,undo);
                 } catch (Throwable error) { undo.undo(); refresh(doc); throw error; }
-                return objectInfo(mesh,true);
+                var result = objectInfo(mesh, true);
+                result.put("topology_impact", dependencies);
+                return result;
             }
-            case "evaluate": {
-                CModel model = source.createModelInstance(com.live2d.graphics3d.rendering.RenderType.NORMAL);
-                try {
-                    Map<?,?> values = (Map<?,?>)request.getOrDefault("parameters",Map.of());
-                    model.getParameterSet().setValuesById(pose(source, (String)request.get("base_pose"), values));
-                    // Match the independent model used by Cubism's PNG exporter.
-                    com.live2d.cubism.view.ay.a.a(model,new com.live2d.cubism.doc.model.ax(null),null,null,null,false);
-                    List<Object> objects = new ArrayList<>();
-                    for (Object guid : (List<?>)request.get("object_guids")) {
-                        var item = findObject(source,(String)guid);
-                        var instance = model.getObject(item.getGuid());
-                        var result = map("guid",guid,"local_positions",formPositions(instance.getInterpolatedForm()),
-                            "canvas_positions",formPositions(instance.getCalculatedForm()));
-                        if (instance.getCalculatedForm() instanceof ACDrawableForm drawable) {
-                            result.put("opacity",drawable.getOpacity()); result.put("draw_order",drawable.getDrawOrder());
-                        }
-                        if (instance.getInterpolatedForm() instanceof CRotationDeformerForm rotation) result.put("rotation",rotationProperties(rotation));
-                        objects.add(result);
-                    }
-                    return map("objects",objects,"parameters",values);
-                } finally { model.disposeAll(); }
-            }
+            case "evaluate": return evaluate(source, request);
             case "create_warp": {
                 String name = (String) request.get("name");
                 if (name == null || name.isBlank()) throw new IllegalArgumentException("Name required");
@@ -775,11 +752,12 @@ public final class NativeBridge {
                     if (name.equals(existing.getLocalName())) throw new IllegalArgumentException("Deformer name already exists");
                 float x = number(request, "x"), y = number(request, "y"), width = number(request, "width"), height = number(request, "height");
                 if (width <= 0 || height <= 0) throw new IllegalArgumentException("Positive bounds required");
+                var part = targetPart(source, request.get("part_guid"));
                 // Same internal factory as the native command: part membership,
                 // GUID, default form, interpolation grid, Bezier extension and undo.
                 Pair<CWarpDeformerSource,ACUndoable> edit = com.live2d.cubism.doc.model.deformer.j.a.a(
-                    source.getCurrentInstance(), name, source.getRootPart(), -1,
-                    CDeformerGuid.Companion.a(), columns, rows, bezierColumns, bezierRows,
+                    source.getCurrentInstance(), name, part, childIndex(request, part.getChildren().size()),
+                    targetDeformer(source, request.get("parent_guid")), columns, rows, bezierColumns, bezierRows,
                     new GRectF(x, y, width, height));
                 finishEdit(doc,edit.getSecond());
                 return deformer(edit.getFirst());
@@ -791,8 +769,10 @@ public final class NativeBridge {
                     if (name.equals(existing.getLocalName())) throw new IllegalArgumentException("Deformer name already exists");
                 float x = number(request,"x"), y = number(request,"y"), length = number(request,"handle_length");
                 if (length <= 0) throw new IllegalArgumentException("Positive handle length required");
-                var edit = com.live2d.cubism.doc.model.deformer.j.a.a(source.getCurrentInstance(),name,source.getRootPart(),-1,
-                    CDeformerGuid.Companion.a(),null,0f,1f,0f,30f,length,new com.live2d.graphics3d.type.GVector2(x,y));
+                var part = targetPart(source, request.get("part_guid"));
+                var edit = com.live2d.cubism.doc.model.deformer.j.a.a(source.getCurrentInstance(), name, part,
+                    childIndex(request, part.getChildren().size()), targetDeformer(source, request.get("parent_guid")),
+                    null, 0f, 1f, 0f, 30f, length, new com.live2d.graphics3d.type.GVector2(x,y));
                 finishEdit(doc,edit.getSecond());
                 return deformer(edit.getFirst());
             }
@@ -807,11 +787,11 @@ public final class NativeBridge {
             case "save_as_new": {
                 Path path = NativeBridgeAssets.output(workspace, request.get("path"), ".cmo3");
                 Files.createDirectories(path.getParent());
-                boolean saved = NativeBridgeAssets.saveModel(doc, path);
-                return map("saved", saved, "path", path.toString(), "bytes", Files.exists(path) ? Files.size(path) : 0);
+                return NativeBridgeAssets.saveModel(doc, path);
             }
             case "close_saved":
-                if (doc.isModifiedAfterSaving()) throw new IllegalStateException("Save or undo changes before closing");
+                if (doc.getFile() == null || doc.isModifiedAfterSaving())
+                    throw new IllegalStateException("Save or undo changes before closing");
                 closeRenderSessions(doc.getDocumentUID());
                 NativeBridgeJobs.closeDocument(doc.getDocumentUID());
                 app.command_close(doc); return map("close_requested", true);
@@ -841,10 +821,32 @@ public final class NativeBridge {
             "canvas_width", source.getCanvas().getPixelWidth(), "canvas_height", source.getCanvas().getPixelHeight(),
             "drawables", source.getDrawableSourceSet().getSources().size(), "deformers", deformers,
             "materials",source.getTextureManager().getAllModelImages().size(),
-            "modified", doc.isModifiedAfterSaving(), "undo_position", doc.getUndoManager().getCurrentPos());
+            "modified", doc.isModifiedAfterSaving(), "undo_position", doc.getUndoManager().getCurrentPos(),
+            "revision", revision(doc));
     }
 
-    private static Map<String,Object> physicsInfo(CModelSource source) {
+    static String revision(IDocument doc) {
+        var undo = doc.getUndoManager();
+        int position = undo.getCurrentPos();
+        Object newest = position > 0 ? undo.getUndoList().get(position - 1) : null;
+        String uid;
+        long modified;
+        if (doc instanceof CModelingDocument model) {
+            uid = model.getDocumentUID();
+            modified = model.getLastModifiedTime();
+        } else if (doc instanceof CSceneDocument scene) {
+            uid = scene.getDocumentUID();
+            modified = scene.getAnimationContent().getLastModifiedTime();
+        } else throw new IllegalArgumentException("Unsupported document type");
+        return uid + ":" + modified + ":" + position + ":" + System.identityHashCode(newest);
+    }
+
+    static void checkRevision(IDocument doc, Map<String,Object> request) {
+        if (request.get("expected_revision") instanceof String expected && !expected.equals(revision(doc)))
+            throw new IllegalArgumentException("Document revision changed; inspect the document before retrying");
+    }
+
+    static Map<String,Object> physicsInfo(CModelSource source) {
         var settings=source.getPhysicsSettingsSourceSet();List<Object> groups=new ArrayList<>();
         for (var group:settings.getSources()) {
             List<Object> inputs=new ArrayList<>(),outputs=new ArrayList<>(),vertices=new ArrayList<>();
@@ -877,16 +879,20 @@ public final class NativeBridge {
             throw new IllegalArgumentException("Invalid parameter range/default");
         String name = patch.containsKey("name") ? nonblank(patch.get("name"), "name") : parameter.getName();
         String description = patch.containsKey("description") ? (String) patch.get("description") : parameter.getDescription();
+        var affected = new ArrayList<Object>();
+        var blockers = new ArrayList<String>();
         for (var item : source.getAllObjects()) {
             var binding = item.getKeyformGridSource().findKeyformBinding(parameter.getGuid());
             if (binding == null) continue;
+            affected.add(map("object_guid", item.getGuid().getUuidString(), "keys", List.copyOf(binding.getKeys())));
             if (binding.isRepeat() && (min != parameter.getMinValue() || max != parameter.getMaxValue()))
-                throw new IllegalArgumentException("Changing this range requires relocating repeating endpoint keys on " + item.getId());
-            for (float key : binding.getKeys()) {
-                if (key < min || key > max)
-                    throw new IllegalArgumentException("Existing key outside new range on " + item.getId());
-            }
+                blockers.add("Changing this range requires relocating repeating endpoint keys on " + item.getId());
+            if (binding.getKeys().stream().anyMatch(key -> key < min || key > max))
+                blockers.add("Existing key outside new range on " + item.getId());
         }
+        if (Boolean.TRUE.equals(request.get("preflight")))
+            return map("ready", blockers.isEmpty(), "blockers", blockers, "affected_bindings", affected);
+        if (!blockers.isEmpty()) throw new IllegalArgumentException(blockers.get(0));
         var undo = new SimpleUndo("Native bridge: update parameter", parameter, new com.live2d.core.a());
         parameter.setName(name);
         parameter.setDescription(description);
@@ -952,6 +958,8 @@ public final class NativeBridge {
         String guid = (String) request.get("group_guid");
         var group = settings.getSources().stream().filter(value -> guid.equals(value.getGuid().getUuidString()))
             .findFirst().orElseThrow(() -> new IllegalArgumentException("Physics group not found: " + guid));
+        checkPhysicsBindings(source, request.get("expected_inputs"), group.getInputs().stream().map(input -> input.getSource()).toList());
+        checkPhysicsBindings(source, request.get("expected_outputs"), group.getOutputs().stream().map(output -> output.getDestination()).toList());
         var patch = (Map<?,?>) request.get("patch");
         var undo = new SimpleUndo("Native bridge: update physics group", settings, new com.live2d.core.a());
         try {
@@ -1015,6 +1023,16 @@ public final class NativeBridge {
         return index.intValue();
     }
 
+    private static void checkPhysicsBindings(CModelSource source, Object value, List<com.live2d.type.CParameterGuid> bindings) {
+        if (!(value instanceof Map<?,?> expected)) return;
+        for (var entry : expected.entrySet()) {
+            int index = Integer.parseInt((String) entry.getKey());
+            if (index < 0 || index >= bindings.size()
+                    || !findParameter(source, nonblank(entry.getValue(), "parameter_id")).getGuid().equals(bindings.get(index)))
+                throw new IllegalArgumentException("Physics parameter binding changed at index " + index);
+        }
+    }
+
     private static float[] normalization(Object input) {
         float[] values = floatArray(input);
         if (values.length != 3 || values[0] >= values[1] || values[2] < values[0] || values[2] > values[1])
@@ -1032,7 +1050,7 @@ public final class NativeBridge {
         return number.floatValue();
     }
 
-    private static float bounded(Object value, String label, float minimum, float maximum) {
+    static float bounded(Object value, String label, float minimum, float maximum) {
         float number = finite(value, label);
         if (number < minimum || number > maximum)
             throw new IllegalArgumentException(label + " outside " + minimum + ".." + maximum);
@@ -1049,6 +1067,26 @@ public final class NativeBridge {
         var item = findObject(source, guid);
         if (!(item instanceof CPartSource part)) throw new IllegalArgumentException("Part required");
         return part;
+    }
+
+    private static Object formEditReceipt(ACParameterControllableSource item, ACForm form, Map<String,Object> request) {
+        if (Boolean.TRUE.equals(request.get("compact")))
+            return map("object_guid", item.getGuid().getUuidString(), "form_guid", form.getGuid().getUuidString(), "applied", true);
+        return objectInfo(item, true);
+    }
+
+    private static ACDeformerSource requireDeformer(CModelSource source, String guid) {
+        if (findObject(source, guid) instanceof ACDeformerSource parent) return parent;
+        throw new IllegalArgumentException("A deformer GUID is required for parent_guid");
+    }
+
+    private static CDeformerGuid targetDeformer(CModelSource source, Object value) {
+        return value == null ? CDeformerGuid.Companion.a() : requireDeformer(source, (String) value).getGuid();
+    }
+
+    private static CPartSource targetPart(CModelSource source, Object value) {
+        var root = source.getRootPart();
+        return value == null || root.getGuid().getUuidString().equals(value) ? root : requirePart(source, (String)value);
     }
 
     private static int childIndex(Map<String,Object> request, int size) {
@@ -1180,7 +1218,7 @@ public final class NativeBridge {
             "children", children.stream().map(child -> child.getGuid().getUuidString()).toList());
     }
 
-    private static CArtMeshSource requireMesh(CModelSource source, String guid) {
+    static CArtMeshSource requireMesh(CModelSource source, String guid) {
         var item = findObject(source, guid);
         if (!(item instanceof CArtMeshSource mesh)) throw new IllegalArgumentException("ArtMesh required");
         return mesh;
@@ -1188,17 +1226,11 @@ public final class NativeBridge {
 
     private static Object startAutoMesh(CModelingDocument doc, Map<String,Object> request) {
         var mesh = requireMesh(doc.getModelSource(), (String) request.get("object_guid"));
-        if (activeAutoMesh != null) {
-            if (activeAutoMesh.documentUid.equals(doc.getDocumentUID()) && activeAutoMesh.objectGuid.equals(mesh.getGuid().getUuidString()))
-                return activeAutoMesh.info();
-            throw new IllegalStateException("Automatic mesh generation is running: " + activeAutoMesh.id);
-        }
         if (doc.getCompletePack().getCurrentDoc() != doc || doc.getCurrentEditMode() != doc.getEditMode_modeling())
             throw new IllegalStateException("Automatic mesh generation requires the target document to be active in Modeling mode");
-        var linked = glues(doc.getModelSource()).stream()
-            .filter(glue -> mesh.getGuid().equals(glue.getTargetArtMeshA_guid()) || mesh.getGuid().equals(glue.getTargetArtMeshB_guid()))
-            .map(glue -> glue.getGuid().getUuidString()).toList();
-        if (!linked.isEmpty()) throw new IllegalArgumentException("ArtMesh has Glue bindings: " + linked);
+        var linked = NativeBridgeModel.topologyReferences(doc.getModelSource(), mesh);
+        if (!((List<?>) linked.get("glue_guids")).isEmpty() || !((List<?>) linked.get("art_path_bindings")).isEmpty())
+            throw new IllegalArgumentException("ArtMesh has Glue or ArtPath bindings: " + linked);
         if (!(mesh.getTextureInputExtension().getCurrentTextureInputData() instanceof CTextureInput_ModelImage))
             throw new IllegalArgumentException("Automatic mesh generation requires a model-image texture");
 
@@ -1221,7 +1253,16 @@ public final class NativeBridge {
             if (patch.containsKey("alpha_threshold")) settings.setThresholdAlpha(meshInteger(patch, "alpha_threshold", 0, 255));
         }
 
-        var job = new AutoMeshJob(doc, mesh);
+        var effective = List.of(settings.getPolygonOuterDensity(), settings.getPolygonInnerDensity(),
+            settings.getPolygonMargin(), settings.getPolygonInnerMargin(), settings.getPolygonMinMargin(),
+            settings.getPolygonDensityScale(), settings.getPolygonMinBoundsPt(), settings.getThresholdAlpha());
+        if (activeAutoMesh != null) {
+            if (activeAutoMesh.documentUid.equals(doc.getDocumentUID())
+                    && activeAutoMesh.objectGuid.equals(mesh.getGuid().getUuidString())
+                    && activeAutoMesh.settings.equals(effective)) return activeAutoMesh.info();
+            throw new IllegalStateException("Automatic mesh generation is running: " + activeAutoMesh.id);
+        }
+        var job = new AutoMeshJob(doc, mesh, effective);
         activeAutoMesh = job;
         NativeBridgeJobs.registerMesh(job.documentUid, job.id, job::info);
         SwingUtilities.invokeLater(() -> runAutoMesh(doc, mesh, extension, job));
@@ -1259,7 +1300,7 @@ public final class NativeBridge {
             try {
                 AutoMeshUtil.INSTANCE.updateMeshFromInspector_inModelingMode(doc.getCompletePack(), com.live2d.ui.event.z.d,
                     List.of(extension), undo, () -> {
-                        Runnable complete = () -> job.complete(doc, mesh);
+                        Runnable complete = () -> job.complete(doc, mesh, undo);
                         if (SwingUtilities.isEventDispatchThread()) complete.run();
                         else SwingUtilities.invokeLater(complete);
                         return kotlin.Unit.INSTANCE;
@@ -1286,16 +1327,16 @@ public final class NativeBridge {
         final String id = UUID.randomUUID().toString();
         final String documentUid;
         final String objectGuid;
-        final int undoPosition;
+        final List<? extends Number> settings;
         final Map<String,Object> before;
         volatile String state = "queued";
         volatile Map<String,Object> after;
         volatile String error;
 
-        AutoMeshJob(CModelingDocument doc, CArtMeshSource mesh) {
+        AutoMeshJob(CModelingDocument doc, CArtMeshSource mesh, List<? extends Number> settings) {
             documentUid = doc.getDocumentUID();
             objectGuid = mesh.getGuid().getUuidString();
-            undoPosition = doc.getUndoManager().getCurrentPos();
+            this.settings = settings;
             before = meshCounts(mesh);
         }
 
@@ -1304,15 +1345,23 @@ public final class NativeBridge {
                 "state", state, "before", before, "after", after, "error", error);
         }
 
-        void complete(CModelingDocument doc, CArtMeshSource mesh) {
+        void complete(CModelingDocument doc, CArtMeshSource mesh, ACUndoable edit) {
             try {
                 after = meshCounts(mesh);
-                if (doc.getUndoManager().getCurrentPos() == undoPosition) {
-                    fail("Cubism did not commit the generated mesh");
+                var manager = doc.getUndoManager();
+                int position = manager.getCurrentPos();
+                var edits = manager.getUndoList();
+                int index = edits.indexOf(edit);
+                if (index < 0 || index >= position) {
+                    fail("Cubism did not commit the generated mesh; inspect the document");
                     return;
                 }
                 if (mesh.getIndices().length == 0 || mesh.getPositions().length < 6) {
-                    doc.getUndoManager().undo();
+                    if (edits.get(position - 1) != edit) {
+                        fail("Cubism generated an empty mesh and another edit is above it; inspect the document");
+                        return;
+                    }
+                    manager.undo();
                     refresh(doc);
                     after = meshCounts(mesh);
                     fail("Cubism generated an empty mesh; edit was undone");
@@ -1460,7 +1509,9 @@ public final class NativeBridge {
             var bu = b.getEditableMesh().getPoints();
             if (ap.length != au.size() * 2 || bp.length != bu.size() * 2)
                 throw new IllegalStateException("Canvas and editable vertex counts differ");
-            var matches = NativeBridgeGlueSearch.find(ap, bp, tolerance);
+            int limit = integer(request, "max_candidates", Integer.MAX_VALUE);
+            if (limit < 1) throw new IllegalArgumentException("max_candidates must be positive");
+            var matches = NativeBridgeGlueSearch.find(ap, bp, tolerance, limit);
             List<Object> pairs = new ArrayList<>();
             List<Object> ambiguous = new ArrayList<>();
             for (var match : matches.candidates()) {
@@ -1468,7 +1519,13 @@ public final class NativeBridge {
                     "b_uid", Long.toString(bu.get(match.b()).getPointUid()), "distance", match.distance());
                 (matches.unique(match) ? pairs : ambiguous).add(result);
             }
-            return map("pairs", pairs, "ambiguous", ambiguous);
+            var result = map("pairs", pairs, "ambiguous", ambiguous);
+            if (request.get("max_candidates") != null) {
+                long count = Arrays.stream(matches.aCounts()).asLongStream().sum();
+                result.put("candidate_count", count);
+                result.put("truncated", count > limit);
+            }
+            return result;
         } finally {
             model.disposeAll();
         }
@@ -1493,9 +1550,12 @@ public final class NativeBridge {
         var pairs = gluePairs(request.get("pairs"), a, b, weighted);
         int[] offsets = new int[pairs.size()];
         long[] vertices = glue.getBindVertexUids();
+        var pairOffsets = new HashMap<List<Long>,Integer>();
+        for (int i = 0; i + 1 < vertices.length; i += 2)
+            pairOffsets.put(List.of(vertices[i], vertices[i + 1]), i);
         for (int i = 0; i < pairs.size(); i++) {
             var pair = pairs.get(i);
-            offsets[i] = gluePairOffset(vertices, pair);
+            offsets[i] = pairOffsets.getOrDefault(List.of(pair.a, pair.b), -1);
             if (offsets[i] < 0) throw new IllegalArgumentException("Vertex pair does not belong to this Glue");
         }
         var undo = new GroupUndo("Native bridge: " + operation);
@@ -1522,26 +1582,26 @@ public final class NativeBridge {
         return glue.isEmpty() ? map("guid", glue.getGuid().getUuidString(), "removed", true) : glueInfo(glue);
     }
 
-    private static int gluePairOffset(long[] vertices, GluePair pair) {
-        for (int offset = 0; offset + 1 < vertices.length; offset += 2) {
-            if (vertices[offset] == pair.a && vertices[offset + 1] == pair.b) return offset;
-        }
-        return -1;
+    private static Map<String,Object> glueInfo(CGlueSource glue) {
+        return glueInfo(glue, true);
     }
 
-    private static Map<String,Object> glueInfo(CGlueSource glue) {
+    private static Map<String,Object> glueInfo(CGlueSource glue, boolean includePairs) {
         List<Object> pairs = new ArrayList<>();
         long[] vertices = glue.getBindVertexUids();
         float[] weights = glue.getWeights();
-        for (int offset = 0; offset + 1 < vertices.length; offset += 2) {
+        for (int offset = 0; includePairs && offset + 1 < vertices.length; offset += 2) {
             pairs.add(map("a_uid", Long.toString(vertices[offset]), "b_uid", Long.toString(vertices[offset + 1]),
                 "weight_a", weights[offset], "weight_b", weights[offset + 1]));
         }
         List<Object> forms = glue.getKeyforms().stream().<Object>map(form -> map(
             "guid", form.getGuid().getUuidString(), "keys", formKeys(glue, form), "intensity", form.getIntensity())).toList();
-        return map("guid", glue.getGuid().getUuidString(), "id", glue.getId().toString(), "name", glue.getLocalName(),
+        var result = map("guid", glue.getGuid().getUuidString(), "id", glue.getId().toString(), "name", glue.getLocalName(),
             "mesh_a_guid", glue.getTargetArtMeshA_guid().getUuidString(), "mesh_b_guid", glue.getTargetArtMeshB_guid().getUuidString(),
-            "pairs", pairs, "forms", forms, "default_form_guid", glue.getDefaultKeyForm().getGuid().getUuidString());
+            "forms", forms, "default_form_guid", glue.getDefaultKeyForm().getGuid().getUuidString());
+        if (includePairs) result.put("pairs", pairs);
+        else result.put("pair_count", vertices.length / 2);
+        return result;
     }
 
     private static ACParameterControllableSource findKeyformObject(CModelSource source, String guid) {
@@ -1596,12 +1656,18 @@ public final class NativeBridge {
         var parameter = request.get("parameter_id") instanceof String id ? findParameter(source, id) : null;
         var result = new LinkedHashMap<String,Object>();
         if (sections.contains("objects")) {
-            List<Object> objects = new ArrayList<>();
+            int offset = integer(request, "offset", 0);
+            int limit = integer(request, "limit", Integer.MAX_VALUE);
+            if (offset < 0 || limit < 1) throw new IllegalArgumentException("Offset must be non-negative and limit positive");
+            List<ACParameterControllableSource> selected = new ArrayList<>();
             for (var item : source.getDrawableSourceSet().getSources())
-                if (selectedObject(item, partFilter, types, parameter)) objects.add(objectInfo(item, false));
+                if (selectedObject(item, partFilter, types, parameter)) selected.add(item);
             for (var item : source.getDeformerSourceSet().getSources())
-                if (selectedObject(item, partFilter, types, parameter)) objects.add(objectInfo(item, false));
-            result.put("objects", objects);
+                if (selectedObject(item, partFilter, types, parameter)) selected.add(item);
+            int end = (int) Math.min(selected.size(), (long) offset + limit);
+            result.put("objects", selected.subList(Math.min(offset, end), end).stream().map(item -> objectInfo(item, false)).toList());
+            if (offset != 0 || request.get("limit") != null)
+                result.put("object_page", map("total", selected.size(), "offset", offset, "next_offset", end < selected.size() ? end : null));
         }
         if (sections.contains("parts")) {
             List<Object> parts = new ArrayList<>();
@@ -1957,6 +2023,100 @@ public final class NativeBridge {
             result.setValue(parameter.getGuid(), value);
         }
         return result;
+    }
+
+    private static Object evaluate(CModelSource source, Map<String,Object> request) {
+        var items = ((List<?>) request.get("object_guids")).stream()
+            .map(id -> findObject(source, nonblank(id, "object_guid"))).toList();
+        var model = source.createModelInstance(com.live2d.graphics3d.rendering.RenderType.NORMAL);
+        try {
+            String base = (String) request.get("base_pose");
+            if (!(request.get("poses") instanceof List<?> poses))
+                return evaluatePose(source, model, items, base, (Map<?,?>) request.getOrDefault("parameters", Map.of()));
+            if (poses.isEmpty()) throw new IllegalArgumentException("Provide at least one pose");
+            var names = new HashSet<String>();
+            var results = new ArrayList<>();
+            for (Object value : poses) {
+                var row = (Map<?,?>) value;
+                String name = nonblank(row.get("name"), "pose name");
+                if (!names.add(name)) throw new IllegalArgumentException("Duplicate pose name: " + name);
+                var result = evaluatePose(source, model, items, base, (Map<?,?>) row.get("parameters"));
+                result.put("name", name);
+                results.add(result);
+            }
+            return map("poses", results);
+        } finally { model.disposeAll(); }
+    }
+
+    private static Map<String,Object> evaluatePose(CModelSource source, CModel model,
+            List<ACParameterControllableSource> items, String base, Map<?,?> values) {
+        model.getParameterSet().setValuesById(pose(source, base, values));
+        evaluateDetached(model);
+        var objects = new ArrayList<>();
+        for (var item : items) {
+            var instance = model.getObject(item.getGuid());
+            var result = map("guid", item.getGuid().getUuidString(), "local_positions", formPositions(instance.getInterpolatedForm()),
+                "canvas_positions", formPositions(instance.getCalculatedForm()));
+            if (instance.getCalculatedForm() instanceof ACDrawableForm drawable) {
+                result.put("opacity", drawable.getOpacity());
+                result.put("draw_order", drawable.getDrawOrder());
+            }
+            if (instance.getInterpolatedForm() instanceof CRotationDeformerForm rotation)
+                result.put("rotation", rotationProperties(rotation));
+            objects.add(result);
+        }
+        return map("objects", objects, "parameters", values);
+    }
+
+    private record PngFrame(com.live2d.graphics.CWritableImage image, Map<String,Object> information) {}
+
+    private static Object renderPng(Callable<CModelingDocument> document, Map<String,Object> request,
+                                    long deadline) throws Exception {
+        Path path = NativeBridgeAssets.output(workspace, request.get("path"), ".png");
+        int width = integer(request, "width", 1024), height = integer(request, "height", 2011);
+        try (var permit = NativeBridgeRendering.reserve(width, height, 0, false)) {
+            // Wait for the in-progress readback to return ownership of its pixels.
+            var frame = onEditorThread(() -> {
+                if (deadline != 0 && System.nanoTime() >= deadline)
+                    throw new IllegalStateException("Editor operation timed out before it started");
+                var doc = document.call();
+                var source = doc.getModelSource();
+                var values = (Map<?,?>) request.getOrDefault("parameters", Map.of());
+                var pose = pose(source, (String) request.get("base_pose"), values);
+                pruneRenderSessions(CEAppCtrl.Companion.b());
+                String key = doc.getDocumentUID() + ":" + width + "x" + height;
+                var cached = renderSessions.get(key);
+                boolean reused = !permit.large && cached != null;
+                NativeRenderSession renderer;
+                if (permit.large) {
+                    closeRenderSessions(null);
+                    renderer = new NativeRenderSession(doc.getDocumentUID(), source, width, height, pose);
+                } else if (reused) {
+                    renderer = cached.renderer;
+                } else {
+                    while (renderSessions.size() >= 2) {
+                        String first = renderSessions.keySet().iterator().next();
+                        renderSessions.remove(first).close();
+                    }
+                    renderer = new NativeRenderSession(doc.getDocumentUID(), source, width, height, pose);
+                    renderSessions.put(key, new CachedRender(doc, renderer));
+                }
+                try {
+                    var image = renderer.render(pose);
+                    if (image == null) throw new IllegalStateException("Cubism offscreen renderer returned no image");
+                    return new PngFrame(image, map("path", path.toString(), "width", width, "height", height,
+                        "parameters", values, "renderer_reused", reused, "renderer_frames", renderer.frames,
+                        "live_renderers", renderSessions.size()));
+                } finally {
+                    if (permit.large) renderer.close();
+                }
+            }, 0);
+            try {
+                NativeBridgeAssets.publishFile(path, ".png", temporary -> frame.image.writeImage(temporary.toFile()));
+                frame.information.put("bytes", Files.size(path));
+                return frame.information;
+            } finally { frame.image.flush(); }
+        }
     }
 
     static void evaluateDetached(CModel model) {

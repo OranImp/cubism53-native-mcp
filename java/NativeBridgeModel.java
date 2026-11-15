@@ -83,6 +83,150 @@ final class NativeBridgeModel {
             "object_guid", mesh.getGuid().getUuidString(), "form_guid", shapeGuid, "key", 1);
     }
 
+    static Object preflight(CModelSource source, Map<String,Object> request) throws ReflectiveOperationException {
+        Object nativeChecks = NativeBridgeAssets.nativeEditionChecks();
+        Class<?> constraints = nativeChecks.getClass();
+        boolean freeLimits = (boolean) constraints.getMethod("l").invoke(nativeChecks);
+        var exceedsKeyBindingLimit = constraints.getMethod("a", int.class, boolean.class);
+        var blockers = new ArrayList<Object>();
+        var warnings = new ArrayList<Object>();
+        var impact = new ArrayList<Object>();
+        var proposed = new LinkedHashMap<String,Map<String,Set<Float>>>();
+        for (Object value : (List<?>) request.get("parameter_keys")) {
+            var row = (Map<?,?>) value;
+            String object = nonblank(row.get("object_guid"), "object_guid");
+            var item = findObject(source, object);
+            var parameter = findParameter(source, nonblank(row.get("parameter_id"), "parameter_id"));
+            if (!parameter.isNormal()) throw new IllegalArgumentException("Normal parameters only");
+            var byParameter = proposed.computeIfAbsent(object, key -> new LinkedHashMap<>());
+            var values = byParameter.computeIfAbsent(parameter.getId().toString(), key -> new LinkedHashSet<>());
+            if (item.getKeyformGridSource().findKeyformBinding(parameter.getGuid()) == null) values.add(parameter.getDefaultValue());
+            var requested = floatArray(row.get("values"));
+            if (requested.length == 0) throw new IllegalArgumentException("At least one key is required");
+            for (float key : requested) {
+                if (key < parameter.getMinValue() || key > parameter.getMaxValue())
+                    throw new IllegalArgumentException("Key is outside the parameter range");
+                values.add(key);
+            }
+        }
+        for (var edit : proposed.entrySet()) {
+            var item = findObject(source, edit.getKey());
+            var byParameter = edit.getValue();
+            for (var binding : item.getKeyformGridSource().getKeyformBindings())
+                byParameter.computeIfAbsent(binding.getParameterId().toString(), key -> new LinkedHashSet<>()).addAll(binding.getKeys());
+            long estimate = 1;
+            for (var values : byParameter.values())
+                estimate = estimate > Long.MAX_VALUE / Math.max(1, values.size()) ? Long.MAX_VALUE : estimate * Math.max(1, values.size());
+            var row = map("object_guid", edit.getKey(), "parameter_count", byParameter.size(),
+                "existing_keyforms", item.getKeyforms().size(), "estimated_grid_keyforms", estimate);
+            if (estimate > item.getKeyforms().size())
+                warnings.add(map("kind", "keyform_grid_growth", "object_guid", edit.getKey(), "estimated_grid_keyforms", estimate));
+            if ((boolean) exceedsKeyBindingLimit.invoke(nativeChecks, byParameter.size(), false))
+                blockers.add(map("kind", "native_parameter_binding_limit", "object_guid", edit.getKey(), "parameter_count", byParameter.size()));
+            impact.add(row);
+        }
+        for (Object key : (List<?>) request.get("texture_objects")) {
+            var item = findObject(source, nonblank(key, "object_guid"));
+            if (!(item instanceof CArtMeshSource mesh)) throw new IllegalArgumentException("ArtMesh required for texture impact");
+            var input = mesh.getTextureInputExtension().getModelImageInput();
+            if (input == null) {
+                blockers.add(map("kind", "missing_model_image", "object_guid", key));
+                continue;
+            }
+            var material = input.getModelImageGuid();
+            var users = source.getAllArtMeshes().stream().filter(other -> {
+                var candidate = other.getTextureInputExtension().getModelImageInput();
+                return candidate != null && material.equals(candidate.getModelImageGuid());
+            }).map(other -> other.getGuid().getUuidString()).toList();
+            impact.add(map("object_guid", key, "material_guid", material.getUuidString(), "affected_mesh_guids", users));
+            if (users.size() > 1) warnings.add(map("kind", "shared_material", "object_guid", key, "affected_mesh_guids", users));
+        }
+        return map("ready", blockers.isEmpty(), "free_model_limits", freeLimits, "blockers", blockers, "warnings", warnings, "impact", impact);
+    }
+
+    static Object editBlendShape(CModelingDocument doc, Map<String,Object> request) {
+        var source = doc.getModelSource();
+        var item = findObject(source, nonblank(request.get("object_guid"), "object_guid"));
+        if (!(item instanceof CArtMeshSource mesh)) throw new IllegalArgumentException("ArtMesh required for Blend Shape");
+        var parameter = findParameter(source, nonblank(request.get("parameter_id"), "parameter_id"));
+        if (!parameter.isMorphTarget()) throw new IllegalArgumentException("A Blend Shape parameter is required");
+        var guid = parameter.getGuid();
+        var shapes = mesh.getKeyformMorphTargetSet().getMorphTargetList(guid);
+        String action = nonblank(request.get("action"), "action");
+        var undo = new GroupUndo("Native bridge: edit Blend Shape");
+        String formGuid = null;
+        try {
+            var nativeEdit = com.live2d.cubism.doc.model.morphTarget.MorphTargetUtils.a;
+            switch (action) {
+                case "bind" -> {
+                    float key = finite(request.get("key"), "key");
+                    if (key < parameter.getMinValue() || key > parameter.getMaxValue() || key == parameter.getDefaultValue()
+                            || shapes.stream().anyMatch(shape -> shape.getKeyValue() == key))
+                        throw new IllegalArgumentException("Blend Shape key must be unique and inside the nondefault parameter range");
+                    var base = request.get("form_guid") == null ? mesh.getDefaultKeyForm()
+                        : (CArtMeshForm) findForm(mesh, nonblank(request.get("form_guid"), "form_guid"));
+                    if (base.isMorphTarget()) throw new IllegalArgumentException("Ordinary base keyform required");
+                    float[] positions = floatArray(request.get("positions"));
+                    if (positions.length != base.getPositions().length) throw new IllegalArgumentException("Vertex count must remain unchanged");
+                    var shape = nativeEdit.a(mesh, base, guid, key, undo);
+                    if (shape == null || !(shape.getKeyform() instanceof CArtMeshForm form))
+                        throw new IllegalStateException("Cubism could not bind the Blend Shape");
+                    form.setPositions(positions);
+                    form.setUpdated();
+                    formGuid = form.getGuid().getUuidString();
+                }
+                case "update" -> {
+                    String selected = nonblank(request.get("form_guid"), "form_guid");
+                    var shape = shapes.stream().filter(candidate -> selected.equals(candidate.getKeyformGuid().getUuidString()))
+                        .findFirst().orElseThrow(() -> new IllegalArgumentException("Blend Shape form not found on this parameter"));
+                    var form = (CArtMeshForm) shape.getKeyform();
+                    float[] positions = floatArray(request.get("positions"));
+                    if (positions.length != form.getPositions().length) throw new IllegalArgumentException("Vertex count must remain unchanged");
+                    undo.plusAssign(mesh.getHandler().createUndo_forKeyformEdit("Edit Blend Shape positions"));
+                    form.setPositions(positions);
+                    form.setUpdated();
+                    formGuid = selected;
+                }
+                case "unbind" -> {
+                    if (shapes.isEmpty()) throw new IllegalArgumentException("The object has no binding to this parameter");
+                    nativeEdit.a(mesh, guid, undo);
+                    if (!mesh.getKeyformMorphTargetSet().getMorphTargetList(guid).isEmpty())
+                        throw new IllegalStateException("Cubism did not remove the selected binding");
+                }
+                default -> throw new IllegalArgumentException("Unknown Blend Shape action");
+            }
+        } catch (RuntimeException | Error error) {
+            undo.undo();
+            refresh(doc);
+            throw error;
+        }
+        finishEdit(doc, undo);
+        return map("object_guid", mesh.getGuid().getUuidString(), "parameter_id", parameter.getId().toString(),
+            "parameter_guid", guid.getUuidString(), "form_guid", formGuid, "action", action);
+    }
+
+    static Map<String,Object> topologyReferences(CModelSource source, CArtMeshSource mesh) {
+        var key = mesh.getGuid();
+        var glueGuids = glues(source).stream()
+            .filter(glue -> key.equals(glue.getTargetArtMeshA_guid()) || key.equals(glue.getTargetArtMeshB_guid()))
+            .map(glue -> glue.getGuid().getUuidString()).toList();
+        var pathBindings = new ArrayList<Map<String,Object>>();
+        for (var path : source.getAllArtPaths()) {
+            for (var binding : NativeBridgeAuthoring.bindings(path)) {
+                if (!key.getUuidString().equals(binding.get("mesh_guid"))) continue;
+                binding.put("path_guid", path.getGuid().getUuidString());
+                pathBindings.add(binding);
+            }
+        }
+        return map("object_guid", key.getUuidString(), "glue_guids", glueGuids, "art_path_bindings", pathBindings);
+    }
+
+    static List<com.live2d.type.CDrawableGuid> masks(ACParameterControllableSource object) {
+        if (object instanceof ACDrawableSource drawable) return drawable.getClipGuidList();
+        if (object instanceof com.live2d.cubism.doc.model.parts.CPartSource part) return part.getClipGuidList();
+        return List.of();
+    }
+
     private record Entry(ACParameterControllableSource object, List<String> parts, List<String> deformers,
                          List<Object> bindings, String material, List<String> masks) {
         String guid() { return object.getGuid().getUuidString(); }
@@ -93,6 +237,7 @@ final class NativeBridgeModel {
         String id = nonblank(request.get("id"), "id");
         var all = new LinkedHashMap<String,ACParameterControllableSource>();
         for (var object : source.getAllObjects()) all.put(object.getGuid().getUuidString(), object);
+        for (var part : source.getAllParts()) all.putIfAbsent(part.getGuid().getUuidString(), part);
         switch (kind) {
             case "object" -> findObject(source, id);
             case "parameter" -> findParameter(source, id);
@@ -128,8 +273,7 @@ final class NativeBridgeModel {
                 var input = mesh.getTextureInputExtension().getModelImageInput();
                 if (input != null) material = input.getModelImageGuid().getUuidString();
             }
-            var masks = object instanceof ACDrawableSource drawable
-                ? drawable.getClipGuidList().stream().map(guid -> guid.getUuidString()).toList() : List.<String>of();
+            var masks = masks(object).stream().map(guid -> guid.getUuidString()).toList();
             var entry = new Entry(object, parts, deformers, bindings, material, masks);
             entries.add(entry);
             byGuid.put(entry.guid(), entry);
@@ -145,6 +289,15 @@ final class NativeBridgeModel {
             var info = map("guid", glue.getGuid().getUuidString(), "a_guid", a, "b_guid", b);
             glueByMesh.computeIfAbsent(a, key -> new ArrayList<>()).add(info);
             if (!a.equals(b)) glueByMesh.computeIfAbsent(b, key -> new ArrayList<>()).add(info);
+        }
+        var artPathByObject = new HashMap<String,List<Map<String,Object>>>();
+        for (var path : source.getAllArtPaths()) {
+            String pathGuid = path.getGuid().getUuidString();
+            for (var binding : NativeBridgeAuthoring.bindings(path)) {
+                binding.put("path_guid", pathGuid);
+                artPathByObject.computeIfAbsent(pathGuid, key -> new ArrayList<>()).add(binding);
+                artPathByObject.computeIfAbsent((String) binding.get("mesh_guid"), key -> new ArrayList<>()).add(binding);
+            }
         }
         var result = new ArrayList<Object>();
         for (var entry : entries) {
@@ -166,7 +319,8 @@ final class NativeBridgeModel {
                 "part_chain", entry.parts, "deformer_chain", entry.deformers, "bindings", entry.bindings, "inherited_bindings", inherited,
                 "mask_guids", entry.masks, "mask_user_guids", maskUsers.getOrDefault(entry.guid(), List.of()),
                 "material_guid", entry.material, "material_user_guids", materialUsers.getOrDefault(entry.material, List.of()),
-                "glue", glueByMesh.getOrDefault(entry.guid(), List.of())));
+                "glue", glueByMesh.getOrDefault(entry.guid(), List.of()),
+                "art_path_bindings", artPathByObject.getOrDefault(entry.guid(), List.of())));
         }
         return map("kind", kind, "id", id, "objects", result);
     }

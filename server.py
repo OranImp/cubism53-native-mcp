@@ -1,5 +1,6 @@
 """MCP for the in-process adapter for verified Cubism 5.3 builds."""
 from __future__ import annotations
+import asyncio
 from contextlib import asynccontextmanager
 import math
 from typing import Any, Literal
@@ -49,6 +50,12 @@ class ParameterPatch(ToolInput):
     default_value: float | None = None
 
 
+class ModelKeyPlan(ToolInput):
+    object_guid: str
+    parameter_id: str
+    values: list[float]
+
+
 class KeyMove(ToolInput):
     from_value: float
     to_value: float
@@ -66,6 +73,33 @@ class PhysicsParticle(ToolInput):
     acceleration: float | None = None
     radius: float | None = None
     position: tuple[float, float] | None = None
+
+
+class PhysicsLink(ToolInput):
+    parameter_id: str
+    type: Literal['x', 'y', 'angle']
+    weight: float = 100
+    reverse: bool = False
+    vertex_index: int | None = None
+    scale: float = 1
+
+
+class PhysicsGroupParticle(ToolInput):
+    position: tuple[float, float]
+    mobility: float = 0.8
+    delay: float = 0.2
+    acceleration: float = 1
+    radius: float = 0
+
+
+class PhysicsGroupEdit(ToolInput):
+    action: Literal['add', 'update', 'remove', 'move']
+    group_guid: str | None = None
+    name: str | None = None
+    index: int | None = None
+    inputs: list[PhysicsLink] | None = None
+    outputs: list[PhysicsLink] | None = None
+    particles: list[PhysicsGroupParticle] | None = None
 
 
 class PhysicsPatch(ToolInput):
@@ -117,6 +151,11 @@ class TimelineEdit(ToolInput):
     parameter_id: str
     keys: list[TimelineKey] = Field(default_factory=list)
     remove_frames: list[int] = Field(default_factory=list)
+
+
+class TimelineEvent(ToolInput):
+    frame: int
+    text: str
 
 
 class AnimationScenePatch(ToolInput):
@@ -178,7 +217,7 @@ class RuntimeExpression(ToolInput):
 
 
 async def native(operation, **arguments):
-    channel = status_requests if operation == "job_status" else editor_requests
+    channel = status_requests if operation in {"job_status", "list_jobs"} else editor_requests
     return await channel.run(call, operation, **arguments)
 
 @mcp.tool()
@@ -191,9 +230,9 @@ async def cubism_native_connect() -> dict[str,Any]:
     return await editor_requests.run(connect_editor)
 
 @mcp.tool()
-async def cubism_native_status() -> dict[str,Any]:
+async def cubism_native_status(lightweight: bool = False) -> dict[str,Any]:
     """Inspect open native model documents, object counts, and stable deformer UUIDs."""
-    return await native('status')
+    return await native('status', **({'lightweight': True} if lightweight else {}))
 
 @mcp.tool()
 async def cubism_native_document(document_uid:str) -> dict[str,Any]:
@@ -222,10 +261,11 @@ async def cubism_native_set_clipping(document_uid:str,object_guid:str,mask_guids
 async def cubism_native_objects(document_uid: str,
                                 sections: list[Literal['objects', 'parts', 'parameters', 'parameter_groups']] | None = None,
                                 part_guid: str | None = None, object_types: list[str] | None = None,
-                                parameter_id: str | None = None) -> dict[str,Any]:
+                                parameter_id: str | None = None, offset: int = 0,
+                                limit: int | None = None) -> dict[str,Any]:
     """List native mesh/deformer identities and available parameter ranges."""
     return await native('objects', document_uid=document_uid, sections=sections, part_guid=part_guid,
-                        object_types=object_types, parameter_id=parameter_id)
+                        object_types=object_types, parameter_id=parameter_id, offset=offset, limit=limit)
 
 @mcp.tool()
 async def cubism_native_object(document_uid: str, object_guid: str, form_guids: list[str] | None = None,
@@ -267,46 +307,50 @@ async def cubism_native_add_parameter_keys(document_uid:str,object_guid:str,para
 
 @mcp.tool()
 async def cubism_native_set_form_positions(document_uid:str,object_guid:str,form_guid:str,
-                                          positions:list[float]) -> dict[str,Any]:
+                                          positions:list[float], compact: bool = False) -> dict[str,Any]:
     """Set one mesh/warp keyform's flat x,y coordinate array, with native undo.
 
     Positions use the keyform's native local coordinates; vertex count stays fixed.
     """
     return await native('set_form_positions',document_uid=document_uid,object_guid=object_guid,
-                        form_guid=form_guid,positions=positions)
+                        form_guid=form_guid, positions=positions, compact=compact)
 
 @mcp.tool()
 async def cubism_native_set_form_properties(document_uid:str,object_guid:str,form_guid:str,
-                                            properties:dict[str,float]) -> dict[str,Any]:
+                                            properties:dict[str,float], compact: bool = False) -> dict[str,Any]:
     """Edit a drawable keyform's opacity or a rotation keyform's angle/origin/scale.
 
     Rotation properties: angle (degrees), origin_x, origin_y, scale. Opacity: 0..1.
     """
     return await native('set_form_properties',document_uid=document_uid,object_guid=object_guid,
-                        form_guid=form_guid,properties=properties)
+                        form_guid=form_guid, properties=properties, compact=compact)
 
 @mcp.tool()
 async def cubism_native_set_mesh_topology(document_uid:str,object_guid:str,positions:list[float],
-                                          indices:list[int]) -> dict[str,Any]:
+                                          indices:list[int], preflight: bool = False) -> dict[str,Any]:
     """Commit ArtMesh topology through the native mesh editor's transfer method.
 
     Positions use the source editable mesh coordinates. Cubism remaps all keyforms
     and original UVs onto the new triangles and records native topology undo.
     """
     return await native('set_mesh_topology',document_uid=document_uid,object_guid=object_guid,
-                        positions=positions,indices=indices)
+                        positions=positions, indices=indices, preflight=preflight)
 
 @mcp.tool()
 async def cubism_native_evaluate(document_uid:str,object_guids:list[str],
                                   parameters:dict[str,float]|None=None,
-                                  base_pose:Literal['current','default']='current') -> dict[str,Any]:
+                                  base_pose:Literal['current','default']='current',
+                                  poses: list[RenderPose] | None = None) -> dict[str,Any]:
     """Evaluate native interpolation and canvas positions at temporary parameter values.
 
     Restores the previous parameter values before returning. Omitted parameters
     evaluate the current pose.
     """
-    return await native('evaluate',document_uid=document_uid,object_guids=object_guids,
-                        parameters={} if parameters is None else parameters,base_pose=base_pose)
+    if poses is not None and (not poses or parameters):
+        raise ValueError('Provide a nonempty poses list or a single parameter map')
+    return await native('evaluate', document_uid=document_uid, object_guids=object_guids,
+                        parameters=parameters or {}, base_pose=base_pose,
+                        poses=None if poses is None else [pose.provided() for pose in poses])
 
 @mcp.tool()
 async def cubism_native_render_png(document_uid:str,path:str,width:int=1024,height:int=2011,
@@ -320,12 +364,27 @@ async def cubism_native_render_png(document_uid:str,path:str,width:int=1024,heig
                         parameters={} if parameters is None else parameters,base_pose=base_pose)
 
 @mcp.tool()
-async def cubism_native_open_project(path:str) -> dict[str,Any]:
+async def cubism_native_open_project(path:str, wait_seconds: float = 0) -> dict[str,Any]:
     """Open a workspace .cmo3 or .can3 through Cubism's native document loader.
 
     Opening may be asynchronous; use status to obtain the resulting document UID.
     """
-    return await native('open_project',path=path)
+    check_wait(wait_seconds)
+    result = await native('open_project', path=path)
+    if not wait_seconds or 'open_requested' not in result:
+        return result
+    end = asyncio.get_running_loop().time() + wait_seconds
+    while asyncio.get_running_loop().time() < end:
+        result_doc = await native('find_open_project', path=result['open_requested'])
+        if result_doc:
+            return {**result_doc, 'opened': True}
+        await asyncio.sleep(0.2)
+    return {**result, 'opened': False}
+
+
+def check_wait(seconds: float):
+    if not 0 <= seconds <= 30:
+        raise ValueError('wait_seconds must be within 0..30')
 
 @mcp.tool()
 async def cubism_native_create_blank_project(width:int,height:int) -> dict[str,Any]:
@@ -338,30 +397,35 @@ async def cubism_native_create_blank_project(width:int,height:int) -> dict[str,A
 
 @mcp.tool()
 async def cubism_native_create_warp(document_uid:str,name:str,x:float,y:float,width:float,height:float,
-                                    columns:int=2,rows:int=2,bezier_columns:int=2,bezier_rows:int=2) -> dict[str,Any]:
+                                    columns:int=2,rows:int=2,bezier_columns:int=2,bezier_rows:int=2,
+                                    part_guid: str | None = None, parent_guid: str | None = None,
+                                    index: int | None = None) -> dict[str,Any]:
     """Create a native root warp using the Editor's factory and undo manager.
 
     Bounds use native canvas coordinates. Creates an empty root warp; use reparent
     to attach artwork and add_parameter_keys to establish parameter keyforms.
     """
     return await native('create_warp',document_uid=document_uid,name=name,x=x,y=y,width=width,height=height,
-                        columns=columns,rows=rows,bezier_columns=bezier_columns,bezier_rows=bezier_rows)
+                        columns=columns, rows=rows, bezier_columns=bezier_columns, bezier_rows=bezier_rows,
+                        part_guid=part_guid, parent_guid=parent_guid, index=index)
 
 @mcp.tool()
 async def cubism_native_create_rotation(document_uid:str,name:str,x:float,y:float,
-                                        handle_length:float=100) -> dict[str,Any]:
+                                        handle_length:float=100, part_guid: str | None = None,
+                                        parent_guid: str | None = None, index: int | None = None) -> dict[str,Any]:
     """Create a native root rotation deformer at a canvas pivot, with native undo."""
-    return await native('create_rotation',document_uid=document_uid,name=name,x=x,y=y,handle_length=handle_length)
+    return await native('create_rotation',document_uid=document_uid,name=name,x=x, y=y, handle_length=handle_length,
+                        part_guid=part_guid, parent_guid=parent_guid, index=index)
 
 @mcp.tool()
-async def cubism_native_undo(document_uid:str) -> dict[str,Any]:
+async def cubism_native_undo(document_uid:str, expected_revision: str | None = None) -> dict[str,Any]:
     """Undo the most recent native document operation, including manual edits."""
-    return await native('undo',document_uid=document_uid)
+    return await native('undo', document_uid=document_uid, expected_revision=expected_revision)
 
 @mcp.tool()
-async def cubism_native_redo(document_uid:str) -> dict[str,Any]:
+async def cubism_native_redo(document_uid:str, expected_revision: str | None = None) -> dict[str,Any]:
     """Redo the most recently undone native document operation."""
-    return await native('redo',document_uid=document_uid)
+    return await native('redo', document_uid=document_uid, expected_revision=expected_revision)
 
 @mcp.tool()
 async def cubism_native_save_as_new(document_uid:str,path:str) -> dict[str,Any]:
@@ -369,9 +433,19 @@ async def cubism_native_save_as_new(document_uid:str,path:str) -> dict[str,Any]:
     return await native('save_as_new',document_uid=document_uid,path=path)
 
 @mcp.tool()
-async def cubism_native_close_saved(document_uid:str) -> dict[str,Any]:
+async def cubism_native_close_saved(document_uid:str, wait_seconds: float = 0) -> dict[str,Any]:
     """Close an unmodified saved document. Refuses documents with unsaved changes."""
-    return await native('close_saved',document_uid=document_uid)
+    check_wait(wait_seconds)
+    result = await native('close_saved', document_uid=document_uid)
+    if not wait_seconds:
+        return result
+    end = asyncio.get_running_loop().time() + wait_seconds
+    while asyncio.get_running_loop().time() < end:
+        status = await native('status', lightweight=True)
+        if all(row['document_uid'] != document_uid for row in status['documents']):
+            return {**result, 'closed': True}
+        await asyncio.sleep(0.2)
+    return {**result, 'closed': False}
 
 @mcp.tool()
 async def cubism_native_create_parameter(document_uid:str,id:str,name:str,minimum:float=-1,maximum:float=1,
@@ -391,32 +465,36 @@ async def cubism_native_release_renderers(document_uid:str) -> dict[str,Any]:
     return await native('release_renderers',document_uid=document_uid)
 
 @mcp.tool()
-async def cubism_native_import_physics3(document_uid:str,path:str,replace:bool=False) -> dict[str,Any]:
+async def cubism_native_import_physics3(document_uid:str,path:str,replace:bool=False,
+                                         preflight: bool = False) -> dict[str,Any]:
     """Import workspace physics3 JSON with native undo; replace existing groups only if explicit."""
-    return await native('import_physics3',document_uid=document_uid,path=path,replace=replace)
+    return await native('import_physics3',document_uid=document_uid,path=path,replace=replace,preflight=preflight)
 
 @mcp.tool()
 async def cubism_native_simulate_physics(document_uid:str,frames:list[dict[str,float]],delta_seconds:float=1/60,
                                          warmup_frames:int=120, output_parameter_ids: list[str] | None = None,
                                          result_mode: Literal['trace', 'summary'] = 'trace',
                                          execution: Literal['sync', 'job'] = 'sync',
-                                         request_id: str | None = None) -> dict[str,Any]:
+                                         request_id: str | None = None,
+                                         trace_path: str | None = None) -> dict[str,Any]:
     """Run Cubism's solver on isolated copies. Each frame supplies absolute drivers.
 
     Unspecified parameters reset to defaults each step. Does not change the editor pose.
     """
     return await native('simulate_physics',document_uid=document_uid,frames=frames,
                         delta_seconds=delta_seconds,warmup_frames=warmup_frames, output_parameter_ids=output_parameter_ids,
-                        result_mode=result_mode, execution=execution, request_id=request_id)
+                        result_mode=result_mode, execution=execution, request_id=request_id, trace_path=trace_path)
 
 
 @mcp.tool()
-async def cubism_native_update_parameter(document_uid: str, parameter_id: str, patch: ParameterPatch) -> dict[str, Any]:
+async def cubism_native_update_parameter(document_uid: str, parameter_id: str, patch: ParameterPatch,
+                                         preflight: bool = False) -> dict[str, Any]:
     """Edit the name, description, range or default of an existing ordinary parameter."""
     changes = patch.provided()
     if not changes:
         raise ValueError('Provide at least one parameter field')
-    return await native('update_parameter', document_uid=document_uid, parameter_id=parameter_id, patch=changes)
+    return await native('update_parameter', document_uid=document_uid, parameter_id=parameter_id, patch=changes,
+                        preflight=preflight)
 
 
 @mcp.tool()
@@ -437,7 +515,8 @@ async def cubism_native_remove_parameter_keys(document_uid: str, object_guid: st
 
 @mcp.tool()
 async def cubism_native_update_physics_group(document_uid: str, group_guid: str,
-                                            patch: PhysicsPatch) -> dict[str, Any]:
+                                            patch: PhysicsPatch, expected_inputs: dict[int, str] | None = None,
+                                            expected_outputs: dict[int, str] | None = None) -> dict[str, Any]:
     """Patch one physics group. Row indices are zero-based in physics readback.
 
     Normalization tuples are [minimum, maximum, default]. Weights are 0–100.
@@ -445,7 +524,17 @@ async def cubism_native_update_physics_group(document_uid: str, group_guid: str,
     changes = patch.provided()
     if not changes:
         raise ValueError('Provide at least one physics field')
-    return await native('update_physics_group', document_uid=document_uid, group_guid=group_guid, patch=changes)
+    return await native('update_physics_group', document_uid=document_uid, group_guid=group_guid, patch=changes,
+                        expected_inputs=expected_inputs, expected_outputs=expected_outputs)
+
+
+@mcp.tool()
+async def cubism_native_edit_physics_groups(document_uid: str, edits: list[PhysicsGroupEdit] | None = None,
+                                             fps: int | None = None, gravity: tuple[float, float] | None = None,
+                                             wind: tuple[float, float] | None = None) -> dict[str, Any]:
+    """Edit ordered native physics groups and global settings in one undo entry."""
+    return await native('edit_physics_groups', document_uid=document_uid, edits=[row.provided() for row in edits or []],
+                        fps=fps, gravity=gravity, wind=wind)
 
 
 @mcp.tool()
@@ -526,6 +615,28 @@ async def cubism_native_create_art_path(document_uid: str, name: str, points: li
                         part_guid=part_guid, deformer_guid=deformer_guid, closed=closed)
 
 
+class ArtPathPointEdit(ToolInput):
+    point_guid: str
+    x: float
+    y: float
+
+
+class ArtPathBindingEdit(ToolInput):
+    point_guid: str
+    mesh_guid: str | None = None
+
+
+@mcp.tool()
+async def cubism_native_edit_art_path(document_uid: str, object_guid: str, form_guid: str | None = None,
+                                     brush_guid: str | None = None, closed: bool | None = None,
+                                     points: list[ArtPathPointEdit] | None = None,
+                                     bindings: list[ArtPathBindingEdit] | None = None) -> dict[str, Any]:
+    """Edit an ArtPath's brush, closure, canvas points, or explicit mesh bindings."""
+    return await native('edit_art_path', document_uid=document_uid, object_guid=object_guid, form_guid=form_guid,
+                        brush_guid=brush_guid, closed=closed, points=[point.provided() for point in points or []],
+                        bindings=[binding.provided() for binding in bindings or []])
+
+
 @mcp.tool()
 async def cubism_native_auto_generate_mesh(document_uid: str, object_guid: str,
                                           preset: Literal['small', 'medium', 'large'] | None = None,
@@ -545,9 +656,9 @@ async def cubism_native_auto_mesh_status(document_uid: str, job_id: str | None =
 
 
 @mcp.tool()
-async def cubism_native_list_glues(document_uid: str) -> dict[str, Any]:
+async def cubism_native_list_glues(document_uid: str, include_pairs: bool = True) -> dict[str, Any]:
     """Read native Glue relationships, vertex pairs, weights and keyform intensities."""
-    return await native('list_glues', document_uid=document_uid)
+    return await native('list_glues', document_uid=document_uid, include_pairs=include_pairs)
 
 
 @mcp.tool()
@@ -593,7 +704,7 @@ def preview_model_uids(value):
             yield from preview_model_uids(item)
 
 
-async def preview(document_uid: str, model_uid: str | None, method: str, **arguments) -> dict[str, Any]:
+async def preview_views(document_uid: str) -> list[str]:
     global preview_client
     if preview_client is None:
         preview_client = CanvasPreview()
@@ -604,7 +715,11 @@ async def preview(document_uid: str, model_uid: str | None, method: str, **argum
     except OSError as error:
         raise ConnectionError('Enable External application integration in Cubism to use canvas preview') from error
     document = await preview_client.rpc('GetDocument', {'DocumentUID': document_uid})
-    candidates = sorted(set(preview_model_uids(document)))
+    return sorted(set(preview_model_uids(document)))
+
+
+async def preview(document_uid: str, model_uid: str | None, method: str, **arguments) -> dict[str, Any]:
+    candidates = await preview_views(document_uid)
     if not candidates:
         raise ValueError('No model view was found for this Cubism document')
     if model_uid is None and len(candidates) != 1:
@@ -630,6 +745,21 @@ async def cubism_native_set_preview_parameters(document_uid: str, parameters: di
 async def cubism_native_clear_preview_parameters(document_uid: str, model_uid: str | None = None) -> dict[str, Any]:
     """Remove external overrides for a model view. Cubism may keep the last displayed value."""
     return await preview(document_uid, model_uid, 'ClearParameterValues')
+
+
+@mcp.tool()
+async def cubism_native_list_preview_views(document_uid: str) -> dict[str, Any]:
+    """List model view UIDs in an open Cubism document through the authorized preview connection."""
+    return {'document_uid': document_uid, 'model_uids': await preview_views(document_uid)}
+
+
+@mcp.tool()
+async def cubism_native_get_preview_parameters(document_uid: str, model_uid: str | None = None,
+                                               parameter_ids: list[str] | None = None) -> dict[str, Any]:
+    """Read parameter values in the specified model view through the official local API."""
+    if parameter_ids is not None and (not parameter_ids or len(set(parameter_ids)) != len(parameter_ids)):
+        raise ValueError('parameter_ids must contain distinct IDs')
+    return await preview(document_uid, model_uid, 'GetParameterValues', Ids=parameter_ids or [])
 
 
 @mcp.tool()
@@ -675,10 +805,11 @@ async def cubism_native_add_glue_pairs(document_uid: str, glue_guid: str,
 @mcp.tool()
 async def cubism_native_suggest_glue_pairs(document_uid: str, mesh_a_guid: str, mesh_b_guid: str,
                                           tolerance: float,
-                                          parameters: dict[str, float] | None = None) -> dict[str, Any]:
+                                          parameters: dict[str, float] | None = None,
+                                          max_candidates: int | None = None) -> dict[str, Any]:
     """Find nearby vertex pairs in canvas pixels at the default or specified pose; report ambiguities."""
     return await native('suggest_glue_pairs', document_uid=document_uid, mesh_a_guid=mesh_a_guid,
-                        mesh_b_guid=mesh_b_guid, tolerance=tolerance, parameters=parameters or {})
+                        mesh_b_guid=mesh_b_guid, tolerance=tolerance, parameters=parameters or {}, max_candidates=max_candidates)
 
 
 @mcp.tool()
@@ -718,11 +849,12 @@ async def cubism_native_edit_texture_atlas(document_uid: str,
                                            action: Literal['inspect', 'create_page', 'resize_page', 'auto_layout', 'place'],
                                            page_guid: str | None = None, name: str | None = None,
                                            width: int | None = None, height: int | None = None,
-                                           placements: list[AtlasPlacement] | None = None) -> dict[str, Any]:
+                                           placements: list[AtlasPlacement] | None = None,
+                                           preflight: bool = False) -> dict[str, Any]:
     """Inspect, create, resize, auto-pack or explicitly place materials on Cubism atlas pages."""
     return await native('edit_texture_atlas', document_uid=document_uid, action=action, page_guid=page_guid,
                         name=name, width=width, height=height,
-                        placements=[placement.provided() for placement in placements or []])
+                        placements=[placement.provided() for placement in placements or []], preflight=preflight)
 
 
 @mcp.tool()
@@ -736,10 +868,11 @@ async def cubism_native_create_animation_scene(model_document_uid: str, name: st
 
 @mcp.tool()
 async def cubism_native_set_timeline_keys(document_uid: str, track_guid: str, parameter_id: str,
-                                          keys: list[TimelineKey]) -> dict[str, Any]:
+                                          keys: list[TimelineKey],
+                                          frame_space: Literal['track', 'scene'] = 'track') -> dict[str, Any]:
     """Set or replace native parameter keys at integer frames in one animation scene and track."""
     return await native('set_timeline_keys', document_uid=document_uid, track_guid=track_guid,
-                        parameter_id=parameter_id, keys=[key.provided() for key in keys])
+                        parameter_id=parameter_id, keys=[key.provided() for key in keys], frame_space=frame_space)
 
 
 @mcp.tool()
@@ -749,9 +882,31 @@ async def cubism_native_edit_animation_scene(document_uid: str, patch: Animation
 
 
 @mcp.tool()
-async def cubism_native_batch_edit_timeline(document_uid: str, edits: list[TimelineEdit]) -> dict[str, Any]:
+async def cubism_native_batch_edit_timeline(document_uid: str, edits: list[TimelineEdit],
+                                          frame_space: Literal['track', 'scene'] = 'track') -> dict[str, Any]:
     """Validate then update multiple native parameter curves with one undo entry."""
-    return await native('batch_edit_timeline', document_uid=document_uid, edits=[edit.provided() for edit in edits])
+    return await native('batch_edit_timeline', document_uid=document_uid,
+                        edits=[edit.provided() for edit in edits], frame_space=frame_space)
+
+
+@mcp.tool()
+async def cubism_native_edit_animation_tracks(document_uid: str, action: Literal['inspect', 'append', 'update'],
+                                               track_guid: str | None = None, model_path: str | None = None,
+                                               start_frame: int | None = None, duration_frames: int | None = None,
+                                               internal_offset: int | None = None) -> dict[str, Any]:
+    """Inspect tracks, append a saved workspace CMO3, or edit a model track's frame interval."""
+    return await native('edit_animation_tracks', document_uid=document_uid, action=action, track_guid=track_guid,
+                        model_path=model_path, start_frame=start_frame, duration_frames=duration_frames,
+                        internal_offset=internal_offset)
+
+
+@mcp.tool()
+async def cubism_native_edit_animation_events(document_uid: str, track_guid: str,
+                                               events: list[TimelineEvent] | None = None,
+                                               remove_frames: list[int] | None = None) -> dict[str, Any]:
+    """List or edit text events at integer scene frames."""
+    return await native('edit_animation_events', document_uid=document_uid, track_guid=track_guid,
+                        events=[event.provided() for event in events or []], remove_frames=remove_frames or [])
 
 
 @mcp.tool()
@@ -785,25 +940,30 @@ async def cubism_native_export_motion3(document_uid: str, track_guid: str, path:
 
 
 @mcp.tool()
-async def cubism_native_get_timeline_keys(document_uid: str, track_guid: str, parameter_id: str) -> dict[str, Any]:
+async def cubism_native_get_timeline_keys(document_uid: str, track_guid: str, parameter_id: str,
+                                          frame_space: Literal['track', 'scene'] = 'track',
+                                          start_frame: int | None = None, end_frame: int | None = None) -> dict[str, Any]:
     """Read native CAN3 curve keys and interpolation for a track parameter."""
-    return await native('get_timeline_keys', document_uid=document_uid, track_guid=track_guid, parameter_id=parameter_id)
+    return await native('get_timeline_keys', document_uid=document_uid, track_guid=track_guid, parameter_id=parameter_id,
+                        frame_space=frame_space, start_frame=start_frame, end_frame=end_frame)
 
 
 @mcp.tool()
 async def cubism_native_remove_timeline_keys(document_uid: str, track_guid: str, parameter_id: str,
-                                             frames: list[int]) -> dict[str, Any]:
+                                             frames: list[int],
+                                          frame_space: Literal['track', 'scene'] = 'track') -> dict[str, Any]:
     """Delete existing integer-frame CAN3 keys as a single native undo."""
     return await native('remove_timeline_keys', document_uid=document_uid, track_guid=track_guid,
-                        parameter_id=parameter_id, frames=frames)
+                        parameter_id=parameter_id, frames=frames, frame_space=frame_space)
 
 
 @mcp.tool()
 async def cubism_native_sample_timeline_parameters(document_uid: str, track_guid: str, parameter_id: str,
-                                                    frames: list[int]) -> dict[str, Any]:
+                                                    frames: list[int],
+                                          frame_space: Literal['track', 'scene'] = 'track') -> dict[str, Any]:
     """Read native CAN3 interpolation at distinct integer frames."""
     return await native('sample_timeline_parameters', document_uid=document_uid, track_guid=track_guid,
-                        parameter_id=parameter_id, frames=frames)
+                        parameter_id=parameter_id, frames=frames, frame_space=frame_space)
 
 
 @mcp.tool()
@@ -842,9 +1002,41 @@ async def cubism_native_render_pose_set(document_uid: str, directory: str, poses
 
 
 @mcp.tool()
-async def cubism_native_job_status(job_id: str | None = None, request_id: str | None = None) -> dict[str, Any]:
+async def cubism_native_job_status(job_id: str | None = None, request_id: str | None = None,
+                                  frame_offset: int = 0, frame_limit: int | None = None) -> dict[str, Any]:
     """Read queued, running or completed job state by exactly one identifier."""
-    return await native('job_status', job_id=job_id, request_id=request_id)
+    if frame_offset < 0 or (frame_limit is not None and frame_limit < 1):
+        raise ValueError('Use a non-negative frame_offset and positive frame_limit')
+    options = {'frame_offset': frame_offset, 'frame_limit': frame_limit} if frame_offset or frame_limit is not None else {}
+    return await native('job_status', job_id=job_id, request_id=request_id, **options)
+
+
+@mcp.tool()
+async def cubism_native_list_jobs(document_uid: str | None = None, operation: str | None = None,
+                                 state: Literal['queued', 'running', 'succeeded', 'failed'] | None = None,
+                                 limit: int = 50, before: int | None = None) -> dict[str, Any]:
+    """List retained bridge jobs newest first. Pass next_before to read another page."""
+    if not 1 <= limit <= 256 or (before is not None and before < 1):
+        raise ValueError('Provide a limit from 1 to 256 and a positive before cursor')
+    return await native('list_jobs', document_uid=document_uid, job_operation=operation,
+                        job_state=state, limit=limit, before=before)
+
+
+@mcp.tool()
+async def cubism_native_preflight_model_edit(document_uid: str, parameter_keys: list[ModelKeyPlan] | None = None,
+                                             texture_objects: list[str] | None = None) -> dict[str, Any]:
+    """Check proposed key additions and shared texture impact without changing the model."""
+    return await native('preflight_model_edit', document_uid=document_uid,
+                        parameter_keys=[row.provided() for row in parameter_keys or []], texture_objects=texture_objects or [])
+
+
+@mcp.tool()
+async def cubism_native_edit_blend_shape(document_uid: str, object_guid: str, parameter_id: str,
+                                          action: Literal['bind', 'update', 'unbind'], form_guid: str | None = None,
+                                          positions: list[float] | None = None, key: float = 1) -> dict[str, Any]:
+    """Bind an existing Blend Shape parameter, edit its form, or unlink it from one ArtMesh."""
+    return await native('edit_blend_shape', document_uid=document_uid, object_guid=object_guid,
+                        parameter_id=parameter_id, action=action, form_guid=form_guid, positions=positions, key=key)
 
 
 @mcp.tool()
@@ -856,10 +1048,11 @@ async def cubism_native_inspect_model_dependencies(document_uid: str, kind: Lite
 
 @mcp.tool()
 async def cubism_native_edit_batch(document_uid: str, mode: Literal['plan', 'apply'],
-                                   edits: list[BatchEdit], plan_id: str | None = None) -> dict[str, Any]:
+                                   edits: list[BatchEdit], plan_id: str | None = None,
+                                   expected_revision: str | None = None) -> dict[str, Any]:
     """Validate and apply supported edits to one document as a single native undo."""
     return await native('edit_batch', document_uid=document_uid, mode=mode,
-                        edits=[edit.provided() for edit in edits], plan_id=plan_id)
+                        edits=[edit.provided() for edit in edits], plan_id=plan_id, expected_revision=expected_revision)
 
 
 @mcp.tool()

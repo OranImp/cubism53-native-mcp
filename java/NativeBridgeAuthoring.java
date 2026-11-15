@@ -13,6 +13,9 @@ import com.live2d.cubism.doc.model.drawable.artMesh.CArtMeshForm;
 import com.live2d.cubism.doc.model.drawable.artMesh.CArtMeshSource;
 import com.live2d.cubism.doc.model.drawable.artPath.CArtPathPointToArtMeshExtension;
 import com.live2d.cubism.doc.model.drawable.artPath.CArtPathSource;
+import com.live2d.cubism.doc.model.drawable.artPath.CArtPathForm;
+import com.live2d.cubism.doc.model.drawable.artPath.CArtPathPoint;
+import com.live2d.cubism.doc.model.drawable.artPath.CArtPathPointToArtMeshExtension_BindingData;
 import com.live2d.cubism.doc.model.id.CDrawableId;
 import com.live2d.cubism.doc.model.parts.CPartSource;
 import com.live2d.cubism.doc.modeling.CModelingDocument;
@@ -51,9 +54,9 @@ final class NativeBridgeAuthoring {
         if (request.get("mask_guids") instanceof List<?> ids) {
             var seen = new HashSet<CDrawableGuid>();
             for (Object id : ids) {
-                if (!(findObject(source, nonblank(id, "mask GUID")) instanceof ACDrawableSource mask) || !seen.add(mask.getGuid()))
-                    throw new IllegalArgumentException("Distinct drawable mask GUIDs required");
-                masks.add(mask.getGuid());
+                if (!(findObject(source, nonblank(id, "mask GUID")) instanceof ACDrawableSource mask))
+                    throw new IllegalArgumentException("Drawable mask GUIDs required");
+                if (seen.add(mask.getGuid())) masks.add(mask.getGuid());
             }
         } else masks.addAll(item.getClipGuidList());
         if (!offscreen && (!masks.isEmpty() || invert))
@@ -187,6 +190,124 @@ final class NativeBridgeAuthoring {
         return result;
     }
 
+    static Object editPath(CModelingDocument doc, Map<String,Object> request) {
+        var source = doc.getModelSource();
+        var item = findObject(source, nonblank(request.get("object_guid"), "object_guid"));
+        if (!(item instanceof CArtPathSource path)) throw new IllegalArgumentException("ArtPath required");
+        var form = request.get("form_guid") == null ? path.getDefaultKeyForm()
+            : (CArtPathForm) findForm(path, nonblank(request.get("form_guid"), "form_guid"));
+        var previousBrush = path.getBrushGuid();
+        var brush = request.get("brush_guid") == null ? previousBrush : source.getArtPathBrushesSetting().getBrushes().stream()
+            .map(value -> value.getGuid()).filter(value -> value.getUuidString().equals(request.get("brush_guid")))
+            .findFirst().orElseThrow(() -> new IllegalArgumentException("Choose an existing ArtPath brush"));
+        boolean previousClosed = path.isClosed();
+        boolean closed = request.get("closed") instanceof Boolean value ? value : previousClosed;
+        if (closed && form.getPositions().size() < 3) throw new IllegalArgumentException("A closed ArtPath requires three points");
+        var extension = path.getExtensions().stream().filter(CArtPathPointToArtMeshExtension.class::isInstance)
+            .map(CArtPathPointToArtMeshExtension.class::cast).findFirst().orElse(null);
+        var oldBindings = extension == null ? Map.<CArtPathPointGuid,CArtPathPointToArtMeshExtension_BindingData>of()
+            : extension.getArtPathPointToPointInTriangle();
+        var available = new HashMap<String,CArtPathPoint>();
+        for (var point : form.getPositions()) available.put(point.getCtrlPtId().getUuidString(), point);
+        var canvasEdits = new LinkedHashMap<CArtPathPointGuid,GVector2>();
+        var localEdits = new LinkedHashMap<CArtPathPointGuid,GVector2>();
+        var oldPositions = new LinkedHashMap<CArtPathPointGuid,GVector2>();
+        var bindingEdits = new LinkedHashMap<CArtPathPointGuid,CArtPathPointToArtMeshExtension_BindingData>();
+        var model = source.createModelInstance(RenderType.NORMAL);
+        try {
+            model.getParameterSet().setDefaultValues();
+            var keyPoses = formKeys(path, form);
+            if (!keyPoses.isEmpty()) {
+                for (var key : ((Map<?,?>) keyPoses.get(0)).entrySet()) {
+                    var parameter = findParameter(source, (String) key.getKey());
+                    model.getParameterSet().get(parameter.getGuid()).setValue(finite(key.getValue(), "keyform value"));
+                }
+            }
+            evaluateDetached(model);
+            var transform = model.getDeformerTransform(path.getTargetDeformerGuid());
+            for (Object value : (List<?>) request.get("points")) {
+                var row = (Map<?,?>) value;
+                var point = pathPoint(available, row);
+                var id = point.getCtrlPtId();
+                var at = new GVector2(finite(row.get("x"), "x"), finite(row.get("y"), "y"));
+                if (canvasEdits.putIfAbsent(id, at) != null) throw new IllegalArgumentException("Duplicate ArtPath point");
+                var local = transform == null ? at : transform.transformCanvasToLocal(at, new GVector2(), -1);
+                if (!Float.isFinite(local.getX()) || !Float.isFinite(local.getY()))
+                    throw new IllegalArgumentException("ArtPath point cannot be transformed to local coordinates");
+                localEdits.put(id, local);
+                var old = point.getCurvePointPosition().getPoint();
+                oldPositions.put(id, new GVector2(old.getX(), old.getY()));
+            }
+            for (Object value : (List<?>) request.get("bindings")) {
+                var row = (Map<?,?>) value;
+                var point = pathPoint(available, row);
+                var id = point.getCtrlPtId();
+                if (bindingEdits.containsKey(id)) throw new IllegalArgumentException("Duplicate ArtPath binding");
+                if (row.get("mesh_guid") == null) {
+                    bindingEdits.put(id, null);
+                    continue;
+                }
+                var mesh = requireMesh(source, nonblank(row.get("mesh_guid"), "mesh_guid"));
+                var at = canvasEdits.get(id);
+                if (at == null) {
+                    var local = point.getCurvePointPosition().getPoint();
+                    at = transform == null ? local : transform.transformLocalToCanvas(local, new GVector2(), -1);
+                }
+                var triangle = model.getArtMesh(mesh.getGuid()).getPointInTriangle_onCanvas(at, false);
+                if (triangle == null) throw new IllegalArgumentException("ArtPath point is outside the target ArtMesh");
+                bindingEdits.put(id, new CArtPathPointToArtMeshExtension_BindingData(mesh.getGuid(), triangle));
+            }
+        } finally {
+            model.disposeAll();
+        }
+        for (var point : canvasEdits.keySet())
+            if (oldBindings.containsKey(point) && !bindingEdits.containsKey(point))
+                throw new IllegalArgumentException("Moved bound points require explicit rebind or detach");
+        if (closed == previousClosed && brush.equals(previousBrush) && localEdits.isEmpty() && bindingEdits.isEmpty())
+            return pathInfo(path);
+        var undo = new GroupUndo("Native bridge: edit ArtPath");
+        try {
+            if (closed != previousClosed || !brush.equals(previousBrush))
+                undo.plusAssign(new LambdaUndo<>("ArtPath brush and closure", path,
+                    ignored -> { path.setBrushGuid(brush); path.setClosed(closed); return kotlin.Unit.INSTANCE; },
+                    ignored -> { path.setBrushGuid(previousBrush); path.setClosed(previousClosed); return kotlin.Unit.INSTANCE; }, null));
+            if (!localEdits.isEmpty())
+                undo.plusAssign(new LambdaUndo<>("ArtPath positions", form,
+                    ignored -> { setPathPoints(form, localEdits); return kotlin.Unit.INSTANCE; },
+                    ignored -> { setPathPoints(form, oldPositions); return kotlin.Unit.INSTANCE; }, null));
+            if (!bindingEdits.isEmpty()) {
+                var active = extension == null ? new CArtPathPointToArtMeshExtension(path) : extension;
+                if (extension == null)
+                    undo.plusAssign(new LambdaUndo<>("Add ArtPath binding extension", path,
+                        ignored -> { path.addExtension(active, path.getExtensions().size()); return kotlin.Unit.INSTANCE; },
+                        ignored -> { path.removeExtension(active); return kotlin.Unit.INSTANCE; }, null));
+                undo.plusAssign(active.getHandler().a("Edit ArtPath mesh bindings"));
+                bindingEdits.forEach((key, data) -> {
+                    if (data == null) active.getArtPathPointToPointInTriangle().remove(key);
+                    else active.getArtPathPointToPointInTriangle().put(key, data);
+                });
+                form.setUpdated();
+            }
+        } catch (RuntimeException | Error error) {
+            undo.undo();
+            refresh(doc);
+            throw error;
+        }
+        finishEdit(doc, undo);
+        return pathInfo(path);
+    }
+
+    private static CArtPathPoint pathPoint(Map<String,CArtPathPoint> available, Map<?,?> row) {
+        var result = available.get(nonblank(row.get("point_guid"), "point_guid"));
+        if (result == null) throw new IllegalArgumentException("ArtPath point not found on the requested form");
+        return result;
+    }
+
+    private static void setPathPoints(CArtPathForm form, Map<CArtPathPointGuid,GVector2> positions) {
+        positions.forEach((id, xy) -> form.getPoint(id).getCurvePointPosition().setPoint(xy));
+        form.setUpdated();
+    }
+
     private static Map<String,Object> pathInfo(CArtPathSource path) {
         return map("guid", guid(path), "name", path.getLocalName(), "brush_guid", path.getBrushGuid().getUuidString(),
             "part_guid", path.getParent() == null ? null : guid(path.getParent()),
@@ -200,7 +321,7 @@ final class NativeBridgeAuthoring {
                     }).toList())).toList());
     }
 
-    private static List<Map<String,Object>> bindings(CArtPathSource path) {
+    static List<Map<String,Object>> bindings(CArtPathSource path) {
         var result = new ArrayList<Map<String,Object>>();
         for (var extension : path.getExtensions()) {
             if (extension instanceof CArtPathPointToArtMeshExtension pointBinding) {
@@ -321,9 +442,7 @@ final class NativeBridgeAuthoring {
         var maskEdits = new ArrayList<MaskEdit>();
         for (var item : all) {
             if (selected.contains(item)) continue;
-            var masks = item instanceof ACDrawableSource drawable ? drawable.getClipGuidList()
-                : item instanceof CPartSource part ? part.getClipGuidList() : null;
-            if (masks == null) continue;
+            var masks = NativeBridgeModel.masks(item);
             var removed = masks.stream().map(CDrawableGuid::getUuidString).filter(ids::contains).toList();
             if (removed.isEmpty()) continue;
             clipping.add(map("owner_guid", guid(item), "mask_guids", removed));

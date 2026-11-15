@@ -1,6 +1,6 @@
 # Cubism 5.3 Native MCP
 
-在 Windows x64 上通过 MCP stdio 操作 Live2D Cubism Editor **5.3.03** 和 **5.3.04**，共 84 个工具。桥接器在已运行的官方编辑器进程中调用原生建模、动画、物理、渲染和导出接口。两项临时画布预览工具使用 Cubism 官方本机 WebSocket API。
+在 Windows x64 上通过 MCP stdio 操作 Live2D Cubism Editor **5.3.03** 和 **5.3.04**，共 93 个工具。桥接器在已运行的官方编辑器进程中调用原生建模、动画、物理、渲染和导出接口。画布预览工具使用 Cubism 官方本机 WebSocket API。
 
 ## 下载
 
@@ -159,6 +159,13 @@ python portable/build.py --python-zip python-3.13.17-embed-amd64.zip --wheelhous
 | `render_pose_set`、`job_status` | 批量渲染命名姿态，查询批量渲染、原生布网、PSD 和 SDK 导出任务 |
 | `inspect_model_dependencies`、`edit_batch` | 反查模型依赖，预检并以一次原生撤销应用一组编辑 |
 | `get_timeline_keys`、`remove_timeline_keys`、`sample_timeline_parameters` | 读回、删除和采样原生 CAN3 参数曲线 |
+| `edit_animation_tracks`、`edit_animation_events` | 向已有场景追加模型轨道、移动或裁切轨道、编辑场景帧上的事件 |
+| `preflight_model_edit` | 检查拟新增的普通参数绑定、关键形数量和共享材质影响 |
+| `edit_physics_groups` | 增删和重排原生物理组，编辑输入输出绑定以及重力、风力、FPS |
+| `edit_blend_shape` | 复用已有 Blend Shape 参数，编辑目标形状或解除一个对象的绑定 |
+| `edit_art_path` | 编辑现有笔刷、开闭、控制点和 ArtMesh 绑定 |
+| `list_preview_views`、`get_preview_parameters` | 列出画布模型 UID 并通过授权的官方 API 读取参数 |
+| `list_jobs` | 按文档、类型或状态分页发现当前桥接会话中的作业 |
 | `preflight_runtime_export`、`export_runtime_package` | 检查目标 SDK 兼容性并组装原生模型、动作、表情和物理 |
 | `set_form_colors`、`replace_mesh_texture_resized` | 编辑关键形乘算色和滤色，为指定 ArtMesh 更换异尺寸贴图 |
 | `create_blend_shape` | 以普通 ArtMesh 关键形为基准创建原生 Blend Shape |
@@ -181,7 +188,10 @@ python portable/build.py --python-zip python-3.13.17-embed-amd64.zip --wheelhous
 - `objects` 可指定 `sections`、`part_guid`、`parameter_id` 及 `object_types`。类型使用返回的名称，例如 `CArtMeshSource`。`parameter_id` 匹配对象的直接普通参数或 Blend Shape 绑定。`object` 可用 `form_guids` 限定关键形，或用 `geometry=false` 省略顶点、网格和 UV。
 - `simulate_physics` 默认返回逐帧轨迹。`result_mode=summary` 返回选定输出的范围，`output_parameter_ids` 用来限定输出，`execution=job` 配合 `request_id` 可异步轮询。4K 及以上的渲染作业独占渲染额度，内存不足时会在分配缓冲前报错。
 - 表情文件的 `Add` 是增量，`Multiply` 是倍率，`Overwrite` 是绝对值。运行包预检和打包使用相同的附件校验，诊断包含出错文件及字段。
-- `edit_animation_scene` 改帧率时保留关键帧的整数帧位。单轨 `export_motion3` 仍按轨道区间导出，场景时长可独立修改。
+- `edit_animation_scene` 改帧率时保留关键帧的整数帧位。曲线工具的 `frame_space` 默认为 `track`，用 `scene` 可按画布场景帧读写。事件工具使用场景帧，Motion3 按原生选项导出轨道事件。
+- `document` 返回用于并发检查的 `revision`。调用 `undo`、`redo` 或 `edit_batch` 时可传 `expected_revision`。`open_project` 和 `close_saved` 的 `wait_seconds` 支持等待结果，默认立即返回。
+- 用 `objects(offset, limit)` 分页读取对象，`evaluate(poses=...)` 批量求值，或用 `status(lightweight=true)` 查看文档 UID。物理轨迹可通过 `trace_path` 输出到新 JSON 文件，作业结果也支持 `job_status(frame_offset=..., frame_limit=...)`。
+- `edit_texture_atlas` 的 `place` 和 `resize_page` 支持 `preflight=true`，返回越界材质和重叠双方。拓扑和物理导入也可用 `preflight=true` 查看影响。自动布网遇到现有 Glue 或 ArtPath 绑定会返回关联项。
 - 镜像的 `axis=x` 翻转横坐标，`axis=y` 翻转纵坐标。`vertex_indices` 按目标顶点顺序提供源顶点索引。删除预检默认阻止未包含的子对象或存活引用，可用 `cascade` 和 `detach_references` 明确扩展删除范围。存活 ArtPath 的点绑定需要先在编辑器中处理。新模型没有自定义笔刷时，可省略 `brush_guid` 使用原生默认线条。
 
 ## 验证
