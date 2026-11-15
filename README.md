@@ -1,5 +1,7 @@
 # Cubism 5.3 Native MCP
 
+**简体中文** · [English](README.en.md) · [日本語](README.ja.md)
+
 在 Windows x64 上通过 MCP stdio 操作 Live2D Cubism Editor **5.3.03** 和 **5.3.04**，共 93 个工具。桥接器在已运行的官方编辑器进程中调用原生建模、动画、物理、渲染和导出接口。画布预览工具使用 Cubism 官方本机 WebSocket API。
 
 ## 下载
@@ -17,14 +19,6 @@ if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ine $expected) 
     throw '便携包 SHA-256 校验失败'
 }
 ```
-
-### English quick start
-
-On Windows x64, install Live2D Cubism Editor 5.3.03 or 5.3.04, extract the portable ZIP,
-and run `Setup.cmd`. Choose the folder containing your models. Setup prints
-the location of the generated stdio configurations for CC Switch, DeepSeek
-Harness, Codex, Claude Code, and other MCP clients. Start the editor, then
-call `cubism_native_connect` and `cubism_native_status` from your client.
 
 ## 安装和连接
 
@@ -113,7 +107,6 @@ python portable/build.py --python-zip python-3.13.17-embed-amd64.zip --wheelhous
 
 ## 工具
 
-
 | 工具（均以 `cubism_native_` 开头） | 用途 |
 | --- | --- |
 | `connect` | 发现并连接已经运行的指定版本编辑器 |
@@ -129,7 +122,7 @@ python portable/build.py --python-zip python-3.13.17-embed-amd64.zip --wheelhous
 | `reparent` | 在默认参数下保形挂接，完成后恢复预览参数 |
 | `add_parameter_keys` | 为现有普通参数建立关键形 |
 | `set_form_positions` | 修改一个 Mesh/Warp 关键形的现有顶点 |
-| `set_form_properties` | 图层透明度或旋转关节角度、枢轴、缩放 |
+| `set_form_properties` | 绘制顺序、图层透明度或旋转变形器的角度、枢轴、缩放 |
 | `set_mesh_topology` | 以原生 MeshEditor 方法重建拓扑、映射 UV 和全部关键形 |
 | `auto_generate_mesh`、`auto_mesh_status` | 启动原生自动布网并查询任务状态、布网前后的顶点和三角形数量 |
 | `evaluate` | 使用独立模型实例执行原生插值和画布顶点求值，保留当前文档预览参数 |
@@ -188,11 +181,11 @@ python portable/build.py --python-zip python-3.13.17-embed-amd64.zip --wheelhous
 - `objects` 可指定 `sections`、`part_guid`、`parameter_id` 及 `object_types`。类型使用返回的名称，例如 `CArtMeshSource`。`parameter_id` 匹配对象的直接普通参数或 Blend Shape 绑定。`object` 可用 `form_guids` 限定关键形，或用 `geometry=false` 省略顶点、网格和 UV。
 - `simulate_physics` 默认返回逐帧轨迹。`result_mode=summary` 返回选定输出的范围，`output_parameter_ids` 用来限定输出，`execution=job` 配合 `request_id` 可异步轮询。4K 及以上的渲染作业独占渲染额度，内存不足时会在分配缓冲前报错。
 - 表情文件的 `Add` 是增量，`Multiply` 是倍率，`Overwrite` 是绝对值。运行包预检和打包使用相同的附件校验，诊断包含出错文件及字段。
-- `edit_animation_scene` 改帧率时保留关键帧的整数帧位。曲线工具的 `frame_space` 默认为 `track`，用 `scene` 可按画布场景帧读写。事件工具使用场景帧，Motion3 按原生选项导出轨道事件。
+- `edit_animation_scene` 改帧率时保留关键帧的整数帧位。曲线工具的 `frame_space` 默认为 `track`，用 `scene` 可按场景帧读写。事件工具使用场景帧，Motion3 按原生选项导出轨道事件。
 - `document` 返回用于并发检查的 `revision`。调用 `undo`、`redo` 或 `edit_batch` 时可传 `expected_revision`。`open_project` 和 `close_saved` 的 `wait_seconds` 支持等待结果，默认立即返回。
 - 用 `objects(offset, limit)` 分页读取对象，`evaluate(poses=...)` 批量求值，或用 `status(lightweight=true)` 查看文档 UID。物理轨迹可通过 `trace_path` 输出到新 JSON 文件，作业结果也支持 `job_status(frame_offset=..., frame_limit=...)`。
 - `edit_texture_atlas` 的 `place` 和 `resize_page` 支持 `preflight=true`，返回越界材质和重叠双方。拓扑和物理导入也可用 `preflight=true` 查看影响。自动布网遇到现有 Glue 或 ArtPath 绑定会返回关联项。
-- 镜像的 `axis=x` 翻转横坐标，`axis=y` 翻转纵坐标。`vertex_indices` 按目标顶点顺序提供源顶点索引。删除预检默认阻止未包含的子对象或存活引用，可用 `cascade` 和 `detach_references` 明确扩展删除范围。存活 ArtPath 的点绑定需要先在编辑器中处理。新模型没有自定义笔刷时，可省略 `brush_guid` 使用原生默认线条。
+- 镜像的 `axis=x` 翻转横坐标，`axis=y` 翻转纵坐标。`vertex_indices` 按目标顶点顺序提供源顶点索引。删除预检默认阻止未包含的子对象或存活引用，可用 `cascade` 和 `detach_references` 明确扩展删除范围。删除仍被 ArtPath 使用的网格前，先用 `edit_art_path` 解除相应的点绑定。新模型没有自定义笔刷时，可省略 `brush_guid` 使用原生默认线条。
 
 ## 验证
 
