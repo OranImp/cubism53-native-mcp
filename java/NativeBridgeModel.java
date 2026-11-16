@@ -125,7 +125,16 @@ final class NativeBridgeModel {
                 blockers.add(map("kind", "native_parameter_binding_limit", "object_guid", edit.getKey(), "parameter_count", byParameter.size()));
             impact.add(row);
         }
-        for (Object key : (List<?>) request.get("texture_objects")) {
+        var textureObjects = (List<?>) request.get("texture_objects");
+        var textureUsers = new HashMap<String,List<String>>();
+        if (!textureObjects.isEmpty()) {
+            for (var mesh : source.getAllArtMeshes()) {
+                String material = materialGuid(mesh);
+                if (material != null)
+                    textureUsers.computeIfAbsent(material, ignored -> new ArrayList<>()).add(mesh.getGuid().getUuidString());
+            }
+        }
+        for (Object key : textureObjects) {
             var item = findObject(source, nonblank(key, "object_guid"));
             if (!(item instanceof CArtMeshSource mesh)) throw new IllegalArgumentException("ArtMesh required for texture impact");
             var input = mesh.getTextureInputExtension().getModelImageInput();
@@ -133,12 +142,9 @@ final class NativeBridgeModel {
                 blockers.add(map("kind", "missing_model_image", "object_guid", key));
                 continue;
             }
-            var material = input.getModelImageGuid();
-            var users = source.getAllArtMeshes().stream().filter(other -> {
-                var candidate = other.getTextureInputExtension().getModelImageInput();
-                return candidate != null && material.equals(candidate.getModelImageGuid());
-            }).map(other -> other.getGuid().getUuidString()).toList();
-            impact.add(map("object_guid", key, "material_guid", material.getUuidString(), "affected_mesh_guids", users));
+            var material = input.getModelImageGuid().getUuidString();
+            var users = textureUsers.getOrDefault(material, List.of());
+            impact.add(map("object_guid", key, "material_guid", material, "affected_mesh_guids", users));
             if (users.size() > 1) warnings.add(map("kind", "shared_material", "object_guid", key, "affected_mesh_guids", users));
         }
         return map("ready", blockers.isEmpty(), "free_model_limits", freeLimits, "blockers", blockers, "warnings", warnings, "impact", impact);
@@ -227,9 +233,28 @@ final class NativeBridgeModel {
         return List.of();
     }
 
-    private record Entry(ACParameterControllableSource object, List<String> parts, List<String> deformers,
-                         List<Object> bindings, String material, List<String> masks) {
-        String guid() { return object.getGuid().getUuidString(); }
+    private static String materialGuid(ACParameterControllableSource object) {
+        if (!(object instanceof CArtMeshSource mesh)) return null;
+        var input = mesh.getTextureInputExtension().getModelImageInput();
+        return input == null ? null : input.getModelImageGuid().getUuidString();
+    }
+
+    private static List<Object> bindings(ACParameterControllableSource object, Map<com.live2d.type.CParameterGuid,String> parameters) {
+        var bindings = new ArrayList<Object>();
+        for (var binding : object.getKeyformGridSource().getKeyformBindings())
+            bindings.add(map("parameter_id", binding.getParameterId().toString(), "keys", List.copyOf(binding.getKeys())));
+        for (var guid : object.getKeyformMorphTargetSet().getBoundParameterGuids())
+            bindings.add(map("parameter_id", parameters.get(guid), "kind", "blend_shape",
+                "keys", object.getKeyformMorphTargetSet().getMorphTargetList(guid).stream().map(shape -> shape.getKeyValue()).toList()));
+        return bindings;
+    }
+
+    private static List<String> deformerChain(ACParameterControllableSource object, Map<String,ACParameterControllableSource> all) {
+        var ancestors = new LinkedHashSet<String>();
+        var next = all.get(object.getTargetDeformerGuid().getUuidString());
+        while (next != null && ancestors.add(next.getGuid().getUuidString()))
+            next = all.get(next.getTargetDeformerGuid().getUuidString());
+        return List.copyOf(ancestors);
     }
 
     static Object dependencies(CModelSource source, Map<String,Object> request) {
@@ -249,38 +274,24 @@ final class NativeBridgeModel {
         }
         var parameters = new HashMap<com.live2d.type.CParameterGuid,String>();
         for (var parameter : source.getAllParameters()) parameters.put(parameter.getGuid(), parameter.getId().toString());
-        var entries = new ArrayList<Entry>();
-        var byGuid = new HashMap<String,Entry>();
+        var selected = new LinkedHashMap<String,List<String>>();
+        var directBindings = new HashMap<String,List<Object>>();
         var maskUsers = new HashMap<String,List<String>>();
         var materialUsers = new HashMap<String,List<String>>();
-        for (var object : all.values()) {
-            var parts = new ArrayList<String>();
-            for (var parent : object.getAllParents()) parts.add(parent.getGuid().getUuidString());
-            var deformers = new ArrayList<String>();
-            var next = all.get(object.getTargetDeformerGuid().getUuidString());
-            while (next != null && !deformers.contains(next.getGuid().getUuidString())) {
-                deformers.add(next.getGuid().getUuidString());
-                next = all.get(next.getTargetDeformerGuid().getUuidString());
-            }
-            var bindings = new ArrayList<Object>();
-            for (var binding : object.getKeyformGridSource().getKeyformBindings())
-                bindings.add(map("parameter_id", binding.getParameterId().toString(), "keys", List.copyOf(binding.getKeys())));
-            for (var guid : object.getKeyformMorphTargetSet().getBoundParameterGuids())
-                bindings.add(map("parameter_id", parameters.get(guid), "kind", "blend_shape",
-                    "keys", object.getKeyformMorphTargetSet().getMorphTargetList(guid).stream().map(shape -> shape.getKeyValue()).toList()));
-            String material = null;
-            if (object instanceof CArtMeshSource mesh) {
-                var input = mesh.getTextureInputExtension().getModelImageInput();
-                if (input != null) material = input.getModelImageGuid().getUuidString();
-            }
-            var masks = masks(object).stream().map(guid -> guid.getUuidString()).toList();
-            var entry = new Entry(object, parts, deformers, bindings, material, masks);
-            entries.add(entry);
-            byGuid.put(entry.guid(), entry);
-            for (var mask : new HashSet<>(entry.masks))
-                maskUsers.computeIfAbsent(mask, key -> new ArrayList<>()).add(entry.guid());
-            if (entry.material != null)
-                materialUsers.computeIfAbsent(entry.material, key -> new ArrayList<>()).add(entry.guid());
+        var bound = new HashSet<String>();
+        if ("parameter".equals(kind))
+            all.forEach((guid, object) -> { if (boundTo(object, id, parameters)) bound.add(guid); });
+        for (var row : all.entrySet()) {
+            var guid = row.getKey();
+            var object = row.getValue();
+            var material = materialGuid(object);
+            for (var mask : new LinkedHashSet<>(masks(object)))
+                maskUsers.computeIfAbsent(mask.getUuidString(), key -> new ArrayList<>()).add(guid);
+            if (material != null) materialUsers.computeIfAbsent(material, key -> new ArrayList<>()).add(guid);
+            if ("object".equals(kind) && !id.equals(guid) || "material".equals(kind) && !id.equals(material)) continue;
+            var chain = deformerChain(object, all);
+            if (!"parameter".equals(kind) || bound.contains(guid) || chain.stream().anyMatch(bound::contains))
+                selected.put(guid, chain);
         }
         var glueByMesh = new HashMap<String,List<Map<String,Object>>>();
         for (var glue : glues(source)) {
@@ -300,32 +311,36 @@ final class NativeBridgeModel {
             }
         }
         var result = new ArrayList<Object>();
-        for (var entry : entries) {
-            boolean matches = switch (kind) {
-                case "object" -> id.equals(entry.guid());
-                case "material" -> id.equals(entry.material);
-                default -> containsParameter(entry.bindings, id)
-                    || entry.deformers.stream().anyMatch(guid -> containsParameter(byGuid.get(guid).bindings, id));
-            };
-            if (!matches) continue;
+        for (var entry : selected.entrySet()) {
+            String guid = entry.getKey();
+            var object = all.get(guid);
+            var parts = new ArrayList<String>();
+            for (var parent : object.getAllParents()) parts.add(parent.getGuid().getUuidString());
             var inherited = new ArrayList<Object>();
-            for (var ancestor : entry.deformers) {
-                var parent = byGuid.get(ancestor);
-                if (parent != null && !parent.bindings.isEmpty())
-                    inherited.add(map("deformer_guid", ancestor, "bindings", parent.bindings));
+            for (var ancestor : entry.getValue()) {
+                var parentBindings = directBindings.computeIfAbsent(ancestor, key -> bindings(all.get(key), parameters));
+                if (!parentBindings.isEmpty()) inherited.add(map("deformer_guid", ancestor, "bindings", parentBindings));
             }
-            result.add(map("guid", entry.guid(), "id", entry.object.getId().toString(),
-                "name", entry.object.getLocalName(), "type", entry.object.getClass().getSimpleName(),
-                "part_chain", entry.parts, "deformer_chain", entry.deformers, "bindings", entry.bindings, "inherited_bindings", inherited,
-                "mask_guids", entry.masks, "mask_user_guids", maskUsers.getOrDefault(entry.guid(), List.of()),
-                "material_guid", entry.material, "material_user_guids", materialUsers.getOrDefault(entry.material, List.of()),
-                "glue", glueByMesh.getOrDefault(entry.guid(), List.of()),
-                "art_path_bindings", artPathByObject.getOrDefault(entry.guid(), List.of())));
+            var ownBindings = directBindings.computeIfAbsent(guid, key -> bindings(object, parameters));
+            var material = materialGuid(object);
+            result.add(map("guid", guid, "id", object.getId().toString(), "name", object.getLocalName(),
+                "type", object.getClass().getSimpleName(), "part_chain", parts, "deformer_chain", entry.getValue(),
+                "bindings", ownBindings, "inherited_bindings", inherited,
+                "mask_guids", masks(object).stream().map(mask -> mask.getUuidString()).toList(),
+                "mask_user_guids", maskUsers.getOrDefault(guid, List.of()),
+                "material_guid", material, "material_user_guids", materialUsers.getOrDefault(material, List.of()),
+                "glue", glueByMesh.getOrDefault(guid, List.of()),
+                "art_path_bindings", artPathByObject.getOrDefault(guid, List.of())));
         }
         return map("kind", kind, "id", id, "objects", result);
     }
 
-    private static boolean containsParameter(List<Object> bindings, String id) {
-        return bindings.stream().anyMatch(binding -> id.equals(((Map<?,?>) binding).get("parameter_id")));
+    private static boolean boundTo(ACParameterControllableSource object, String id,
+                                   Map<com.live2d.type.CParameterGuid,String> parameters) {
+        for (var binding : object.getKeyformGridSource().getKeyformBindings())
+            if (id.equals(binding.getParameterId().toString())) return true;
+        for (var guid : object.getKeyformMorphTargetSet().getBoundParameterGuids())
+            if (id.equals(parameters.get(guid))) return true;
+        return false;
     }
 }

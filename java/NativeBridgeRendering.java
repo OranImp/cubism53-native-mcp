@@ -25,9 +25,18 @@ final class NativeBridgeRendering {
 
     static final class Permit implements AutoCloseable {
         final boolean large;
-        final long bytes;
+        private long bytes;
 
         private Permit(boolean large, long bytes) { this.large = large; this.bytes = bytes; }
+
+        void increase(long additional) {
+            if (additional <= 0) return;
+            synchronized (budget) {
+                checkHeap(additional);
+                reserved += additional;
+                bytes += additional;
+            }
+        }
 
         public void close() {
             synchronized (budget) {
@@ -58,12 +67,7 @@ final class NativeBridgeRendering {
                     if (!wait) throw new IllegalStateException("Render capacity is occupied by a high-resolution job");
                     budget.wait();
                 }
-                var runtime = Runtime.getRuntime();
-                long used = runtime.totalMemory() - runtime.freeMemory();
-                long headroom = Math.max(128 * MIB, runtime.maxMemory() / 10);
-                if (estimate > runtime.maxMemory() - used - reserved - headroom)
-                    throw new IllegalStateException("Insufficient editor heap for render buffers (estimated "
-                        + ((estimate + MIB - 1) / MIB) + " MiB). Reduce the resolution or free editor memory.");
+                checkHeap(estimate);
                 active++;
                 exclusive = large;
                 reserved += estimate;
@@ -73,6 +77,15 @@ final class NativeBridgeRendering {
                 budget.notifyAll();
             }
         }
+    }
+
+    private static void checkHeap(long estimate) {
+        var runtime = Runtime.getRuntime();
+        long used = runtime.totalMemory() - runtime.freeMemory();
+        long headroom = Math.max(128 * MIB, runtime.maxMemory() / 10);
+        if (estimate > runtime.maxMemory() - used - reserved - headroom)
+            throw new IllegalStateException("Insufficient editor heap for render buffers (estimated "
+                + ((estimate + MIB - 1) / MIB) + " MiB). Reduce the resolution or free editor memory.");
     }
 
     private record Frame(String name, CParameterSet pose, Map<String,Double> parameters) {}
@@ -141,13 +154,8 @@ final class NativeBridgeRendering {
         long[] dimensions = onEditorThread(() -> {
             var source = document.call().getModelSource();
             var canvas = source.getCanvas();
-            long textures = 0;
-            for (var material : source.getTextureManager().getAllModelImages())
-                textures += (long) material.getWidth() * material.getHeight() * Integer.BYTES;
-            long poseCount = ((List<?>) request.get("poses")).size();
-            long parameters = poseCount * source.getAllParameters().size() * 256L;
             return new long[]{integer(request, "width", canvas.getPixelWidth()),
-                integer(request, "height", canvas.getPixelHeight()), textures + parameters};
+                integer(request, "height", canvas.getPixelHeight()), snapshotBytes(source, request)};
         }, 0);
         int[] size = {(int) dimensions[0], (int) dimensions[1]};
         long difference = request.get("baseline_manifest") == null ? 0 : (long) size[0] * size[1];
@@ -157,12 +165,20 @@ final class NativeBridgeRendering {
             if (width > 0 && width <= size[0] && height > 0 && height <= size[1]) difference = width * height;
         }
         try (var permit = reserve(size[0], size[1], difference, true, dimensions[2])) {
-            return renderReserved(document, workspace, output, request, size, permit);
+            return renderReserved(document, workspace, output, request, size, permit, dimensions[2]);
         }
     }
 
+    private static long snapshotBytes(CModelSource source, Map<String,Object> request) {
+        long textures = 0;
+        for (var material : source.getTextureManager().getAllModelImages())
+            textures += (long) material.getWidth() * material.getHeight() * Integer.BYTES;
+        long poseCount = ((List<?>) request.get("poses")).size();
+        return textures + poseCount * source.getAllParameters().size() * 256L;
+    }
+
     private static Object renderReserved(Callable<CModelingDocument> document, Path workspace, Path output,
-                                         Map<String,Object> request, int[] size, Permit permit) throws Exception {
+                                         Map<String,Object> request, int[] size, Permit permit, long estimatedSnapshot) throws Exception {
         Files.createDirectories(output.getParent());
         Path staging = Files.createTempDirectory(output.getParent(), ".cubism-render-");
         try {
@@ -173,6 +189,7 @@ final class NativeBridgeRendering {
                 if (size[0] != integer(request, "width", canvas.getPixelWidth())
                         || size[1] != integer(request, "height", canvas.getPixelHeight()))
                     throw new IllegalStateException("Canvas changed before rendering began");
+                permit.increase(snapshotBytes(doc.getModelSource(), request) - estimatedSnapshot);
                 if (permit.large) closeRenderSessions(null);
                 return prepare(doc, request);
             }, 0)) {
@@ -196,9 +213,12 @@ final class NativeBridgeRendering {
                 || !String.valueOf(plan.height).equals(String.valueOf(baseline.get("height")))
                 || !(baseline.get("frames") instanceof List<?> baselineFrames))
                 throw new IllegalArgumentException("Baseline dimensions or crop differ");
+            var byName = new HashMap<String,Map<?,?>>();
+            for (var value : baselineFrames)
+                if (value instanceof Map<?,?> row && row.get("name") instanceof String name) byName.putIfAbsent(name, row);
             for (var frame : plan.frames) {
-                var match = baselineFrames.stream().filter(v -> v instanceof Map<?,?> m && frame.name.equals(m.get("name")))
-                    .map(v -> (Map<?,?>) v).findFirst().orElseThrow(() -> new IllegalArgumentException("Missing baseline pose " + frame.name));
+                var match = byName.get(frame.name);
+                if (match == null) throw new IllegalArgumentException("Missing baseline pose " + frame.name);
                 if (!frame.parameters.equals(match.get("parameters")))
                     throw new IllegalArgumentException("Baseline parameters differ for " + frame.name);
                 references.put(frame.name, NativeBridgeAssets.input(workspace, previous.resolveSibling(frame.name + ".png").toString(), ".png"));

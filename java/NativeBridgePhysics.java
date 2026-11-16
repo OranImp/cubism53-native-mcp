@@ -150,7 +150,8 @@ final class NativeBridgePhysics {
     private record Range(CParameterGuid guid, float min, float max) {}
     private record OutputRange(String group, String parameter, int groupIndex, int outputIndex) {}
 
-    record Simulation(CPhysicsSettingsSourceSet settings, CParameterSet pose, List<List<Driver>> frames,
+    record Simulation(CPhysicsSettingsSourceSet settings, CParameterSet pose, List<?> frames,
+                      Map<String,Range> parameters,
                       Map<String,CParameterGuid> outputs, List<OutputRange> ranges, int warmup, float delta,
                       boolean summary) {}
 
@@ -178,19 +179,6 @@ final class NativeBridgePhysics {
             parameters.put(id, new Range(parameter.getGuid(), parameter.getMinValue(), parameter.getMaxValue()));
             names.put(parameter.getGuid(), id);
         }
-        var frames = new ArrayList<List<Driver>>();
-        for (Object frame : requestedFrames) {
-            var drivers = new ArrayList<Driver>();
-            for (var entry : ((Map<?,?>) frame).entrySet()) {
-                var parameter = parameters.get(entry.getKey());
-                if (parameter == null) throw new IllegalArgumentException("Parameter not found: " + entry.getKey());
-                float value = finite(entry.getValue(), "parameter " + entry.getKey());
-                if (value < parameter.min || value > parameter.max)
-                    throw new IllegalArgumentException("Parameter outside defined range: " + entry.getKey());
-                drivers.add(new Driver(parameter.guid, value));
-            }
-            frames.add(drivers);
-        }
         var selected = new HashSet<Object>();
         boolean filtered = request.get("output_parameter_ids") instanceof List<?>;
         if (filtered) selected.addAll((List<?>) request.get("output_parameter_ids"));
@@ -210,10 +198,33 @@ final class NativeBridgePhysics {
             }
         }
         if (!outputs.keySet().containsAll(selected)) throw new IllegalArgumentException("Requested parameter is not a physics output");
-        return new Simulation(settings, pose, frames, outputs, ranges, warmup, delta, "summary".equals(request.get("result_mode")));
+        return new Simulation(settings, pose, requestedFrames, parameters, outputs, ranges, warmup, delta, "summary".equals(request.get("result_mode")));
     }
 
-    static Map<String,Object> solve(Simulation simulation, long deadline) {
+    private static List<List<Driver>> resolveFrames(Simulation simulation) {
+        var frames = new ArrayList<List<Driver>>(simulation.frames.size());
+        var parameters = simulation.parameters;
+        for (Object frame : simulation.frames) {
+            var drivers = new ArrayList<Driver>();
+            for (var entry : ((Map<?,?>) frame).entrySet()) {
+                var parameter = parameters.get(entry.getKey());
+                if (parameter == null) throw new IllegalArgumentException("Parameter not found: " + entry.getKey());
+                float value = finite(entry.getValue(), "parameter " + entry.getKey());
+                if (value < parameter.min || value > parameter.max)
+                    throw new IllegalArgumentException("Parameter outside defined range: " + entry.getKey());
+                drivers.add(new Driver(parameter.guid, value));
+            }
+            frames.add(drivers);
+        }
+        return frames;
+    }
+
+    static boolean spill(Simulation simulation) {
+        return !simulation.summary && (long) simulation.frames.size() * (simulation.outputs.size() + 1) >= 16000;
+    }
+
+    static Map<String,Object> solve(Simulation simulation, long deadline, NativeBridgeTrace.Spool spool) throws java.io.IOException {
+        var drivers = resolveFrames(simulation);
         var settings = simulation.settings;
         var pose = simulation.pose;
         var solver = new com.live2d.cubism.doc.gameData.physics.b();
@@ -230,7 +241,7 @@ final class NativeBridgePhysics {
             if (deadline != 0 && deadline - System.nanoTime() <= 0)
                 throw new IllegalStateException("Physics simulation timed out; retry with execution=job");
             pose.setDefaultValues();
-            if (frame >= 0) for (var driver : simulation.frames.get(frame)) pose.setValue(driver.guid, driver.value);
+            if (frame >= 0) for (var driver : drivers.get(frame)) pose.setValue(driver.guid, driver.value);
             for (var group : groups) if (group.getEnable())
                 solver.a(group, pose, settings.getGravity(), settings.getWind(), simulation.delta,
                     ignored -> kotlin.Unit.INSTANCE, false, null, null, null);
@@ -245,7 +256,11 @@ final class NativeBridgePhysics {
                     range[1] = Math.max(range[1], value);
                 } else values.put(output.getKey(), value);
             }
-            if (!simulation.summary) trace.add(map("frame", frame, "outputs", values));
+            if (!simulation.summary) {
+                var row = map("frame", frame, "outputs", values);
+                if (spool == null) trace.add(row);
+                else spool.append(row);
+            }
         }
         var ranges = new ArrayList<Object>();
         for (var range : simulation.ranges) {
@@ -260,7 +275,7 @@ final class NativeBridgePhysics {
             extrema.forEach((id, range) -> summary.put(id, map("minimum", range[0], "maximum", range[1])));
             result.put("frame_count", simulation.frames.size());
             result.put("summary", summary);
-        } else result.put("frames", trace);
+        } else if (spool == null) result.put("frames", trace);
         return result;
     }
 }

@@ -428,6 +428,12 @@ async def check_v040(invoke, work):
         await asyncio.sleep(.1)
     assert result['state'] == 'succeeded' and result['result']['frame_count'] == 8100, result
     assert result['result']['frames'][0]['frame'] == 8099
+    full = await invoke('job_status', job_id=large['job_id'])
+    assert len(full['result']['frames']) == 8100
+    assert full['result']['frames'][-1] == result['result']['frames'][0]
+    replayed = await model('simulate_physics', frames=[{'ParamAngleZ': 1}] * 8100, warmup_frames=0,
+                           execution='job', request_id='large-physics-trace')
+    assert replayed == full
     await model('close_saved', wait_seconds=6)
     jobs = await invoke('list_jobs', operation='simulate_physics', state='succeeded', limit=1)
     assert jobs['jobs'][0]['operation'] == 'simulate_physics'
@@ -527,8 +533,15 @@ async def check_legacy_gaps(invoke, work):
     placed = await edit('edit_texture_atlas', action='place', placements=placements)
     assert len(placed['pages'][0]['placements']) == 2
     save = await edit('save_as_new', path='mesh-audit.cmo3')
-    assert save['saved'], save
-    await edit('close_saved', wait_seconds=6)
+    if save['saved']:
+        assert (await edit('close_saved', wait_seconds=6))['closed']
+        opened = await invoke('open_project', path='mesh-audit.cmo3', wait_seconds=12)
+        assert {row['guid'] for row in (await invoke('objects', document_uid=opened['document_uid']))['objects']} >= {first, second}
+        await invoke('close_saved', document_uid=opened['document_uid'], wait_seconds=6)
+    else:
+        assert save['reason'] == 'native_edit_restriction' and save['bytes'] == 0, save
+        assert not (work/'mesh-audit.cmo3').exists()
+        print('NATIVE_MESH_AUDIT_SAVE_RESTRICTION_VERIFIED', flush=True)
     print('LEGACY_TOOL_GAPS_STDIO_OK', flush=True)
 
 

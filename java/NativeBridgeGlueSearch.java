@@ -31,18 +31,31 @@ final class NativeBridgeGlueSearch {
         for (int i = 0; i < aCells.length; i++) {
             Cell cell = aCells[i];
             int start = candidates.size();
+            int remaining = limit - start;
+            var nearestIndices = remaining > 0 && remaining < bCells.length
+                ? new PriorityQueue<Candidate>(Comparator.comparingInt(Candidate::b).reversed()) : null;
             for (int dx = -1; dx <= 1; dx++) {
                 for (int dy = -1; dy <= 1; dy++) {
                     var bucket = buckets.get(new Cell(cell.x + dx, cell.y + dy));
                     if (bucket == null) continue;
                     for (int j : bucket) {
-                        compare(a, b, tolerance, i, j, start < limit ? candidates : null, aCounts, bCounts);
+                        double distance = distance(a, b, i, j);
                         comparisons++;
+                        if (!(distance <= tolerance)) continue;
+                        aCounts[i]++;
+                        bCounts[j]++;
+                        if (remaining == 0) continue;
+                        if (nearestIndices == null) {
+                            candidates.add(new Candidate(i, j, distance));
+                        } else if (nearestIndices.size() < remaining || j < nearestIndices.peek().b) {
+                            if (nearestIndices.size() == remaining) nearestIndices.remove();
+                            nearestIndices.add(new Candidate(i, j, distance));
+                        }
                     }
                 }
             }
+            if (nearestIndices != null) candidates.addAll(nearestIndices);
             candidates.subList(start, candidates.size()).sort(Comparator.comparingInt(Candidate::b));
-            if (candidates.size() > limit) candidates.subList(limit, candidates.size()).clear();
         }
         return new Matches(candidates, aCounts, bCounts, comparisons);
     }
@@ -71,9 +84,13 @@ final class NativeBridgeGlueSearch {
         return new Matches(candidates, aCounts, bCounts, (long) aCounts.length * bCounts.length);
     }
 
+    private static double distance(float[] a, float[] b, int i, int j) {
+        return Math.hypot(a[i * 2] - b[j * 2], a[i * 2 + 1] - b[j * 2 + 1]);
+    }
+
     private static void compare(float[] a, float[] b, double tolerance, int i, int j,
                                 List<Candidate> candidates, int[] aCounts, int[] bCounts) {
-        double distance = Math.hypot(a[i * 2] - b[j * 2], a[i * 2 + 1] - b[j * 2 + 1]);
+        double distance = distance(a, b, i, j);
         if (distance <= tolerance) {
             aCounts[i]++;
             bCounts[j]++;

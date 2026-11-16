@@ -20,6 +20,7 @@ from PIL import Image
 from psd_tools import PSDImage
 from psd_tools.api.layers import PixelLayer
 from expansion_smoke import check_expansion
+from perf_smoke import check_performance
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -198,7 +199,7 @@ async def check_upgrade(previous, spec, env, profile):
     print('OLD_BRIDGE_REJECTED_AND_STOPPED_FOR_UPGRADE', flush=True)
 
 
-async def exercise(spec, env, work, legacy, expected_version, probe, preview_port, editor, pid, high_resolution):
+async def exercise(spec, env, work, legacy, expected_version, probe, preview_port, editor, pid, high_resolution, performance):
     config = StdioServerParameters(command=spec['command'], args=spec['args'], env={
         'PATH':env['PATH'], 'LOCALAPPDATA':env['LOCALAPPDATA'], 'CUBISM53_EDITOR_PID':env['CUBISM53_EDITOR_PID'],
         'PYTHONDONTWRITEBYTECODE':'1',
@@ -289,7 +290,30 @@ async def exercise(spec, env, work, legacy, expected_version, probe, preview_por
         await current('edit_batch',mode='apply',edits=same,plan_id=plan['plan_id'],reject='stale')
         plan = await current('edit_batch',mode='plan',edits=same)
         await current('edit_batch',mode='apply',edits=same,plan_id=plan['plan_id'])
+        def rename(name):
+            return {'operation': 'rename_object', 'arguments': {'object_guid': c, 'name': name}}
+
+        mixed = [rename('C under B'), move(c, part_guid=b)]
+        plan = await current('edit_batch', mode='plan', edits=mixed)
+        await current('edit_batch', mode='apply', edits=mixed, plan_id=plan['plan_id'])
+        moved = await current('object', object_guid=c)
+        assert moved['name'] == 'C under B' and moved['parent_part_guid'] == b
+        await current('undo')
+        restored = await current('object', object_guid=c)
+        assert restored['name'] == 'C renamed' and restored['parent_part_guid'] != b
+
+        renames = [rename('C intermediate'), rename('C final')]
+        plan = await current('edit_batch', mode='plan', edits=renames)
+        await current('edit_batch', mode='apply', edits=renames, plan_id=plan['plan_id'])
+        assert (await current('object', object_guid=c))['name'] == 'C final'
+        await current('undo')
+        assert (await current('object', object_guid=c))['name'] == 'C renamed'
+        await current('redo')
+        assert (await current('object', object_guid=c))['name'] == 'C final'
         await current('save_as_new',path='batch.cmo3')
+        await current('close_saved')
+        uid = await reopen('batch.cmo3')
+        assert (await current('object', object_guid=c))['name'] == 'C final'
         await current('close_saved')
         print('BATCH_OK', flush=True)
 
@@ -302,6 +326,17 @@ async def exercise(spec, env, work, legacy, expected_version, probe, preview_por
         before = await geometry()
         plan = await current('plan_psd_reimport',path='revision-2.psd')
         assert len(plan['updates'])==1 and len(plan['missing'])==1
+        alias = work / 'preview-copy.psd'
+        alias.write_bytes((work / 'revision-2.psd').read_bytes())
+        assert (await current('plan_psd_reimport', path=alias.name)) == plan
+        stamp = alias.stat()
+        alias.write_bytes((work / 'revision-3.psd').read_bytes())
+        os.utime(alias, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        changed = await current('plan_psd_reimport', path=alias.name)
+        assert changed['plan_id'] != plan['plan_id']
+        await current('reimport_psd', path=alias.name, plan_id=plan['plan_id'], reject='stale')
+        alias.write_bytes((work / 'revision-2.psd').read_bytes())
+        assert (await current('plan_psd_reimport', path=alias.name)) == plan
         updated = await current('reimport_psd',path='revision-2.psd',plan_id=plan['plan_id'])
         next_plan = await current('plan_psd_reimport',path='revision-3.psd')
         assert next_plan['source_psd_guid']==updated['new_source_psd_guid']
@@ -473,6 +508,8 @@ async def exercise(spec, env, work, legacy, expected_version, probe, preview_por
         print('PSD_UNDO_REDO_REOPEN_PIXELS_OK', flush=True)
         print('PHYSICS_RUNTIME_AND_ANIMATION_EXPORT_OK', flush=True)
         await check_expansion(invoke, work, editor, pid, probe, high_resolution)
+        if performance:
+            await check_performance(invoke, work, pid, performance == 'candidate')
         if probe:
             assert successful == set(definitions), sorted(set(definitions) - successful)
             print(f'ALL_{len(successful)}_TOOLS_INVOKED_SUCCESSFULLY', flush=True)
@@ -493,6 +530,7 @@ def main():
     parser.add_argument('--previous-package', type=Path, help='Exercise an upgrade with the previous portable package')
     parser.add_argument('--native-probe', action='store_true', help='Test editor undo and preview via a dedicated test agent')
     parser.add_argument('--high-resolution', action='store_true', help='Render and compare 4K and 8K; requires psutil')
+    parser.add_argument('--performance', choices=['baseline', 'candidate'], help='Run isolated performance samples; requires psutil')
     options = parser.parse_args()
     portable = options.package.resolve(strict=True)
     editor = options.editor_home.resolve(strict=True)
@@ -550,7 +588,8 @@ def main():
                       if options.legacy_server and expected == '5.3.03' else {})
             probe = native_probe(portable, editor, root, process.pid, expected) if options.native_probe else None
             definitions = asyncio.run(asyncio.wait_for(exercise(
-                spec, env, folder, legacy, expected, probe, preview_port, editor, process.pid, options.high_resolution), 240))
+                spec, env, folder, legacy, expected, probe, preview_port, editor, process.pid,
+                options.high_resolution, options.performance), 420 if options.performance else 240))
             assert definitions == asyncio.run(schemas(ROOT / 'server.py'))
             if baseline:
                 previous = asyncio.run(schemas(baseline))

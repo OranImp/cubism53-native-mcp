@@ -16,7 +16,6 @@ import com.live2d.cubism.doc.model.texture.textureAtlas.CTextureAtlas;
 import com.live2d.cubism.doc.modeling.CModelingDocument;
 import com.live2d.cubism.doc.modeling.editor.Editor_Texture;
 import com.live2d.cubism.doc.resources.ACLayerEntry;
-import com.live2d.cubism.doc.resources.CImageDocumentProjectEntry;
 import com.live2d.cubism.doc.resources.CLayer;
 import com.live2d.cubism.doc.resources.CLayerGroup;
 import com.live2d.cubism.doc.resources.CLayeredImage;
@@ -95,7 +94,14 @@ final class NativeBridgeAssets {
         return response;
     }
 
-    static java.awt.image.BufferedImage readPng(Path path) throws IOException {
+    record PngInput(Path path, java.awt.image.BufferedImage pixels) {}
+
+    static PngInput readPng(Path workspace, Object value) throws IOException {
+        var path = input(workspace, value, ".png");
+        return new PngInput(path, readPng(path));
+    }
+
+    private static java.awt.image.BufferedImage readPng(Path path) throws IOException {
         var input = javax.imageio.ImageIO.read(path.toFile());
         if (input == null) throw new IllegalArgumentException("Image could not be decoded");
         if (input.getType() == java.awt.image.BufferedImage.TYPE_INT_ARGB) return input;
@@ -111,7 +117,7 @@ final class NativeBridgeAssets {
         } finally { input.flush(); }
     }
 
-    static Object replaceResized(CModelingDocument doc, Path workspace, Map<String,Object> request) throws Exception {
+    static Object replaceResized(CModelingDocument doc, PngInput png, Map<String,Object> request) throws Exception {
         var source = doc.getModelSource();
         var item = findObject(source, (String) request.get("object_guid"));
         if (!(item instanceof CArtMeshSource mesh)) throw new IllegalArgumentException("ArtMesh required");
@@ -119,8 +125,7 @@ final class NativeBridgeAssets {
         if (!(extension.getCurrentTextureInputData() instanceof CTextureInput_ModelImage input))
             throw new IllegalArgumentException("Resizable replacement requires model-image texture mode");
         var previous = input.getModelImage();
-        var path = input(workspace, request.get("path"), ".png");
-        var pixels = readPng(path);
+        var pixels = png.pixels;
         var offsets = (List<?>) request.get("origin_offset");
         if (offsets.size() != 2) throw new IllegalArgumentException("Origin offset requires [x,y]");
         var dx = ((Number) offsets.get(0)).intValue();
@@ -191,15 +196,9 @@ final class NativeBridgeAssets {
         mesh.setMeshUpdatedFlag__testImpl();
     }
 
-    private static CLayeredImage readPsd(Path path) {
-        var entry = new CImageDocumentProjectEntry(path.toFile());
-        entry.open();
-        return entry.getOpenedImageDocument().a();
-    }
-
-    static Object importPsd(CEAppCtrl app, Path workspace, Map<String,Object> request) throws Exception {
-        Path path = input(workspace, request.get("path"), ".psd");
-        var raw = readPsd(path);
+    static Object importPsd(CEAppCtrl app, PsdInput input) throws Exception {
+        Path path = input.path;
+        var raw = input.image;
         var source = CEPsdImport_Import.a.a(raw, path.toFile(), psdOption(), new GroupUndo("Native bridge: import PSD"));
         var doc = com.live2d.cubism.appCtrlImpl.ar.a.a(app, source.getName(), source, null, true, null, false);
         var result = describe(doc);
@@ -214,8 +213,13 @@ final class NativeBridgeAssets {
             .getField("a").get(null);
     }
 
+    private record LayerDescriptor(String key, List<String> path, String id) {
+        Map<String,Object> info() { return map("key", key, "path", path, "layer_id", id); }
+    }
+
     private record LayerRow(String key, List<String> path, CLayer layer) {
         String id() { return layer.getLayerIdentifier().getLayerId(); }
+        LayerDescriptor descriptor() { return new LayerDescriptor(key, List.copyOf(path), id()); }
         Map<String,Object> info() { return map("key", key, "path", path, "layer_id", id()); }
     }
 
@@ -246,9 +250,22 @@ final class NativeBridgeAssets {
                     .add(new IndexedMesh(index, mesh.getGuid().getUuidString()));
             index++;
         }
+        var byLayer = new HashMap<CLayer,Set<com.live2d.type.CModelImageGuid>>();
+        for (var group : source.getTextureManager().getModelImageGroups()) {
+            for (var image : group.getModelImages()) {
+                var environment = image.getInputFilterEnv();
+                if (!environment.getHasCurrentImageGuid()) continue;
+                var selector = environment.getLayerInputData();
+                if (selector == null) continue;
+                // Match the native layer lookup across all selector revisions, including inactive inputs.
+                for (var inputs : selector.getImageToLayerInput().values())
+                    for (var input : inputs)
+                        byLayer.computeIfAbsent(input.getLayer(), key -> new HashSet<>()).add(image.getGuid());
+            }
+        }
         var result = new ArrayList<Object>();
         for (var row : layers(raw)) {
-            var materials = source.getTextureManager().getHandler().a(row.layer);
+            var materials = byLayer.getOrDefault(row.layer, Set.of());
             var meshes = materials.stream().flatMap(guid -> byMaterial.getOrDefault(guid, List.of()).stream())
                 .sorted(Comparator.comparingInt(IndexedMesh::index)).map(IndexedMesh::guid).toList();
             result.add(map("layer", row.info(), "material_guids", materials.stream().map(guid -> guid.getUuidString()).sorted().toList(),
@@ -266,15 +283,15 @@ final class NativeBridgeAssets {
         }
     }
 
-    private record Match(HistoryLayer oldLayer, LayerRow incoming) {
+    private record Match(HistoryLayer oldLayer, LayerDescriptor incoming) {
         Object info() { return map("existing", oldLayer.info(), "incoming", incoming.info()); }
     }
 
-    private record ReimportPlan(String id, LayeredImageWrapper previous, CLayeredImage incoming, List<Match> matches,
-            List<LayerRow> added, List<HistoryLayer> missing, List<Object> conflicts) {
+    private record ReimportPlan(String id, LayeredImageWrapper previous, List<Match> matches,
+            List<LayerDescriptor> added, List<HistoryLayer> missing, List<Object> conflicts) {
         Map<String,Object> info() {
             return map("plan_id", id, "source_psd_guid", previous.getImage().getGuid().getUuidString(),
-                "updates", matches.stream().map(Match::info).toList(), "additions", added.stream().map(LayerRow::info).toList(),
+                "updates", matches.stream().map(Match::info).toList(), "additions", added.stream().map(LayerDescriptor::info).toList(),
                 "missing", missing.stream().map(HistoryLayer::info).toList(), "conflicts", conflicts);
         }
     }
@@ -311,33 +328,88 @@ final class NativeBridgeAssets {
         throw new IllegalArgumentException("Select source_psd_guid from " + descriptions);
     }
 
-    record PsdInput(byte[] hash, CLayeredImage image) {}
+    record PsdInput(Path path, byte[] hash, CLayeredImage image) {}
 
-    static PsdInput snapshotPsd(Path workspace, Object value) throws Exception {
-        Path path = input(workspace, value, ".psd");
-        var modified = Files.getLastModifiedTime(path);
+    static final class PsdPreview {
+        private final byte[] hash;
+        private final List<LayerDescriptor> layers;
+
+        PsdPreview(byte[] hash, CLayeredImage image) {
+            this.hash = hash;
+            this.layers = NativeBridgeAssets.layers(image).stream().map(LayerRow::descriptor).toList();
+        }
+    }
+
+    // Retain only the last set of detached layer descriptors. Read the file
+    // again and recompute the plan against the current model on every request.
+    private static volatile PsdPreview lastPreview;
+
+    private record PsdSnapshot(Path path, Path copy, byte[] hash, long modified) implements AutoCloseable {
+        CLayeredImage readImage() {
+            var parsed = com.live2d.graphics.psd.CPsdDocument.a.a(copy.toFile(), false, false);
+            String name = path.getFileName().toString();
+            var image = new CLayeredImage(parsed, path.toFile(), name.substring(0, name.length() - 4));
+            image.setPsdFileLastModified(modified);
+            return image;
+        }
+
+        @Override public void close() throws IOException { Files.deleteIfExists(copy); }
+    }
+
+    private static PsdSnapshot copyPsd(Path path) throws Exception {
+        long modified = Files.getLastModifiedTime(path).toMillis();
         var digest = MessageDigest.getInstance("SHA-256");
         Path snapshot = Files.createTempFile("cubism-reimport-", ".psd");
         try {
             try (var stream = new DigestInputStream(Files.newInputStream(path), digest)) {
                 Files.copy(stream, snapshot, StandardCopyOption.REPLACE_EXISTING);
             }
-            var parsed = com.live2d.graphics.psd.CPsdDocument.a.a(snapshot.toFile(), false, false);
-            String name = path.getFileName().toString();
-            var incoming = new CLayeredImage(parsed, path.toFile(), name.substring(0, name.length() - 4));
-            incoming.setPsdFileLastModified(modified.toMillis());
-            return new PsdInput(digest.digest(), incoming);
-        } finally {
-            Files.deleteIfExists(snapshot);
+            return new PsdSnapshot(path, snapshot, digest.digest(), modified);
+        } catch (Exception | Error error) {
+            try { Files.deleteIfExists(snapshot); }
+            catch (IOException cleanup) { error.addSuppressed(cleanup); }
+            throw error;
         }
     }
 
-    private static ReimportPlan plan(CModelingDocument doc, PsdInput snapshot, Map<String,Object> request) throws Exception {
+    static PsdInput snapshotPsd(Path workspace, Object value) throws Exception {
+        try (var snapshot = copyPsd(input(workspace, value, ".psd"))) {
+            return new PsdInput(snapshot.path, snapshot.hash, snapshot.readImage());
+        }
+    }
+
+    static PsdPreview previewPsd(Path workspace, Object value) throws Exception {
+        Path path = input(workspace, value, ".psd");
+        var cached = lastPreview;
+        if (cached != null) {
+            var digest = MessageDigest.getInstance("SHA-256");
+            try (var stream = new DigestInputStream(Files.newInputStream(path), digest)) {
+                stream.transferTo(java.io.OutputStream.nullOutputStream());
+            }
+            if (Arrays.equals(cached.hash, digest.digest())) return cached;
+        }
+        try (var snapshot = copyPsd(path)) {
+            var image = snapshot.readImage();
+            try {
+                var preview = new PsdPreview(snapshot.hash, image);
+                lastPreview = preview;
+                return preview;
+            } finally {
+                image.dispose();
+            }
+        }
+    }
+
+    static Object planPsdReimport(CModelingDocument doc, PsdPreview preview, Map<String,Object> request) throws Exception {
+        return plan(doc, preview.hash, preview.layers, request).info();
+    }
+
+    private static ReimportPlan plan(CModelingDocument doc, byte[] hash,
+                                     List<LayerDescriptor> newLayers, Map<String,Object> request) throws Exception {
         var model = doc.getModelSource();
         var previous = sourcePsd(model, request.get("source_psd_guid"));
         var digest = MessageDigest.getInstance("SHA-256");
-        digest.update(snapshot.hash());
-        var incoming = snapshot.image();
+        digest.update(hash);
         String current = previous.getImage().getGuid().getUuidString();
         var activeLayerIds = new HashSet<com.live2d.type.CLayerGuid>();
         var linkedSources = new HashMap<String,Set<String>>();
@@ -379,36 +451,41 @@ final class NativeBridgeAssets {
         var proven = oldLayers.stream().filter(layer -> provenSources.contains(layer.source)).toList();
         var unproven = oldLayers.stream()
             .filter(layer -> !provenSources.contains(layer.source) && replacedSources.contains(layer.source)).toList();
-        var newLayers = layers(incoming);
         var explicit = (Map<?,?>) request.get("layer_map");
         var matches = new ArrayList<Match>();
-        var added = new ArrayList<LayerRow>();
+        var added = new ArrayList<LayerDescriptor>();
         var conflicts = new ArrayList<Object>();
         var used = new HashSet<HistoryLayer>();
-        var explicitlyMatched = new HashSet<LayerRow>();
-        for (Object key : explicit.keySet()) {
-            if (newLayers.stream().noneMatch(row -> row.key.equals(key)))
-                throw new IllegalArgumentException("Unknown incoming layer key: " + key);
+        var explicitlyMatched = new HashSet<String>();
+        var incomingKeys = new HashSet<String>();
+        for (var row : newLayers) incomingKeys.add(row.key);
+        for (Object key : explicit.keySet())
+            if (!incomingKeys.contains(key)) throw new IllegalArgumentException("Unknown incoming layer key: " + key);
+        var historyKeys = new HashMap<String,HistoryLayer>();
+        for (var row : oldLayers) {
+            historyKeys.putIfAbsent(row.key, row);
+            historyKeys.putIfAbsent(row.source + ":" + row.row.key, row);
         }
         for (var newRow : newLayers) {
             if (!explicit.containsKey(newRow.key)) continue;
-            explicitlyMatched.add(newRow);
+            explicitlyMatched.add(newRow.key);
             Object target = explicit.get(newRow.key);
             if ("new".equals(target)) {
                 added.add(newRow);
             } else {
-                var oldRow = oldLayers.stream().filter(layer -> layer.key.equals(target)
-                    || (layer.source + ":" + layer.row.key).equals(target)).findFirst()
-                    .orElseThrow(() -> new IllegalArgumentException("Unknown existing layer key: " + target));
+                var oldRow = historyKeys.get(target);
+                if (oldRow == null) throw new IllegalArgumentException("Unknown existing layer key: " + target);
                 if (!used.add(oldRow)) throw new IllegalArgumentException("Two explicit mappings use the same existing layer");
                 matches.add(new Match(oldRow, newRow));
             }
         }
+        var provenIndex = new LayerIndex(proven);
+        var uncertainIndex = new LayerIndex(unproven);
         for (var newRow : newLayers) {
-            if (explicitlyMatched.contains(newRow)) continue;
-            var candidates = matchLayers(proven, newRow);
+            if (explicitlyMatched.contains(newRow.key)) continue;
+            var candidates = provenIndex.match(newRow);
             if (candidates.isEmpty()) {
-                var uncertain = matchLayers(unproven, newRow);
+                var uncertain = uncertainIndex.match(newRow);
                 if (uncertain.isEmpty()) added.add(newRow);
                 else conflicts.add(map("incoming", newRow.info(), "reason", "unverified_psd_source",
                     "existing_candidates", uncertain.stream().map(HistoryLayer::info).toList()));
@@ -421,35 +498,54 @@ final class NativeBridgeAssets {
         var missing = proven.stream().filter(row -> !used.contains(row)).toList();
         var modelState = map("document", doc.getDocumentUID(), "modified", doc.getLastModifiedTime(), "undo", doc.getUndoManager().getCurrentPos(),
             "source", current, "materials", materialSnapshot, "layers", oldLayers.stream().map(HistoryLayer::info).toList(),
-            "matches", matches.stream().map(Match::info).toList(), "additions", added.stream().map(LayerRow::info).toList(),
+            "matches", matches.stream().map(Match::info).toList(), "additions", added.stream().map(LayerDescriptor::info).toList(),
             "conflicts", conflicts);
         digest.update(org.json.simple.JSONValue.toJSONString(modelState).getBytes(StandardCharsets.UTF_8));
-        return new ReimportPlan(HexFormat.of().formatHex(digest.digest()), previous, incoming, matches, added, missing, conflicts);
+        return new ReimportPlan(HexFormat.of().formatHex(digest.digest()), previous, matches, added, missing, conflicts);
     }
 
-    private static List<HistoryLayer> matchLayers(List<HistoryLayer> layers, LayerRow incoming) {
-        String id = incoming.id();
-        if (id != null && !id.isBlank() && !"0".equals(id)) {
-            var sameId = layers.stream().filter(layer -> id.equals(layer.row.id())).toList();
-            if (!sameId.isEmpty()) return sameId;
+    private static final class LayerIndex {
+        private final Map<String,List<HistoryLayer>> ids = new HashMap<>();
+        private final Map<List<String>,List<HistoryLayer>> paths = new HashMap<>();
+
+        LayerIndex(List<HistoryLayer> layers) {
+            for (var layer : layers) {
+                String id = layer.row.id();
+                if (id != null && !id.isBlank() && !"0".equals(id))
+                    ids.computeIfAbsent(id, ignored -> new ArrayList<>()).add(layer);
+                paths.computeIfAbsent(layer.row.path, ignored -> new ArrayList<>()).add(layer);
+            }
         }
-        return layers.stream().filter(layer -> layer.row.path.equals(incoming.path)).toList();
+
+        List<HistoryLayer> match(LayerDescriptor incoming) {
+            var sameId = ids.get(incoming.id());
+            return sameId == null ? paths.getOrDefault(incoming.path, List.of()) : sameId;
+        }
     }
 
-    static Object reimportPsd(CModelingDocument doc, PsdInput input, Map<String,Object> request, String op) throws Exception {
-        var plan = plan(doc, input, request);
-        if ("plan_psd_reimport".equals(op)) return plan.info();
-        if (!plan.id.equals(request.get("plan_id"))) throw new IllegalArgumentException("PSD plan is stale; run preflight again");
-        if (!plan.conflicts.isEmpty()) throw new IllegalArgumentException("Resolve PSD layer conflicts with explicit mappings first");
+    static Object reimportPsd(CModelingDocument doc, PsdInput input, Map<String,Object> request) throws Exception {
+        var incoming = input.image;
+        var rows = layers(incoming);
+        ReimportPlan plan;
+        try {
+            plan = plan(doc, input.hash, rows.stream().map(LayerRow::descriptor).toList(), request);
+            if (!plan.id.equals(request.get("plan_id"))) throw new IllegalArgumentException("PSD plan is stale; run preflight again");
+            if (!plan.conflicts.isEmpty()) throw new IllegalArgumentException("Resolve PSD layer conflicts with explicit mappings first");
+        } catch (Exception | Error error) {
+            incoming.dispose();
+            throw error;
+        }
         var source = doc.getModelSource();
         var manager = source.getTextureManager();
-        var newGuid = plan.incoming.getGuid();
+        var newGuid = incoming.getGuid();
+        var byKey = new HashMap<String,CLayer>();
+        for (var row : rows) byKey.put(row.key, row.layer);
         var replacements = new HashMap<com.live2d.type.CLayerGuid,CLayer>();
-        for (var match : plan.matches) replacements.put(match.oldLayer.row.layer.getGuid(), match.incoming.layer);
+        for (var match : plan.matches) replacements.put(match.oldLayer.row.layer.getGuid(), byKey.get(match.incoming.key));
         var undo = new GroupUndo("Native bridge: reimport PSD");
         List<String> changed = new ArrayList<>();
         try {
-            var wrapper = new LayeredImageWrapper(plan.incoming, System.currentTimeMillis(), plan.incoming.getPsdFileLastModified(), false);
+            var wrapper = new LayeredImageWrapper(incoming, System.currentTimeMillis(), incoming.getPsdFileLastModified(), false);
             undo.plusAssign(manager.getHandler().a(wrapper, 0));
             boolean wasReplaced = plan.previous.isReplaced();
             // The pinned build exposes a synthetic Kotlin setter to reflection.
@@ -475,11 +571,11 @@ final class NativeBridgeAssets {
                 changed.add(material.getGuid().getUuidString());
             }
             if (!plan.added.isEmpty()) {
-                var group = CModelImageGroup.Companion.a(plan.incoming.getName(), newGuid);
+                var group = CModelImageGroup.Companion.a(incoming.getName(), newGuid);
                 undo.plusAssign(manager.getHandler().a(group, 0));
                 Set<ACLayerEntry> skip = new HashSet<>();
-                for (var match : plan.matches) skip.add(match.incoming.layer);
-                CEPsdImport_Import.a.a(source, plan.incoming, plan.incoming.getName(), skip, group,
+                for (var match : plan.matches) skip.add(byKey.get(match.incoming.key));
+                CEPsdImport_Import.a.a(source, incoming, incoming.getName(), skip, group,
                     source.getHandler().c(), psdOption(), undo);
             }
             refreshTextures(source);
@@ -494,7 +590,7 @@ final class NativeBridgeAssets {
         var result = plan.info();
         result.put("new_source_psd_guid", newGuid.getUuidString());
         result.put("updated_material_guids", changed);
-        result.put("layers", layerMaterials(source, plan.incoming));
+        result.put("layers", layerMaterials(source, incoming));
         return result;
     }
 
@@ -532,61 +628,80 @@ final class NativeBridgeAssets {
         return saved(path, true, doc.getFile(), doc.isModifiedAfterSaving(), null);
     }
 
-    static Object exportPhysics(CModelingDocument doc, Path workspace, Map<String,Object> request) throws Exception {
-        Path path = output(workspace, request.get("path"), ".physics3.json");
+    record PhysicsExport(String json, int sourceGroupCount) {}
+
+    static PhysicsExport preparePhysics(CModelingDocument doc) throws Exception {
         var source = doc.getModelSource();
         var settings = source.getPhysicsSettingsSourceSet();
         var verified = settings.createVerifiedSettingSet(source, false);
         var serializer = Class.forName("com.live2d.cubism.doc.gameData.a.a");
         String json = (String) serializer.getMethod("a", CModelSource.class, verified.getClass())
             .invoke(serializer.getConstructor().newInstance(), source, verified);
-        if (!(org.json.simple.JSONValue.parse(json) instanceof Map<?,?> result))
+        return new PhysicsExport(json, settings.getSources().size());
+    }
+
+    static Object writePhysics(PhysicsExport export, Path path) throws IOException {
+        if (!(org.json.simple.JSONValue.parse(export.json) instanceof Map<?,?> result))
             throw new IllegalStateException("Cubism did not generate a valid physics export");
-        writeNew(path, json);
+        writeNew(path, export.json);
         return map("path", path.toString(), "groups", result.get("PhysicsSettings"),
-            "source_group_count", settings.getSources().size(), "bytes", Files.size(path));
+            "source_group_count", export.sourceGroupCount, "bytes", Files.size(path));
     }
 
     record RuntimeExport(String name, String sdk, List<String> artPathWarnings, RuntimeAssets assets, List<?> files) {}
 
-    static RuntimeExport prepareRuntime(CModelingDocument doc, Path workspace, Map<String,Object> request) throws Exception {
+    record RuntimeCheck(String name, String sdk, String revision, Set<String> parameters, Set<String> parts,
+                        List<String> blockers, List<String> warnings) {}
+
+    static RuntimeCheck runtimeCheck(CModelingDocument doc, Map<String,Object> request, boolean preflight) {
+        checkRevision(doc, request);
         String name = request.get("name") == null ? doc.getModelSource().getName() : nonblank(request.get("name"), "name");
-        if (name.isBlank() || name.matches(".*[\\\\/:*?\"<>|].*") || name.endsWith(".") || name.endsWith(" "))
+        if (!preflight && (name.isBlank() || name.matches(".*[\\\\/:*?\"<>|].*") || name.endsWith(".") || name.endsWith(" ")))
             throw new IllegalArgumentException("Export name must be a valid file basename");
         var source = doc.getModelSource();
         String sdk = targetVersion(request);
         var blockers = runtimeBlockers(source, sdk);
         var artPathWarnings = omittedArtPaths(source);
-        if ("export_runtime_package".equals(request.get("operation"))) blockers.addAll(artPathWarnings);
-        if (!blockers.isEmpty()) throw new IllegalArgumentException("Runtime preflight failed: " + blockers);
-        var diagnostics = new ArrayList<Map<String,Object>>();
-        var assets = runtimeAssets(source, workspace, request, diagnostics);
-        if (!diagnostics.isEmpty()) throw new IllegalArgumentException("Runtime attachment preflight failed: " + diagnostics);
+        if (preflight || "export_runtime_package".equals(request.get("operation"))) blockers.addAll(artPathWarnings);
+        if (!preflight && !blockers.isEmpty()) throw new IllegalArgumentException("Runtime preflight failed: " + blockers);
+        var parts = new HashSet<String>();
+        for (var part : source.getAllParts()) parts.add(part.getId().toString());
+        return new RuntimeCheck(name, sdk, revision(doc), parameterIds(source), Set.copyOf(parts),
+            List.copyOf(blockers), List.copyOf(artPathWarnings));
+    }
+
+    static RuntimeExport prepareRuntime(CModelingDocument doc, RuntimeCheck check, RuntimeAssets assets) throws Exception {
+        if (!check.revision.equals(revision(doc))) throw new IllegalArgumentException("Document revision changed; inspect the document before retrying");
+        var source = doc.getModelSource();
+        String name = check.name;
+        String sdk = check.sdk;
         var options = new CModelExportSettingDialogData();
         options.setVersion("5.3".equals(sdk) ? CModelExportSettingDialogData.FormatVersion.VERSION_53 : CModelExportSettingDialogData.FormatVersion.VERSION_50);
         var exporter = new com.live2d.cubism.doc.model.exporter.w();
         exporter.a(options.toMocSetting());
         var context = new com.live2d.core.a();
         var exportSource = context.a(() -> source.deepCopy(context));
-        exportSource.setup();
-        rebuildAtlasInputs(exportSource);
-        exportSource.getTextureManager().changeModelTextureInput_toAtlas();
-        var result = exporter.a(exportSource, null);
-        if (result.b().isEmpty())
-            throw new IOException("Cubism produced no atlas textures for " + exportSource.getAllArtMeshes().stream()
-                .map(mesh -> mesh.getId() + ":" + (mesh.getTextureInputExtension().getTextureAtlasInput() != null)).toList());
-        var companion = com.live2d.cubism.doc.model.exporter.b.a;
-        var exportVariant = Class.forName("com.live2d.cubism.doc.model.exporter.b$b");
-        var standardField = exportVariant.getDeclaredField("a");
-        standardField.setAccessible(true);
-        var standard = standardField.get(null);
-        var packageFiles = companion.getClass().getDeclaredMethod("a", String.class, CModelSource.class, dD.class,
-            CModelJsonFormat.class, int.class, boolean.class, boolean.class, boolean.class, boolean.class,
-            boolean.class, boolean.class, boolean.class, exportVariant);
-        packageFiles.setAccessible(true);
-        var files = (List<?>) packageFiles.invoke(companion, name, source, result, options.getVersion().b(),
-            options.getExportTextureScale(), assets.physics == null, true, false, true, true, false, true, standard);
-        return new RuntimeExport(name, sdk, artPathWarnings, assets, files);
+        try {
+            exportSource.setup();
+            rebuildAtlasInputs(exportSource);
+            exportSource.getTextureManager().changeModelTextureInput_toAtlas();
+            var result = exporter.a(exportSource, null);
+            if (result.b().isEmpty())
+                throw new IOException("Cubism produced no atlas textures for " + exportSource.getAllArtMeshes().stream()
+                    .map(mesh -> mesh.getId() + ":" + (mesh.getTextureInputExtension().getTextureAtlasInput() != null)).toList());
+            var companion = com.live2d.cubism.doc.model.exporter.b.a;
+            var exportVariant = Class.forName("com.live2d.cubism.doc.model.exporter.b$b");
+            var standardField = exportVariant.getDeclaredField("a");
+            standardField.setAccessible(true);
+            var standard = standardField.get(null);
+            var packageFiles = companion.getClass().getDeclaredMethod("a", String.class, CModelSource.class, dD.class,
+                CModelJsonFormat.class, int.class, boolean.class, boolean.class, boolean.class, boolean.class,
+                boolean.class, boolean.class, boolean.class, exportVariant);
+            packageFiles.setAccessible(true);
+            var files = (List<?>) packageFiles.invoke(companion, name, source, result, options.getVersion().b(),
+                options.getExportTextureScale(), assets.physics == null, true, false, true, true, false, true, standard);
+            return new RuntimeExport(name, sdk, check.warnings, assets, List.copyOf(files));
+        } finally { exportSource.dispose(); }
     }
 
     static Object writeRuntime(RuntimeExport export, Path destination, long deadline) throws Exception {
@@ -652,21 +767,20 @@ final class NativeBridgeAssets {
         return sdk;
     }
 
-    static Object preflightRuntime(CModelingDocument doc, Path workspace, Map<String,Object> request) {
-        String sdk = targetVersion(request);
-        var blockers = runtimeBlockers(doc.getModelSource(), sdk);
-        blockers.addAll(omittedArtPaths(doc.getModelSource()));
-        var diagnostics = new ArrayList<Map<String,Object>>();
-        var assets = runtimeAssets(doc.getModelSource(), workspace, request, diagnostics);
+    static Object preflightRuntime(RuntimeCheck check, RuntimeAssets assets, List<Map<String,Object>> diagnostics) {
+        var blockers = new ArrayList<>(check.blockers);
         for (var diagnostic : diagnostics) blockers.add((String) diagnostic.get("message"));
-        return map("sdk_version", sdk, "ready", blockers.isEmpty(), "blockers", blockers,
+        return map("sdk_version", check.sdk, "ready", blockers.isEmpty(), "blockers", blockers,
             "attachments", List.copyOf(assets.files.keySet()), "diagnostics", diagnostics);
     }
 
-    static Object exportExpression(CModelingDocument doc, Path workspace, Map<String,Object> request) throws IOException {
-        var path = output(workspace, request.get("path"), ".exp3.json");
+    static Set<String> parameterIds(CModelSource source) {
         var parameters = new HashSet<String>();
-        for (var parameter : doc.getModelSource().getAllParameters()) parameters.add(parameter.getId().toString());
+        for (var parameter : source.getAllParameters()) parameters.add(parameter.getId().toString());
+        return Set.copyOf(parameters);
+    }
+
+    static Object exportExpression(Set<String> parameters, Path path, Map<String,Object> request) throws IOException {
         var values = new ArrayList<Object>();
         for (Object value : (List<?>) request.get("parameters")) {
             var row = (Map<?,?>) value;
@@ -741,9 +855,13 @@ final class NativeBridgeAssets {
         return blockers;
     }
 
-    static Object preflightPhysics(CModelSource source, Path path, boolean replace) throws IOException {
+    record PhysicsPreflightInput(Path path, Object parsed) {}
+
+    static Object preflightPhysics(CModelSource source, PhysicsPreflightInput input, boolean replace) {
         var blockers = new ArrayList<Object>();
-        var data = readAttachment(path).data;
+        Path path = input.path;
+        if (!(input.parsed instanceof Map<?,?> data))
+            throw new NativeBridgeSdk.InvalidAttachment(path, "$", "Invalid JSON attachment");
         var parameters = new HashSet<String>();
         for (var parameter : source.getAllParameters()) parameters.add(parameter.getId().toString());
         try { new NativeBridgeSdk(path, parameters, Set.of()).physics(data); }
@@ -776,26 +894,26 @@ final class NativeBridgeAssets {
                     && ref.get("Id") instanceof String id && !known.contains(id)) missing.add(id);
     }
 
-    private record RuntimeAssets(Map<String,byte[]> files, Map<String,List<Object>> motions, List<Object> expressions, String physics) {}
+    record RuntimeAssets(Map<String,byte[]> files, Map<String,List<Object>> motions, List<Object> expressions, String physics) {}
 
-    private static RuntimeAssets runtimeAssets(CModelSource source, Path workspace, Map<String,Object> request,
-                                               List<Map<String,Object>> diagnostics) {
+    static RuntimeAssets runtimeAssets(RuntimeCheck check, Path workspace, Map<String,Object> request,
+                                       List<Map<String,Object>> diagnostics) {
         var files = new LinkedHashMap<String,byte[]>();
         var motions = new LinkedHashMap<String,List<Object>>();
         var expressions = new ArrayList<Object>();
         var names = new HashSet<String>();
-        var parameters = new HashSet<String>();
-        var parts = new HashSet<String>();
-        for (var parameter : source.getAllParameters()) parameters.add(parameter.getId().toString());
-        for (var part : source.getAllParts()) parts.add(part.getId().toString());
+        var fileNames = new TreeMap<String,String>(String.CASE_INSENSITIVE_ORDER);
+        var snapshots = new HashMap<Path,Attachment>();
+        var parameters = check.parameters;
+        var parts = check.parts;
         for (var value : (List<?>) request.getOrDefault("motions", List.of())) {
             var row = (Map<?,?>) value;
             try {
                 String group = nonblank(row.get("group"), "motion group");
                 var path = input(workspace, row.get("path"), ".motion3.json");
-                var asset = readAttachment(path);
+                var asset = readAttachment(snapshots, path);
                 new NativeBridgeSdk(path, parameters, parts).motion(asset.data);
-                String file = addAttachment(files, "motions", path, asset.bytes);
+                String file = addAttachment(files, fileNames, "motions", path, asset.bytes);
                 motions.computeIfAbsent(group, ignored -> new ArrayList<>()).add(map("File", file));
             } catch (IOException | IllegalArgumentException error) {
                 diagnostics.add(attachmentError(row.get("path"), error));
@@ -807,9 +925,9 @@ final class NativeBridgeAssets {
                 String name = nonblank(row.get("name"), "expression name");
                 if (!names.add(name.toLowerCase(Locale.ROOT))) throw new IllegalArgumentException("Duplicate expression name: " + name);
                 var path = input(workspace, row.get("path"), ".exp3.json");
-                var asset = readAttachment(path);
+                var asset = readAttachment(snapshots, path);
                 new NativeBridgeSdk(path, parameters, parts).expression(asset.data);
-                expressions.add(map("Name", name, "File", addAttachment(files, "expressions", path, asset.bytes)));
+                expressions.add(map("Name", name, "File", addAttachment(files, fileNames, "expressions", path, asset.bytes)));
             } catch (IOException | IllegalArgumentException error) {
                 diagnostics.add(attachmentError(row.get("path"), error));
             }
@@ -818,9 +936,9 @@ final class NativeBridgeAssets {
         if (request.get("physics_path") != null) {
             try {
                 var path = input(workspace, request.get("physics_path"), ".physics3.json");
-                var asset = readAttachment(path);
+                var asset = readAttachment(snapshots, path);
                 new NativeBridgeSdk(path, parameters, parts).physics(asset.data);
-                physics = addAttachment(files, "physics", path, asset.bytes);
+                physics = addAttachment(files, fileNames, "physics", path, asset.bytes);
             } catch (IOException | IllegalArgumentException error) {
                 diagnostics.add(attachmentError(request.get("physics_path"), error));
             }
@@ -835,20 +953,23 @@ final class NativeBridgeAssets {
 
     private record Attachment(byte[] bytes, Map<?,?> data) {}
 
-    private static Attachment readAttachment(Path path) throws IOException {
+    private static Attachment readAttachment(Map<Path,Attachment> snapshots, Path path) throws IOException {
+        var cached = snapshots.get(path);
+        if (cached != null) return cached;
         byte[] bytes = Files.readAllBytes(path);
         if (!(org.json.simple.JSONValue.parse(new String(bytes, StandardCharsets.UTF_8)) instanceof Map<?,?> data))
             throw new NativeBridgeSdk.InvalidAttachment(path, "$", "Invalid JSON attachment");
-        return new Attachment(bytes, data);
+        var attachment = new Attachment(bytes, data);
+        snapshots.put(path, attachment);
+        return attachment;
     }
 
-    private static String addAttachment(Map<String,byte[]> files, String folder, Path path, byte[] bytes) {
+    private static String addAttachment(Map<String,byte[]> files, Map<String,String> names, String folder, Path path, byte[] bytes) {
         String file = folder + "/" + path.getFileName();
-        for (var existing : files.keySet()) {
-            if (existing.equalsIgnoreCase(file)) {
-                if (existing.equals(file) && Arrays.equals(files.get(existing), bytes)) return file;
-                throw new IllegalArgumentException("Attachment file name conflict: " + file);
-            }
+        var existing = names.putIfAbsent(file, file);
+        if (existing != null) {
+            if (existing.equals(file) && Arrays.equals(files.get(existing), bytes)) return file;
+            throw new IllegalArgumentException("Attachment file name conflict: " + file);
         }
         files.put(file, bytes);
         return file;
@@ -1080,18 +1201,35 @@ final class NativeBridgeAssets {
     private static List<Object> atlasConflicts(CTextureAtlas page, List<AtlasRectangle> placements, int width, int height) {
         var conflicts = new ArrayList<Object>();
         String pageGuid = page.getGuid().getUuidString();
+        var sweep = new ArrayList<Integer>();
+        for (int i = 0; i < placements.size(); i++) if (!placements.get(i).bound.isEmpty()) sweep.add(i);
+        sweep.sort(Comparator.comparingDouble(i -> placements.get(i).bound.getMinX()));
+        var byEnd = new PriorityQueue<Integer>(Comparator.comparingDouble(i -> placements.get(i).bound.getMaxX()));
+        var active = new LinkedHashSet<Integer>();
+        var overlaps = new HashMap<Integer,List<Integer>>();
+        for (int i : sweep) {
+            var bounds = placements.get(i).bound;
+            while (!byEnd.isEmpty() && placements.get(byEnd.peek()).bound.getMaxX() <= bounds.getMinX())
+                active.remove(byEnd.remove());
+            for (int j : active) {
+                if (bounds.intersects(placements.get(j).bound))
+                    overlaps.computeIfAbsent(Math.max(i, j), key -> new ArrayList<>()).add(Math.min(i, j));
+            }
+            active.add(i);
+            byEnd.add(i);
+        }
         for (int i = 0; i < placements.size(); i++) {
             var placement = placements.get(i);
             var bound = placement.bound;
             if (bound.getMinX() < -0.01 || bound.getMinY() < -0.01
                     || bound.getMaxX() > width + 0.01 || bound.getMaxY() > height + 0.01)
                 conflicts.add(map("kind", "outside", "page_guid", pageGuid, "material_guid", placement.guid));
-            for (int j = 0; j < i; j++) {
-                var other = placements.get(j);
-                if (bound.intersects(other.bound))
-                    conflicts.add(map("kind", "overlap", "page_guid", pageGuid, "material_guid", placement.guid,
-                        "other_material_guid", other.guid));
-            }
+            var neighbors = overlaps.get(i);
+            if (neighbors == null) continue;
+            neighbors.sort(Integer::compareTo);
+            for (int j : neighbors)
+                conflicts.add(map("kind", "overlap", "page_guid", pageGuid, "material_guid", placement.guid,
+                    "other_material_guid", placements.get(j).guid));
         }
         return conflicts;
     }

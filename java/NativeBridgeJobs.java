@@ -2,9 +2,6 @@ package cubism53.mcp;
 
 import java.io.IOException;
 import java.math.BigDecimal;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import org.json.simple.JSONValue;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.Callable;
@@ -80,31 +77,28 @@ final class NativeBridgeJobs {
         }
     }
 
+    record TraceResult(Map<String,Object> metadata, NativeBridgeTrace trace) {}
+
     private static final class Job {
         final String id = UUID.randomUUID().toString();
         final String requestId;
         final String operation;
         final String arguments;
         volatile Map<String,Object> status;
-        TraceFile trace;
+        NativeBridgeTrace trace;
 
-        Job(String requestId, String operation, Map<String,Object> arguments) {
+        Job(String requestId, String operation, Map<String,Object> arguments, String fingerprint) {
             this.requestId = requestId;
             this.operation = operation;
-            this.arguments = fingerprint(arguments);
+            this.arguments = fingerprint;
             status = map("job_id", id, "request_id", requestId, "operation", operation,
                 "document_uid", arguments.get("document_uid"), "state", "queued", "result", null, "error", null);
         }
 
-        Object retainResult(Object result) throws IOException {
-            if (!(result instanceof Map<?,?> data) || !(data.get("frames") instanceof List<?> frames)
-                    || !"simulate_physics".equals(operation)) return result;
-            long outputCount = frames.isEmpty() ? 0 : ((Map<?,?>) ((Map<?,?>) frames.get(0)).get("outputs")).size();
-            if ((long) frames.size() * (outputCount + 1) < 16000) return result;
-            trace = TraceFile.store(frames);
-            var metadata = new LinkedHashMap<>(data);
-            metadata.remove("frames");
-            return metadata;
+        Object retainResult(Object result) {
+            if (!(result instanceof TraceResult completed)) return result;
+            trace = completed.trace;
+            return completed.metadata;
         }
 
         void update(String state, Object result, String error) {
@@ -113,40 +107,45 @@ final class NativeBridgeJobs {
         }
     }
 
-    static synchronized Object submit(String operation, Map<String,Object> request, Callable<Object> work) {
+    static Object submit(String operation, Map<String,Object> request, Callable<Object> work) {
         return submit(operation, request, false, work);
     }
 
-    static synchronized Object submit(String operation, Map<String,Object> request, boolean background, Callable<Object> work) {
-        prune();
+    static Object submit(String operation, Map<String,Object> request, boolean background, Callable<Object> work) {
         String requestId = NativeBridge.nonblank(request.get("request_id"), "request_id");
         var arguments = new HashMap<>(request);
         arguments.remove("token");
-        var existing = requests.get(requestId);
-        if (existing != null) {
-            if (!existing.arguments.equals(fingerprint(arguments)))
-                throw new IllegalArgumentException("request_id already belongs to a different request");
-            try {
-                return report(existing, Map.of());
-            } catch (IOException error) {
-                throw new IllegalStateException("Could not read the completed job result", error);
+        var fingerprint = fingerprint(arguments);
+        JobReport replay;
+        synchronized (NativeBridgeJobs.class) {
+            prune();
+            var existing = requests.get(requestId);
+            if (existing == null) {
+                checkExpired(null, requestId);
+                var job = new Job(requestId, operation, arguments, fingerprint);
+                beginWork();
+                track(job.id);
+                jobs.put(job.id, job);
+                requests.put(requestId, job);
+                Runnable run = () -> {
+                    job.update("running", null, null);
+                    try { job.update("succeeded", job.retainResult(work.call()), null); }
+                    catch (Exception | Error error) { job.update("failed", null, error.toString()); }
+                    finally { complete(job); }
+                };
+                if (background) workers.execute(run);
+                else SwingUtilities.invokeLater(run);
+                return job.status;
             }
+            if (!existing.arguments.equals(fingerprint))
+                throw new IllegalArgumentException("request_id already belongs to a different request");
+            replay = snapshot(existing);
         }
-        checkExpired(null, requestId);
-        var job = new Job(requestId, operation, arguments);
-        beginWork();
-        track(job.id);
-        jobs.put(job.id, job);
-        requests.put(requestId, job);
-        Runnable run = () -> {
-            job.update("running", null, null);
-            try { job.update("succeeded", job.retainResult(work.call()), null); }
-            catch (Exception | Error error) { job.update("failed", null, error.toString()); }
-            finally { complete(job); }
-        };
-        if (background) workers.execute(run);
-        else SwingUtilities.invokeLater(run);
-        return job.status;
+        try (replay) {
+            return report(replay, Map.of());
+        } catch (IOException error) {
+            throw new IllegalStateException("Could not read the completed job result", error);
+        }
     }
 
     static synchronized void beginWork() {
@@ -193,7 +192,7 @@ final class NativeBridgeJobs {
         for (var key : history.prune()) {
             times.remove(key.id);
             var removed = jobs.remove(key.id);
-            if (removed != null && removed.trace != null) removed.trace.delete();
+            if (removed != null && removed.trace != null) removed.trace.close();
             if (key.requestId != null) requests.remove(key.requestId);
             if (meshes.remove(key.id) != null) latestMesh.values().remove(key.id);
         }
@@ -209,21 +208,32 @@ final class NativeBridgeJobs {
         String requestId = (String) request.get("request_id");
         if ((jobId == null) == (requestId == null))
             throw new IllegalArgumentException("Provide exactly one of job_id and request_id");
-        Job job;
+        JobReport snapshot;
         synchronized (NativeBridgeJobs.class) {
             prune();
-            job = jobId == null ? requests.get(requestId) : jobs.get(jobId);
+            var job = jobId == null ? requests.get(requestId) : jobs.get(jobId);
             if (job == null) {
                 var mesh = meshes.get(jobId);
                 if (mesh != null) return mesh.get();
                 checkExpired(jobId, requestId);
                 throw new IllegalArgumentException("Job not found in this bridge session");
             }
+            snapshot = snapshot(job);
         }
-        return report(job, request);
+        try (snapshot) { return report(snapshot, request); }
     }
 
-    private static Map<String,Object> report(Job job, Map<String,Object> request) throws IOException {
+    private record JobReport(Map<String,Object> status, NativeBridgeTrace.ReadLease trace, int count) implements AutoCloseable {
+        @Override public void close() { if (trace != null) trace.close(); }
+    }
+
+    private static JobReport snapshot(Job job) {
+        var status = job.status;
+        var trace = "succeeded".equals(status.get("state")) ? job.trace : null;
+        return new JobReport(status, trace == null ? null : trace.acquire(), trace == null ? 0 : trace.count);
+    }
+
+    private static Map<String,Object> report(JobReport job, Map<String,Object> request) throws IOException {
         var status = job.status;
         if (!"succeeded".equals(status.get("state"))) return status;
         boolean page = request.containsKey("frame_offset") || request.get("frame_limit") != null;
@@ -231,7 +241,7 @@ final class NativeBridgeJobs {
         if (!(status.get("result") instanceof Map<?,?> result)) return status;
         var frames = result.get("frames") instanceof List<?> list ? list : null;
         if (frames == null && job.trace == null) return status;
-        int total = job.trace == null ? frames.size() : job.trace.count;
+        int total = job.trace == null ? frames.size() : job.count;
         int offset = NativeBridge.integer(request, "frame_offset", 0);
         int limit = NativeBridge.integer(request, "frame_limit", Integer.MAX_VALUE);
         if (offset < 0 || limit < 1) throw new IllegalArgumentException("Invalid physics frame page");
@@ -246,37 +256,6 @@ final class NativeBridgeJobs {
         var reply = new LinkedHashMap<>(status);
         reply.put("result", data);
         return reply;
-    }
-
-    private record TraceFile(Path path, int count) {
-        static TraceFile store(List<?> frames) throws IOException {
-            Path path = Files.createTempFile("cubism-job-trace-", ".jsonl");
-            boolean finished = false;
-            try {
-                try (var writer = Files.newBufferedWriter(path)) {
-                    for (Object frame : frames) {
-                        writer.write(JSONValue.toJSONString(frame));
-                        writer.newLine();
-                    }
-                }
-                path.toFile().deleteOnExit();
-                finished = true;
-                return new TraceFile(path, frames.size());
-            } finally {
-                if (!finished) Files.deleteIfExists(path);
-            }
-        }
-
-        synchronized List<Object> read(int start, int end) throws IOException {
-            try (var lines = Files.lines(path)) {
-                return lines.skip(start).limit(end - start).map(JSONValue::parse).toList();
-            }
-        }
-
-        synchronized void delete() {
-            try { Files.deleteIfExists(path); }
-            catch (IOException error) { System.err.println("Cubism job trace cleanup: " + error); }
-        }
     }
 
     static synchronized Object list(Map<String,Object> request) {
@@ -325,17 +304,12 @@ final class NativeBridgeJobs {
 
     static synchronized void stopped() {
         workers.shutdown();
-        for (var job : jobs.values()) if (job.trace != null) job.trace.delete();
+        for (var job : jobs.values()) if (job.trace != null) job.trace.close();
     }
 
     private static String fingerprint(Map<String,Object> arguments) {
-        String text = org.json.simple.JSONValue.toJSONString(normalize(arguments));
-        try {
-            var hash = java.security.MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(hash.digest(text.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-        } catch (java.security.NoSuchAlgorithmException impossible) {
-            throw new IllegalStateException(impossible);
-        }
+        try { return NativeBridge.digestJson(normalize(arguments)); }
+        catch (IOException impossible) { throw new IllegalStateException(impossible); }
     }
 
     private static Object normalize(Object value) {

@@ -213,19 +213,24 @@ final class NativeBridgeAuthoring {
         var localEdits = new LinkedHashMap<CArtPathPointGuid,GVector2>();
         var oldPositions = new LinkedHashMap<CArtPathPointGuid,GVector2>();
         var bindingEdits = new LinkedHashMap<CArtPathPointGuid,CArtPathPointToArtMeshExtension_BindingData>();
-        var model = source.createModelInstance(RenderType.NORMAL);
+        var points = (List<?>) request.get("points");
+        var bindings = (List<?>) request.get("bindings");
+        boolean needsModel = !points.isEmpty() || bindings.stream().anyMatch(row -> ((Map<?,?>) row).get("mesh_guid") != null);
+        var model = needsModel ? source.createModelInstance(RenderType.NORMAL) : null;
         try {
-            model.getParameterSet().setDefaultValues();
-            var keyPoses = formKeys(path, form);
-            if (!keyPoses.isEmpty()) {
-                for (var key : ((Map<?,?>) keyPoses.get(0)).entrySet()) {
-                    var parameter = findParameter(source, (String) key.getKey());
-                    model.getParameterSet().get(parameter.getGuid()).setValue(finite(key.getValue(), "keyform value"));
+            if (model != null) {
+                model.getParameterSet().setDefaultValues();
+                var keyPoses = formKeys(path, form);
+                if (!keyPoses.isEmpty()) {
+                    for (var key : ((Map<?,?>) keyPoses.get(0)).entrySet()) {
+                        var parameter = findParameter(source, (String) key.getKey());
+                        model.getParameterSet().get(parameter.getGuid()).setValue(finite(key.getValue(), "keyform value"));
+                    }
                 }
+                evaluateDetached(model);
             }
-            evaluateDetached(model);
-            var transform = model.getDeformerTransform(path.getTargetDeformerGuid());
-            for (Object value : (List<?>) request.get("points")) {
+            var transform = model == null ? null : model.getDeformerTransform(path.getTargetDeformerGuid());
+            for (Object value : points) {
                 var row = (Map<?,?>) value;
                 var point = pathPoint(available, row);
                 var id = point.getCtrlPtId();
@@ -238,7 +243,7 @@ final class NativeBridgeAuthoring {
                 var old = point.getCurvePointPosition().getPoint();
                 oldPositions.put(id, new GVector2(old.getX(), old.getY()));
             }
-            for (Object value : (List<?>) request.get("bindings")) {
+            for (Object value : bindings) {
                 var row = (Map<?,?>) value;
                 var point = pathPoint(available, row);
                 var id = point.getCtrlPtId();
@@ -258,7 +263,7 @@ final class NativeBridgeAuthoring {
                 bindingEdits.put(id, new CArtPathPointToArtMeshExtension_BindingData(mesh.getGuid(), triangle));
             }
         } finally {
-            model.disposeAll();
+            if (model != null) model.disposeAll();
         }
         for (var point : canvasEdits.keySet())
             if (oldBindings.containsKey(point) && !bindingEdits.containsKey(point))
@@ -365,11 +370,13 @@ final class NativeBridgeAuthoring {
         var colors = new CArrayList<CFloatColor>();
         var opacities = new CArrayList<Float>();
         var corners = new CArrayList<Boolean>();
-        CModel model = source.createModelInstance(RenderType.NORMAL);
+        CModel model = target instanceof ACDeformerSource ? source.createModelInstance(RenderType.NORMAL) : null;
         try {
-            model.getParameterSet().setDefaultValues();
-            evaluateDetached(model);
-            var transform = target instanceof ACDeformerSource deformer ? model.getDeformerTransform(deformer.getGuid()) : null;
+            if (model != null) {
+                model.getParameterSet().setDefaultValues();
+                evaluateDetached(model);
+            }
+            var transform = model == null ? null : model.getDeformerTransform(((ACDeformerSource) target).getGuid());
             for (Object value : rows) {
                 var row = (Map<?,?>) value;
                 var point = new GVector2(finite(row.get("x"), "x"), finite(row.get("y"), "y"));
@@ -384,7 +391,7 @@ final class NativeBridgeAuthoring {
                 colors.add(new CFloatColor(0, 0, 0, 1));
                 corners.add(Boolean.TRUE.equals(row.get("corner")));
             }
-        } finally { model.disposeAll(); }
+        } finally { if (model != null) model.disposeAll(); }
         var undo = new GroupUndo("Native bridge: create ArtPath");
         CArtPathSource path;
         try {
@@ -424,15 +431,13 @@ final class NativeBridgeAuthoring {
         boolean cascade = Boolean.TRUE.equals(request.get("cascade"));
         boolean detach = Boolean.TRUE.equals(request.get("detach_references"));
         var closure = new LinkedHashSet<>(selected);
-        boolean changed;
-        do {
-            changed = false;
-            for (var item : all) {
-                if (item instanceof ACAffecterSource) continue;
-                if (!closure.contains(item) && (includes(item.getAllParents(), closure)
-                        || includes(item.getAllParentDeformers(), closure))) changed |= closure.add(item);
-            }
-        } while (changed);
+        expandInScanOrder(closure, all, item -> {
+            if (item instanceof ACAffecterSource) return List.of();
+            var ancestors = new ArrayList<ACParameterControllableSource>();
+            item.getAllParents().forEach(ancestors::add);
+            item.getAllParentDeformers().forEach(ancestors::add);
+            return ancestors;
+        });
         var descendants = closure.stream().filter(item -> !selected.contains(item)).toList();
         var blockers = new ArrayList<Map<String,Object>>();
         if (cascade) selected.addAll(descendants);
@@ -516,9 +521,4 @@ final class NativeBridgeAuthoring {
         return result;
     }
 
-    private static boolean includes(Iterable<? extends ACParameterControllableSource> items,
-                                    Set<ACParameterControllableSource> selected) {
-        for (var item : items) if (selected.contains(item)) return true;
-        return false;
-    }
 }

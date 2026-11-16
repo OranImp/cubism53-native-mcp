@@ -1,6 +1,6 @@
 package cubism53.mcp;
 
-import java.util.Map;
+import java.util.*;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -11,6 +11,43 @@ public final class NativeJobsCheck {
     private static Map<?,?> submit(String id, Number value) {
         return (Map<?,?>) NativeBridgeJobs.submit("render_pose_set",
             Map.of("request_id", id, "value", value), () -> Map.of("success", true));
+    }
+
+    private static void checkTraceAndTraversal() throws Exception {
+        try (var spool = new NativeBridgeTrace.Spool()) {
+            for (int i = 0; i < 300; i++) spool.append(NativeBridge.map("frame", i, "outputs", Map.of("\u6d4b", 0.125)));
+            var trace = spool.finish();
+            try (var reader = trace.acquire()) {
+                trace.close();
+                var page = reader.read(127, 130);
+                if (!page.equals(List.of(
+                        Map.of("frame", 127L, "outputs", Map.of("\u6d4b", 0.125)),
+                        Map.of("frame", 128L, "outputs", Map.of("\u6d4b", 0.125)),
+                        Map.of("frame", 129L, "outputs", Map.of("\u6d4b", 0.125)))))
+                    throw new AssertionError("Trace lost a frame at the UTF-8 checkpoint boundary: " + page);
+                if (!reader.read(300, 300).isEmpty()) throw new AssertionError("End page must be empty");
+            }
+        }
+        var random = new Random(318L);
+        for (int trial = 0; trial < 100; trial++) {
+            var order = new ArrayList<Integer>();
+            var parents = new HashMap<Integer,List<Integer>>();
+            for (int node = 0; node < 96; node++) {
+                order.add(node);
+                parents.put(node, List.of(random.nextInt(96), random.nextInt(96)));
+            }
+            Collections.shuffle(order, random);
+            var original = new LinkedHashSet<>(List.of(0, 12, 23));
+            var indexed = new LinkedHashSet<>(original);
+            int size;
+            do {
+                size = original.size();
+                for (var node : order) if (parents.get(node).stream().anyMatch(original::contains)) original.add(node);
+            } while (size != original.size());
+            NativeBridge.expandInScanOrder(indexed, order, parents::get);
+            if (!List.copyOf(original).equals(List.copyOf(indexed)))
+                throw new AssertionError("Indexed traversal changed discovery order");
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -83,6 +120,7 @@ public final class NativeJobsCheck {
                 if (!expected.getMessage().contains("Insufficient editor heap")) throw expected;
             }
         }
-        System.out.println("Native job capacity, replay, polling, drain, expiry and render admission verified");
+        checkTraceAndTraversal();
+        System.out.println("Native job capacity, replay, polling, indexed trace, ordered traversal, expiry and render admission verified");
     }
 }

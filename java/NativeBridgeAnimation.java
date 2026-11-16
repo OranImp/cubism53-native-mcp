@@ -49,7 +49,17 @@ final class NativeBridgeAnimation {
 
     static CSceneDocument find(CEAppCtrl app, String uid) {
         if (uid == null) return null;
-        return scenes(app).stream().filter(scene -> uid.equals(scene.getDocumentUID())).findFirst().orElse(null);
+        for (var doc : app.getAllDocs()) {
+            if (doc instanceof CSceneDocument scene)
+                for (var candidate : scene.getAnimationContent().getSceneDocs())
+                    if (uid.equals(candidate.getDocumentUID())) return candidate;
+        }
+        for (var entry : app.getCurrentProject().getChildren()) {
+            if (entry instanceof CAnimationFileContent file)
+                for (var candidate : file.getSceneDocs())
+                    if (uid.equals(candidate.getDocumentUID())) return candidate;
+        }
+        return null;
     }
 
     static Map<String,Object> describe(CSceneDocument doc) {
@@ -118,7 +128,6 @@ final class NativeBridgeAnimation {
             case "edit_animation_events": return editEvents(doc, request);
             case "batch_edit_timeline": return batchCurves(doc, request);
             case "get_timeline_keys", "remove_timeline_keys", "sample_timeline_parameters": return curves(doc, op, request);
-            case "export_motion3": return exportMotion(doc, workspace, request);
             case "save_as_new": {
                 var path = NativeBridgeAssets.output(workspace, request.get("path"), ".can3");
                 Files.createDirectories(path.getParent());
@@ -175,7 +184,11 @@ final class NativeBridgeAnimation {
     private static int localFrame(CSceneDocument doc, CMvTrack_Live2DModel_Source track, int frame, boolean scene) {
         var movie = doc.getSceneSource().getMovieInfo();
         if (!scene) {
-            if (frame < 0 || frame >= movie.getDuration()) throw new IllegalArgumentException("Frame is outside the scene");
+            long sceneFrame = frame + frameOffset(track);
+            boolean visible = sceneFrame >= Math.max(movie.getStartFrame(), track.getStart())
+                && sceneFrame < Math.min((long) movie.getStartFrame() + movie.getDuration(), (long) track.getStart() + track.getDuration());
+            if (!visible && (frame < 0 || frame >= movie.getDuration()))
+                throw new IllegalArgumentException("Frame is outside the scene");
             return frame;
         }
         if (frame < movie.getStartFrame() || frame >= (long) movie.getStartFrame() + movie.getDuration()
@@ -240,6 +253,8 @@ final class NativeBridgeAnimation {
 
     private static Object editEvents(CSceneDocument doc, Map<String,Object> request) {
         var track = track(doc, request.get("track_guid"));
+        if (((List<?>) request.get("events")).isEmpty() && ((List<?>) request.get("remove_frames")).isEmpty())
+            return eventInfo(track, track.getUserData());
         var before = new HashMap<>(track.getUserData());
         var after = new HashMap<>(before);
         var touched = new HashSet<Integer>();
@@ -260,7 +275,11 @@ final class NativeBridgeAnimation {
                 value -> { track.getUserData().clear(); track.getUserData().putAll(before); return kotlin.Unit.INSTANCE; }, null);
             finishTrackEdit(doc, undo);
         }
-        return map("track_guid", track.getGuid().getUuidString(), "events", after.entrySet().stream()
+        return eventInfo(track, after);
+    }
+
+    private static Object eventInfo(CMvTrack_Live2DModel_Source track, Map<Integer,String> events) {
+        return map("track_guid", track.getGuid().getUuidString(), "events", events.entrySet().stream()
             .sorted(Map.Entry.comparingByKey()).map(entry -> map("frame", displayFrame(track, entry.getKey(), true), "text", entry.getValue())).toList());
     }
 
@@ -324,20 +343,27 @@ final class NativeBridgeAnimation {
         return (int) Math.round(seconds * 1000);
     }
 
-    private static CMutableSequence curve(CMvTrack_Live2DModel_Source track, String id) {
-        var parameter = track.getParameterSourceSet().getSources().stream()
+    private static com.live2d.cubism.doc.model.param.CParameterSource trackParameter(CMvTrack_Live2DModel_Source track, String id) {
+        var sources = track.getParameterSourceSet();
+        var parameter = sources.getIdMap().get(new com.live2d.cubism.doc.model.id.CParameterId(id));
+        if (parameter != null && id.equals(parameter.getId().toString())) return parameter;
+        return sources.getSources().stream()
             .filter(candidate -> id.equals(candidate.getId().toString())).findFirst()
             .orElseThrow(() -> new IllegalArgumentException("Parameter is absent from the linked model: " + id));
+    }
+
+    private static CMutableSequence curve(CMvTrack_Live2DModel_Source track,
+                                          com.live2d.cubism.doc.model.param.CParameterSource parameter) {
         var attr = track.getKeyParam().getAttrByParamId(parameter);
         if (attr == null || !(attr.getValueData() instanceof CMutableSequence sequence))
-            throw new IllegalStateException("Linked parameter has no editable native curve: " + id);
+            throw new IllegalStateException("Linked parameter has no editable native curve: " + parameter.getId());
         return sequence;
     }
 
     private static Object curves(CSceneDocument doc, String operation, Map<String,Object> request) {
         var track = track(doc, request.get("track_guid"));
         String id = nonblank(request.get("parameter_id"), "parameter_id");
-        var sequence = curve(track, id);
+        var sequence = curve(track, trackParameter(track, id));
         var response = map("document_uid", doc.getDocumentUID(), "track_guid", track.getGuid().getUuidString(), "parameter_id", id);
         boolean scene = "scene".equals(request.get("frame_space"));
         if ("get_timeline_keys".equals(operation)) {
@@ -351,17 +377,20 @@ final class NativeBridgeAnimation {
                 scene ? Math.max(start, sceneStart) : start, scene ? Math.min(end, sceneEnd - 1) : end));
             return response;
         }
+        boolean sample = "sample_timeline_parameters".equals(operation);
         var frames = new LinkedHashSet<Integer>();
         for (Object value : (List<?>) request.get("frames")) {
-            int frame = localFrame(doc, track, integer(value, "frame"), scene);
+            int requested = integer(value, "frame");
+            int frame = scene || sample ? localFrame(doc, track, requested, scene) : requested;
             if (!frames.add(frame)) throw new IllegalArgumentException("Frames must be distinct");
         }
         if (frames.isEmpty()) throw new IllegalArgumentException("Provide at least one frame");
-        if ("sample_timeline_parameters".equals(operation)) {
+        if (sample) {
             response.put("samples", frames.stream().map(frame -> map("frame", displayFrame(track, frame, scene), "value", sequence.getDoubleValue(frame))).toList());
             return response;
         }
-        var existing = Arrays.stream(sequence.getPoints()).map(point -> point.getPos()).toList();
+        var existing = new HashSet<Integer>();
+        for (var point : sequence.getPoints()) existing.add(point.getPos());
         if (!existing.containsAll(frames)) throw new IllegalArgumentException("One or more timeline keys are missing");
         editCurve(doc, track, sequence, "Remove timeline keys", () -> frames.forEach(sequence::removeDoubleValueAuto));
         response.put("keys", timelineKeys(sequence, track, scene, Long.MIN_VALUE, Long.MAX_VALUE));
@@ -384,19 +413,18 @@ final class NativeBridgeAnimation {
         var track = track(doc, request.get("track_guid"));
         String id = nonblank(request.get("parameter_id"), "parameter_id");
         boolean scene = "scene".equals(request.get("frame_space"));
-        var keys = parseKeys(doc, track, id, (List<?>) request.get("keys"), scene);
+        var parameter = trackParameter(track, id);
+        var keys = parseKeys(doc, track, parameter, (List<?>) request.get("keys"), scene);
         if (keys.isEmpty()) throw new IllegalArgumentException("At least one keyframe is required");
-        var sequence = curve(track, id);
+        var sequence = curve(track, parameter);
         editCurve(doc, track, sequence, "Set timeline keys", () -> applyKeys(sequence, keys.values()));
         return map("document_uid", doc.getDocumentUID(), "track_guid", track.getGuid().getUuidString(), "parameter_id", id,
             "keys", keys.values().stream().map(key -> map("frame", displayFrame(track, key.frame, scene), "value", sequence.getDoubleValue(key.frame),
                 "interpolation", key.type.name().toLowerCase(Locale.ROOT))).toList());
     }
 
-    private static Map<Integer,Key> parseKeys(CSceneDocument doc, CMvTrack_Live2DModel_Source track, String id, List<?> rows, boolean scene) {
-        var parameter = track.getParameterSourceSet().getSources().stream()
-            .filter(candidate -> id.equals(candidate.getId().toString())).findFirst()
-            .orElseThrow(() -> new IllegalArgumentException("Parameter is absent from the linked model: " + id));
+    private static Map<Integer,Key> parseKeys(CSceneDocument doc, CMvTrack_Live2DModel_Source track,
+                                              com.live2d.cubism.doc.model.param.CParameterSource parameter, List<?> rows, boolean scene) {
         var keys = new TreeMap<Integer,Key>();
         for (var value : rows) {
             var row = (Map<?,?>) value;
@@ -425,14 +453,20 @@ final class NativeBridgeAnimation {
         boolean scene = "scene".equals(request.get("frame_space"));
         var edits = new ArrayList<CurveEdit>();
         var seen = new HashSet<List<String>>();
+        var tracks = new HashMap<String,CMvTrack_Live2DModel_Source>();
+        for (var source : doc.getSceneSource().getAllTracks())
+            if (source instanceof CMvTrack_Live2DModel_Source track) tracks.putIfAbsent(track.getGuid().getUuidString(), track);
         for (Object value : (List<?>) request.get("edits")) {
             var row = (Map<?,?>) value;
-            var track = track(doc, row.get("track_guid"));
+            String guid = nonblank(row.get("track_guid"), "track_guid");
+            var track = tracks.get(guid);
+            if (track == null) throw new IllegalArgumentException("Model track not found: " + guid);
             String id = nonblank(row.get("parameter_id"), "parameter_id");
             if (!seen.add(List.of(track.getGuid().getUuidString(), id)))
                 throw new IllegalArgumentException("Only one edit per track and parameter is allowed");
-            var sequence = curve(track, id);
-            var keys = parseKeys(doc, track, id, (List<?>) row.get("keys"), scene);
+            var parameter = trackParameter(track, id);
+            var sequence = curve(track, parameter);
+            var keys = parseKeys(doc, track, parameter, (List<?>) row.get("keys"), scene);
             var existing = new HashSet<Integer>();
             for (var point : sequence.getPoints()) existing.add(point.getPos());
             var remove = new LinkedHashSet<Integer>();
@@ -497,13 +531,15 @@ final class NativeBridgeAnimation {
         if (!doc.getViewContexts().isEmpty()) doc.resetAllViewContext();
     }
 
-    private static Object exportMotion(CSceneDocument doc, Path workspace, Map<String,Object> request) throws Exception {
-        Path path = NativeBridgeAssets.output(workspace, request.get("path"), ".motion3.json");
+    static String prepareMotion(CSceneDocument doc, Map<String,Object> request) throws Exception {
         var track = track(doc, request.get("track_guid"));
         var exporter = new q();
         var exported = exporter.a(doc, track, true, 2, 2, 1, 1, 1, true, true, true);
         if (!(exported instanceof q.b.c result)) throw new IllegalStateException("Cubism could not export motion: " + exported);
-        var json = result.a();
+        return result.a();
+    }
+
+    static Object writeMotion(Path path, String json) throws java.io.IOException {
         if (!(org.json.simple.JSONValue.parse(json) instanceof Map<?,?> root))
             throw new IllegalStateException("Cubism produced invalid Motion3 JSON");
         NativeBridgeAssets.writeNew(path, json);

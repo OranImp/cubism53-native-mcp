@@ -26,6 +26,14 @@ public final class GlueSearchCheck {
             for (int j = 0; j < b.length; j++) b[j] = (random.nextFloat() - .5f) * 50;
             check(a, b, random.nextFloat() * 5 + .01);
         }
+        var denseA = new float[128];
+        var denseB = new float[8192];
+        var allDense = NativeBridgeGlueSearch.bruteForce(denseA, denseB, 1);
+        var limited = NativeBridgeGlueSearch.find(denseA, denseB, 1, 7);
+        if (!limited.candidates().equals(allDense.candidates().subList(0, 7))
+                || !Arrays.equals(limited.aCounts(), allDense.aCounts())
+                || !Arrays.equals(limited.bCounts(), allDense.bCounts()))
+            throw new AssertionError("Dense search changed truncation, order or ambiguity");
         int size = 4096;
         float[] a = new float[size * 2], b = new float[size * 2];
         for (int i = 0; i < size; i++) {
