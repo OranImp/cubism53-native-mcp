@@ -4,6 +4,8 @@
 
 在 Windows x64 上通过 MCP stdio 操作 Live2D Cubism Editor **5.3.03** 和 **5.3.04**，共 93 个工具。桥接器在已运行的官方编辑器进程中调用原生建模、动画、物理、渲染和导出接口。画布预览工具使用 Cubism 官方本机 WebSocket API。
 
+**v0.4.1** 优化了千层 PSD 预检、批量重命名和长物理轨迹分页。两版编辑器均完成了 93 项工具回归。详见 [验证记录](VALIDATION.md)。
+
 ## 下载
 
 - [Windows x64 便携包 ZIP](https://github.com/OranImp/cubism53-native-mcp/releases/latest/download/Cubism53-Native-MCP-win-x64.zip)

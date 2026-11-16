@@ -4,6 +4,8 @@
 
 Windows x64 で MCP stdio を通じて Live2D Cubism Editor **5.3.03** と **5.3.04** を操作できます。93 個のツールから、起動中のエディタのモデリング、アニメーション、物理演算、レンダリング、書き出しの各機能を呼び出せます。キャンバスのプレビューには Cubism 公式のローカル WebSocket API を使用します。
 
+**v0.4.1** では、大規模な PSD の再読み込み前チェック、一括リネーム、長い物理演算トレースのページ取得を高速化しました。両バージョンで 93 個すべてのツールの回帰テストに合格しています。[検証記録](VALIDATION.md)を参照してください。
+
 ## ダウンロード
 
 - [Windows x64 ポータブル版 ZIP](https://github.com/OranImp/cubism53-native-mcp/releases/latest/download/Cubism53-Native-MCP-win-x64.zip)

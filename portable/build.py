@@ -101,7 +101,8 @@ def build_package(options):
             shutil.copyfile(ROOT / name, app / name)
         for source, name in (('portable/Setup.cmd', 'Setup.cmd'), ('LICENSE', 'LICENSE'),
                              ('README.md', 'README.md'), ('README.en.md', 'README.en.md'),
-                             ('README.ja.md', 'README.ja.md'), ('portable/THIRD_PARTY.md', 'THIRD_PARTY.md')):
+                             ('README.ja.md', 'README.ja.md'), ('VALIDATION.md', 'VALIDATION.md'),
+                             ('portable/THIRD_PARTY.md', 'THIRD_PARTY.md')):
             shutil.copyfile(ROOT / source, folder / name)
         subprocess.run([str(python / 'python.exe'), '-B', '-c', 'import mcp, pydantic, websockets, win32api; import server'],
                        cwd=folder, check=True)

@@ -4,6 +4,8 @@
 
 Operate Live2D Cubism Editor **5.3.03** and **5.3.04** on Windows x64 through MCP stdio. The bridge provides 93 tools and calls the running editor's native modeling, animation, physics, rendering, and export functions. Canvas preview uses Cubism's official local WebSocket API.
 
+**v0.4.1** improves PSD reimport preflight for large files, batch renames, and pagination of long physics traces. All 93 tools passed regression checks on both editor builds. See the [validation record](VALIDATION.md).
+
 ## Downloads
 
 - [Windows x64 portable ZIP](https://github.com/OranImp/cubism53-native-mcp/releases/latest/download/Cubism53-Native-MCP-win-x64.zip)
