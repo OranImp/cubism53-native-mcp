@@ -130,10 +130,11 @@ final class NativeBridgeAnimation {
             case "get_timeline_keys", "remove_timeline_keys", "sample_timeline_parameters": return curves(doc, op, request);
             case "save_as_new": {
                 var path = NativeBridgeAssets.output(workspace, request.get("path"), ".can3");
-                Files.createDirectories(path.getParent());
-                var content = doc.getAnimationContent();
-                return NativeBridgeAssets.saved(path, content.saveDocument(path.toFile(), false),
-                    content.getFile(), content.isModifiedAfterSaving(), null);
+                return NativeBridgeAssets.saveNew(workspace, path, () -> {
+                    var content = doc.getAnimationContent();
+                    return NativeBridgeAssets.saved(path, content.saveDocument(path.toFile(), false),
+                        content.getFile(), content.isModifiedAfterSaving(), null);
+                });
             }
             case "close_saved":
                 if (doc.getAnimationContent().isModifiedAfterSaving() || doc.getAnimationContent().getFile() == null)
@@ -539,10 +540,10 @@ final class NativeBridgeAnimation {
         return result.a();
     }
 
-    static Object writeMotion(Path path, String json) throws java.io.IOException {
+    static Object writeMotion(Path workspace, Path path, String json) throws java.io.IOException {
         if (!(org.json.simple.JSONValue.parse(json) instanceof Map<?,?> root))
             throw new IllegalStateException("Cubism produced invalid Motion3 JSON");
-        NativeBridgeAssets.writeNew(path, json);
+        NativeBridgeAssets.writeNew(workspace, path, json);
         return map("path", path.toString(), "bytes", Files.size(path), "meta", root.get("Meta"));
     }
 

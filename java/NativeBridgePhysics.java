@@ -32,20 +32,30 @@ final class NativeBridgePhysics {
             throw new IllegalArgumentException("Provide at least one physics edit");
         var candidate = settings.deepCopy(new com.live2d.core.a());
         for (Object value : edits) applyGroup(source, candidate, (Map<?,?>) value);
+        for (var group : candidate.getSources()) {
+            for (var input : group.getInputs())
+                if (source.getParameterSourceSet().get(input.getSource()) == null)
+                    throw new IllegalArgumentException("Physics input references a missing parameter in " + group.getName());
+            for (var output : group.getOutputs())
+                if (source.getParameterSourceSet().get(output.getDestination()) == null)
+                    throw new IllegalArgumentException("Physics output references a missing parameter in " + group.getName());
+        }
         var undo = new SimpleUndo("Native bridge: edit physics groups", settings, new com.live2d.core.a());
+        Map<String,Object> result;
         try {
             settings.reinit(candidate, new com.live2d.core.a());
             if (fps != null) settings.setSettingFPS(fps);
             if (gravity != null) settings.setGravity(gravity);
             if (wind != null) settings.setWind(wind);
             for (var group : settings.getSources()) group.updatePhysicsSettings();
+            result = physicsInfo(source);
         } catch (RuntimeException | Error failure) {
             undo.undo();
             refresh(doc);
             throw failure;
         }
         finishEdit(doc, undo);
-        return physicsInfo(source);
+        return result;
     }
 
     private static void applyGroup(CModelSource source, CPhysicsSettingsSourceSet settings, Map<?,?> row) {

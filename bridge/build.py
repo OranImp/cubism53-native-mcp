@@ -17,7 +17,7 @@ import time
 from .editor_versions import EditorBuild, verify_editor
 from .settings import ROOT, editor_home, state_directory
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 MANIFEST = 'Manifest-Version: 1.0\nAgent-Class: cubism53.mcp.BootstrapV3\n\n'
 
 

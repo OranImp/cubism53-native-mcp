@@ -1,6 +1,7 @@
 """Paths and ports for one standalone bridge configuration."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,7 +18,11 @@ def workspace() -> Path:
 
 
 def state_directory() -> Path:
-    return Path(os.environ.get('CUBISM53_BRIDGE_STATE', ROOT / '.state')).resolve()
+    configured = os.environ.get('CUBISM53_BRIDGE_STATE')
+    if configured is not None:
+        return Path(configured).resolve()
+    source_key = hashlib.sha256(os.path.normcase(str(ROOT)).encode('utf8')).hexdigest()[:16]
+    return (Path(os.environ['LOCALAPPDATA']) / 'Cubism53MCP' / 'source-state' / source_key).resolve()
 
 
 def port_from_env(name: str, default: int) -> int:

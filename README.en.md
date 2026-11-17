@@ -4,9 +4,11 @@
 
 Operate Live2D Cubism Editor **5.3.03** and **5.3.04** on Windows x64 through MCP stdio. The bridge provides 93 tools and calls the running editor's native modeling, animation, physics, rendering, and export functions. Canvas preview uses Cubism's official local WebSocket API.
 
-**v0.4.1** improves PSD reimport preflight for large files, batch renames, and pagination of long physics traces. All 93 tools passed regression checks on both editor builds. See the [validation record](VALIDATION.md).
+**v0.4.2 source** adds mutual authentication to the native bridge and fixes preview redirects, output path races, and overflow in edit arguments. All 93 tools passed regression checks on both editor builds. [Validation record](VALIDATION.md)
 
 ## Downloads
+
+The current published portable bundle is `v0.4.1`. Follow the source installation or portable build instructions below to use the `v0.4.2` fixes.
 
 - [Windows x64 portable ZIP](https://github.com/OranImp/cubism53-native-mcp/releases/latest/download/Cubism53-Native-MCP-win-x64.zip)
 - [SHA-256 checksum file](https://github.com/OranImp/cubism53-native-mcp/releases/latest/download/Cubism53-Native-MCP-win-x64.zip.sha256)
@@ -66,6 +68,7 @@ The diagnostic command checks the editor version, workspace, Attach runtime, and
 
 - Let active jobs finish before upgrading. If the old bridge is still running, run the old package's diagnostic command with `stop` in place of `doctor`. Extract the new ZIP, run Setup with the same profile from the new directory, update the client entry, and reopen the client session.
 - `doctor` checks the target editor PID, editor build, bridge protocol, and adapter build ID. If it reports an older bridge or an adapter mismatch, stop the bridge with its existing package and reconnect using the new package.
+- If you run directly from source with the default state directory, stop the bridge using the previous version or restart Cubism Editor. Approve canvas preview again on first use.
 - `Unsupported Cubism editor JAR` means the selected build is outside the compatibility table. Rerun Setup with `--editor-home` pointing to a supported installation.
 - `Expected one running Cubism` means the bridge found zero or multiple matching processes. Start the appropriate editor or set `CUBISM53_EDITOR_PID` to the target Java process.
 - If a port is in use, run `doctor` to check whether it belongs to this profile. Assign each concurrent profile a distinct `--bridge-port`.
@@ -88,13 +91,13 @@ You can also start the server directly with `python server.py`. Use these enviro
 | `CUBISM53_EDITOR_HOME` | Cubism Editor installation directory. |
 | `CUBISM53_JDK_HOME` | JDK 17 for source builds. Falls back to `JAVA_HOME` and `PATH`. |
 | `CUBISM53_WORKSPACE` | Root directory for file operations. Defaults to the repository when running from source. |
-| `CUBISM53_BRIDGE_STATE` | Directory for bridge state and tokens. Defaults to `.state` when running from source. |
+| `CUBISM53_BRIDGE_STATE` | Directory for bridge state and tokens. Direct source runs use a checkout-specific directory under `%LOCALAPPDATA%\Cubism53MCP\source-state`. |
 | `CUBISM53_BRIDGE_PORT` | Native bridge port. Defaults to `22055`. |
 | `CUBISM53_EDITOR_PID` | Target Java process PID when multiple editors are running. |
 | `CUBISM53_PORT` | External Application Integration port for canvas preview. Defaults to `22033`. |
 | `CUBISM53_ATTACH_DIR` | Temporary Attach configuration directory. Defaults to `LOCALAPPDATA` when running from source. |
 
-Clients connected to the same editor process share its open documents and native undo stack. Separate configurations should use distinct bridge ports and state directories. The bridge listens on `127.0.0.1`. For canvas preview, enable **External Application Integration**, keep the MCP session connected, and approve **Cubism53 Native MCP**.
+Clients connected to the same editor process share its open documents and native undo stack. Separate configurations should use distinct bridge ports and state directories. The native bridge listens on `127.0.0.1`. It uses mutual authentication before transferring tool arguments and accepts JSON requests up to 32 MiB. For canvas preview, enable **External Application Integration**, keep the MCP session connected, and approve **Cubism53 Native MCP**.
 
 ### Build the portable package
 

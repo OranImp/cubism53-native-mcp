@@ -491,7 +491,7 @@ final class NativeBridgeAuthoring {
             "descendant_guids", descendants.stream().map(NativeBridgeAuthoring::guid).toList(),
             "clipping", clipping, "glues", glues, "art_path_bindings", pathBindings, "materials", retained, "blockers", blockers);
         byte[] fingerprint = JSONValue.toJSONString(map("impact", result, "cascade", cascade, "detach", detach,
-            "modified", doc.getLastModifiedTime(), "undo", doc.getUndoManager().getCurrentPos())).getBytes(StandardCharsets.UTF_8);
+            "revision", revision(doc))).getBytes(StandardCharsets.UTF_8);
         String plan = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(fingerprint));
         result.put("plan_id", plan);
         if ("plan_delete_objects".equals(operation)) return result;

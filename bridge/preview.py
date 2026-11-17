@@ -64,7 +64,10 @@ class CanvasPreview:
             if self.socket is not None and self.socket.close_code is None and not self.reader.done():
                 return
             await self._close()
-            self.socket = await connect(f'ws://127.0.0.1:{self.port}', proxy=None, open_timeout=5)
+            host = '127.0.0.1'
+            # Explicit endpoint overrides also prevent cross-origin redirects.
+            self.socket = await connect(f'ws://{host}:{self.port}', host=host, port=self.port,
+                                        proxy=None, open_timeout=5)
             self.reader = asyncio.create_task(self._receive(self.socket))
             try:
                 async with self.registration_lock():

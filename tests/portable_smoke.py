@@ -223,7 +223,7 @@ async def exercise(spec, env, work, legacy, expected_version, probe, preview_por
         first, second = await asyncio.gather(invoke('connect'), invoke('connect'))
         assert first['editor_thread'] and second['editor_thread'] and not first['documents']
         assert first['editor_version'] == second['editor_version'] == expected_version
-        assert first['bridge_protocol'] == 2 and first['adapter_build_id'] == second['adapter_build_id']
+        assert first['bridge_protocol'] == 3 and first['adapter_build_id'] == second['adapter_build_id']
         assert len(first['adapter_build_id']) == 64
         assert (await invoke('status'))['editor_version'] == expected_version
         assert sum(bool(item.get('already_connected')) for item in (first, second)) == 1
@@ -253,6 +253,29 @@ async def exercise(spec, env, work, legacy, expected_version, probe, preview_por
         uid = doc['document_uid']
         async def current(op, **kwargs):
             return await invoke(op, document_uid=uid, **kwargs)
+
+        # Exercise native JSON loading before other tools can initialize it on the editor thread.
+        physics = await current('import_physics3', path='probe.physics3.json')
+        assert len(physics['groups']) == 1
+        await current('undo')
+        assert not (await current('physics'))['groups']
+
+        before_invalid = await current('document')
+        blank_objects = await current('objects')
+        await current('create_warp', name='Invalid Bezier', x=0, y=0, width=16, height=16,
+                      bezier_columns=101, reject='Bezier grid subdivisions')
+        await current('create_warp', name='Invalid width', x=3e38, y=0, width=3e38, height=16,
+                      reject='nonfinite coordinates')
+        await current('create_warp', name='Invalid columns', x=0, y=0, width=16, height=16,
+                      columns=2**32 + 2, reject='32-bit integer')
+        await current('edit_physics_groups', edits=[], fps=2**32 + 60, reject='32-bit integer')
+        Image.new('RGBA', (16, 16), 'red').save(work / 'affine-limit.png')
+        await current('import_png', path='affine-limit.png', name='Invalid transform',
+                      affine=[3e38, 0, 0, 1, 3e38, 0], reject='nonfinite vertex')
+        after_invalid = await current('document')
+        assert before_invalid['revision'] == after_invalid['revision']
+        assert (await current('objects')) == blank_objects
+        print('INVALID_INTEGER_AND_GEOMETRY_LEAVE_MODEL_UNCHANGED', flush=True)
 
         async def wait_job(job, request_id, *, reject=None):
             for _ in range(200):

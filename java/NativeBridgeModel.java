@@ -69,7 +69,11 @@ final class NativeBridgeModel {
                 throw new IllegalStateException("Cubism could not create a mesh Blend Shape");
             var original = base.getPositions();
             var target = form.getPositions().clone();
-            for (int i = 0; i < target.length; i++) target[i] += positions[i] - original[i];
+            for (int i = 0; i < target.length; i++) {
+                target[i] += positions[i] - original[i];
+                if (!Float.isFinite(target[i]))
+                    throw new IllegalArgumentException("Blend Shape offset produces a nonfinite vertex at coordinate " + i);
+            }
             form.setPositions(target);
             form.setUpdated();
             shapeGuid = form.getGuid().getUuidString();

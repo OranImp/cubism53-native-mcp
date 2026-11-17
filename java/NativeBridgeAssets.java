@@ -24,47 +24,177 @@ import com.live2d.type.CAffine;
 import com.live2d.undo.GroupUndo;
 import com.live2d.undo.LambdaUndo;
 import com.live2d.undo.SimpleUndo;
+import com.sun.jna.platform.win32.Kernel32;
+import com.sun.jna.platform.win32.WinBase;
+import com.sun.jna.platform.win32.WinNT;
+import java.awt.image.BufferedImage;
 import java.awt.geom.Rectangle2D;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.util.*;
+import java.util.concurrent.Callable;
+import java.util.regex.Pattern;
+import javax.imageio.ImageIO;
 import kotlin.Unit;
+import org.json.simple.parser.ContainerFactory;
+import org.json.simple.parser.JSONParser;
+import org.json.simple.parser.ParseException;
 
 import static cubism53.mcp.NativeBridge.*;
 
 /** Native file, material and texture-atlas operations for the pinned Cubism build. */
 final class NativeBridgeAssets {
+    private static final int MIB = 1024 * 1024;
+    private static final int JSON_LIMIT = 16 * MIB;
+    private static final int ATTACHMENT_LIMIT = 32 * MIB;
+    private static final int PNG_EDGE_LIMIT = 8192;
+    private static final long PNG_LIMIT = 512L * MIB;
+    private static final long PSD_LIMIT = 2L * 1024 * MIB;
+    private static final Pattern DEVICE_NAME = Pattern.compile(
+        "(?i)(CON|PRN|AUX|NUL|CONIN\\$|CONOUT\\$|COM[1-9\u00b9\u00b2\u00b3]|LPT[1-9\u00b9\u00b2\u00b3])");
+
     private NativeBridgeAssets() {}
 
     static Path input(Path workspace, Object value, String suffix) throws IOException {
-        Path path = workspace.resolve(nonblank(value, "path")).toRealPath();
+        Path requested = workspace.resolve(nonblank(value, "path")).normalize();
+        if (requested.equals(workspace) || !requested.startsWith(workspace))
+            throw new IllegalArgumentException("A workspace " + suffix + " file is required");
+        Path parent = realParent(workspace, requested.getParent());
+        Path path = parent.resolve(requested.getFileName()).toRealPath();
         if (!path.startsWith(workspace) || !Files.isRegularFile(path) || !hasSuffix(path, suffix))
             throw new IllegalArgumentException("A workspace " + suffix + " file is required");
         return path;
+    }
+
+    private static byte[] readJsonBytes(Path path, int maximum) throws IOException {
+        try (var stream = Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS)) {
+            var bytes = stream.readNBytes(maximum + 1);
+            if (bytes.length > maximum) throw new IOException("JSON input exceeds the byte limit: " + path.getFileName());
+            return bytes;
+        }
+    }
+
+    static String readJsonText(Path path) throws IOException {
+        return decodeJsonText(readJsonBytes(path, JSON_LIMIT));
+    }
+
+    private static String decodeJsonText(byte[] bytes) throws IOException {
+        String text = StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
+        int depth = 0;
+        boolean quoted = false;
+        for (int index = 0; index < text.length(); index++) {
+            char c = text.charAt(index);
+            if (quoted) {
+                if (c == '\\') index++;
+                else if (c == '"') quoted = false;
+            } else if (c == '"') {
+                quoted = true;
+            } else if (c == '[' || c == '{') {
+                if (++depth > 64) throw new IOException("JSON input exceeds the nesting limit");
+            } else if (c == ']' || c == '}') {
+                if (--depth < 0) throw new IOException("Invalid JSON input");
+            }
+        }
+        return text;
     }
 
     static Path output(Path workspace, Object value, String suffix) throws IOException {
         Path path = workspace.resolve(nonblank(value, "destination")).normalize();
         if (path.equals(workspace) || !path.startsWith(workspace) || !hasSuffix(path, suffix))
             throw new IllegalArgumentException("A workspace destination" + (suffix.isEmpty() ? "" : " ending in " + suffix) + " is required");
-        if (Files.exists(path, LinkOption.NOFOLLOW_LINKS))
-            throw new FileAlreadyExistsException(path.toString());
-        Path parent = path.getParent();
-        while (parent != null && !Files.exists(parent, LinkOption.NOFOLLOW_LINKS)) parent = parent.getParent();
-        if (parent == null || !parent.toRealPath().startsWith(workspace))
-            throw new IllegalArgumentException("Destination resolves outside the workspace");
-        return path;
+        for (Path part : workspace.relativize(path)) requireBasename(part.toString());
+        Path destination = realParent(workspace, path.getParent()).resolve(path.getFileName());
+        if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS))
+            throw new FileAlreadyExistsException(destination.toString());
+        return destination;
+    }
+
+    private static Path realParent(Path workspace, Path parent) throws IOException {
+        Path current = workspace;
+        if (workspace.equals(parent)) return current;
+        for (var part : workspace.relativize(parent)) {
+            current = current.resolve(part);
+            if (Files.exists(current, LinkOption.NOFOLLOW_LINKS)) {
+                current = current.toRealPath();
+                if (!current.startsWith(workspace) || !Files.isDirectory(current))
+                    throw new IllegalArgumentException("Path parent is outside the workspace or is not a directory");
+            }
+        }
+        return current;
     }
 
     private static boolean hasSuffix(Path path, String suffix) {
         return path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(suffix);
     }
 
-    static void writeNew(Path path, String contents) throws IOException {
-        publishFile(path, ".json", temporary -> Files.writeString(temporary, contents, StandardCharsets.UTF_8));
+    static void requireBasename(String name) {
+        int dot = name.indexOf('.');
+        String stem = dot == -1 ? name : name.substring(0, dot);
+        if (name.isBlank() || name.endsWith(".") || name.endsWith(" ")
+                || name.chars().anyMatch(c -> c < 32 || "\\/:*?\"<>|".indexOf(c) >= 0)
+                || DEVICE_NAME.matcher(stem.stripTrailing()).matches())
+            throw new IllegalArgumentException("Invalid file basename: " + name);
+    }
+
+    // Windows directory handles held without FILE_SHARE_DELETE prevent replacement by a junction
+    // between validation and the native writer or final move.
+    static final class DirectoryGuard implements AutoCloseable {
+        private final List<WinNT.HANDLE> handles = new ArrayList<>();
+
+        void lock(Path directory) throws IOException {
+            if (com.sun.jna.Platform.isWindows()) {
+                var kernel = Kernel32.INSTANCE;
+                var handle = kernel.CreateFile(directory.toString(), WinNT.FILE_LIST_DIRECTORY,
+                    WinNT.FILE_SHARE_READ | WinNT.FILE_SHARE_WRITE, null, WinNT.OPEN_EXISTING,
+                    WinNT.FILE_FLAG_BACKUP_SEMANTICS | WinNT.FILE_FLAG_OPEN_REPARSE_POINT, null);
+                if (WinBase.INVALID_HANDLE_VALUE.equals(handle))
+                    throw new IOException("Cannot secure output directory " + directory + " (Win32 error " + kernel.GetLastError() + ")");
+                handles.add(handle);
+            }
+            if (!Files.readAttributes(directory, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).isDirectory()
+                    || !directory.equals(directory.toRealPath()))
+                throw new IOException("Output directory changed or resolves through a link: " + directory);
+        }
+
+        @Override public void close() {
+            for (int index = handles.size() - 1; index >= 0; index--)
+                Kernel32.INSTANCE.CloseHandle(handles.get(index));
+        }
+    }
+
+    static DirectoryGuard prepareOutput(Path workspace, Path path) throws IOException {
+        if (path.equals(workspace) || !path.startsWith(workspace))
+            throw new IllegalArgumentException("A workspace destination is required");
+        var guard = new DirectoryGuard();
+        try {
+            var parent = path.getRoot();
+            guard.lock(parent);
+            for (var part : path.getParent()) {
+                parent = parent.resolve(part);
+                if (parent.startsWith(workspace) && !parent.equals(workspace)) {
+                    try { Files.createDirectory(parent); }
+                    catch (FileAlreadyExistsException existing) { /* Validate the directory below. */ }
+                }
+                guard.lock(parent);
+            }
+            if (Files.exists(path, LinkOption.NOFOLLOW_LINKS))
+                throw new FileAlreadyExistsException(path.toString());
+            return guard;
+        } catch (IOException | RuntimeException | Error error) {
+            guard.close();
+            throw error;
+        }
+    }
+
+    static void writeNew(Path workspace, Path path, String contents) throws IOException {
+        publishFile(workspace, path, ".json", temporary -> Files.writeString(temporary, contents, StandardCharsets.UTF_8));
     }
 
     @FunctionalInterface
@@ -72,15 +202,30 @@ final class NativeBridgeAssets {
         void write(Path path) throws IOException;
     }
 
-    static void publishFile(Path path, String suffix, FileWriter writer) throws IOException {
-        Files.createDirectories(path.getParent());
-        Path temporary = Files.createTempFile(path.getParent(), ".cubism-output-", suffix);
-        try {
-            writer.write(temporary);
-            if (Files.size(temporary) == 0) throw new IOException("Cubism produced an empty output file");
-            Files.move(temporary, path);
-        } finally {
-            Files.deleteIfExists(temporary);
+    static void publishFile(Path workspace, Path path, String suffix, FileWriter writer) throws IOException {
+        try (var guard = prepareOutput(workspace, path)) {
+            Path temporary = Files.createTempFile(path.getParent(), ".cubism-output-", suffix);
+            try {
+                writer.write(temporary);
+                if (Files.size(temporary) == 0) throw new IOException("Cubism produced an empty output file");
+                Files.move(temporary, path);
+            } finally {
+                Files.deleteIfExists(temporary);
+            }
+        }
+    }
+
+    static Object saveNew(Path workspace, Path path, Callable<Object> save) throws Exception {
+        try (var guard = prepareOutput(workspace, path)) {
+            // The native archive writer replaces its target after serialization. Claim the
+            // basename before entering Cubism so a competing creator cannot lose its file.
+            Files.createFile(path);
+            try {
+                return save.call();
+            } finally {
+                if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) && Files.size(path) == 0)
+                    Files.deleteIfExists(path);
+            }
         }
     }
 
@@ -94,20 +239,66 @@ final class NativeBridgeAssets {
         return response;
     }
 
-    record PngInput(Path path, java.awt.image.BufferedImage pixels) {}
+    record PngInput(Path path, BufferedImage pixels) {}
 
     static PngInput readPng(Path workspace, Object value) throws IOException {
         var path = input(workspace, value, ".png");
         return new PngInput(path, readPng(path));
     }
 
-    private static java.awt.image.BufferedImage readPng(Path path) throws IOException {
-        var input = javax.imageio.ImageIO.read(path.toFile());
-        if (input == null) throw new IllegalArgumentException("Image could not be decoded");
-        if (input.getType() == java.awt.image.BufferedImage.TYPE_INT_ARGB) return input;
+    private static BufferedImage readPng(Path path) throws IOException {
+        try (var channel = Files.newByteChannel(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS);
+             var file = java.nio.channels.Channels.newInputStream(channel);
+             var bounded = new LimitedInput(file, PNG_LIMIT);
+             var stream = new javax.imageio.stream.MemoryCacheImageInputStream(bounded)) {
+            long encodedBytes = channel.size();
+            if (encodedBytes > PNG_LIMIT) throw new IllegalArgumentException("PNG exceeds the input byte limit");
+            var readers = ImageIO.getImageReadersByFormatName("PNG");
+            if (!readers.hasNext()) throw new IOException("PNG reader unavailable");
+            var reader = readers.next();
+            try {
+                reader.setInput(stream, true, true);
+                int width = reader.getWidth(0), height = reader.getHeight(0);
+                if (width < 1 || height < 1 || width > PNG_EDGE_LIMIT || height > PNG_EDGE_LIMIT)
+                    throw new IllegalArgumentException("PNG dimensions must be between 1 and " + PNG_EDGE_LIMIT);
+                var runtime = Runtime.getRuntime();
+                long available = runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory());
+                // Allow for 16-bit RGBA input, the converted ARGB image, and decoder buffers.
+                if ((long) width * height * 16 + encodedBytes + 64 * MIB > available)
+                    throw new IllegalArgumentException("PNG exceeds the available editor heap");
+                return argb(reader.read(0));
+            } finally {
+                reader.dispose();
+            }
+        }
+    }
+
+    private static final class LimitedInput extends java.io.FilterInputStream {
+        private long remaining;
+
+        LimitedInput(InputStream stream, long maximum) {
+            super(stream);
+            remaining = maximum;
+        }
+
+        @Override public int read() throws IOException {
+            int value = in.read();
+            if (value != -1 && --remaining < 0) throw new IOException("Asset exceeds the input byte limit");
+            return value;
+        }
+
+        @Override public int read(byte[] bytes, int offset, int count) throws IOException {
+            int read = in.read(bytes, offset, (int) Math.min(count, remaining + 1));
+            if (read > 0 && (remaining -= read) < 0) throw new IOException("Asset exceeds the input byte limit");
+            return read;
+        }
+    }
+
+    private static BufferedImage argb(BufferedImage input) {
+        if (input.getType() == BufferedImage.TYPE_INT_ARGB) return input;
         try {
             int width = input.getWidth(), height = input.getHeight();
-            var result = new java.awt.image.BufferedImage(width, height, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+            var result = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
             var row = new int[width];
             for (int y = 0; y < height; y++) {
                 input.getRGB(0, y, width, 1, row, 0, width);
@@ -345,7 +536,22 @@ final class NativeBridgeAssets {
     private static volatile PsdPreview lastPreview;
 
     private record PsdSnapshot(Path path, Path copy, byte[] hash, long modified) implements AutoCloseable {
-        CLayeredImage readImage() {
+        CLayeredImage readImage() throws IOException {
+            try (var stream = new java.io.DataInputStream(Files.newInputStream(copy))) {
+                if (stream.readInt() != 0x38425053 || stream.readUnsignedShort() != 1)
+                    throw new IllegalArgumentException("Expected a PSD document");
+                stream.skipNBytes(6);
+                int channels = stream.readUnsignedShort(), height = stream.readInt(), width = stream.readInt();
+                int depth = stream.readUnsignedShort();
+                if (channels < 1 || channels > 56 || width < 1 || height < 1 || width > 30_000 || height > 30_000
+                        || !(depth == 1 || depth == 8 || depth == 16 || depth == 32))
+                    throw new IllegalArgumentException("Invalid PSD header dimensions or channel format");
+                var runtime = Runtime.getRuntime();
+                long available = runtime.maxMemory() - (runtime.totalMemory() - runtime.freeMemory());
+                long canvasBytes = (long) width * height * channels * Math.max(1, depth / 8);
+                if (canvasBytes + (long) width * height * 4 + 64 * MIB > available)
+                    throw new IllegalArgumentException("PSD canvas exceeds the available editor heap");
+            }
             var parsed = com.live2d.graphics.psd.CPsdDocument.a.a(copy.toFile(), false, false);
             String name = path.getFileName().toString();
             var image = new CLayeredImage(parsed, path.toFile(), name.substring(0, name.length() - 4));
@@ -357,12 +563,13 @@ final class NativeBridgeAssets {
     }
 
     private static PsdSnapshot copyPsd(Path path) throws Exception {
-        long modified = Files.getLastModifiedTime(path).toMillis();
+        long modified = Files.getLastModifiedTime(path, LinkOption.NOFOLLOW_LINKS).toMillis();
         var digest = MessageDigest.getInstance("SHA-256");
         Path snapshot = Files.createTempFile("cubism-reimport-", ".psd");
         try {
-            try (var stream = new DigestInputStream(Files.newInputStream(path), digest)) {
-                Files.copy(stream, snapshot, StandardCopyOption.REPLACE_EXISTING);
+            try (var stream = new DigestInputStream(psdStream(path), digest);
+                 var destination = Files.newOutputStream(snapshot, LinkOption.NOFOLLOW_LINKS)) {
+                stream.transferTo(destination);
             }
             return new PsdSnapshot(path, snapshot, digest.digest(), modified);
         } catch (Exception | Error error) {
@@ -383,8 +590,8 @@ final class NativeBridgeAssets {
         var cached = lastPreview;
         if (cached != null) {
             var digest = MessageDigest.getInstance("SHA-256");
-            try (var stream = new DigestInputStream(Files.newInputStream(path), digest)) {
-                stream.transferTo(java.io.OutputStream.nullOutputStream());
+            try (var stream = new DigestInputStream(psdStream(path), digest)) {
+                stream.transferTo(OutputStream.nullOutputStream());
             }
             if (Arrays.equals(cached.hash, digest.digest())) return cached;
         }
@@ -398,6 +605,11 @@ final class NativeBridgeAssets {
                 image.dispose();
             }
         }
+    }
+
+    private static InputStream psdStream(Path path) throws IOException {
+        if (Files.size(path) > PSD_LIMIT) throw new IllegalArgumentException("PSD exceeds the input byte limit");
+        return new LimitedInput(Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS), PSD_LIMIT);
     }
 
     static Object planPsdReimport(CModelingDocument doc, PsdPreview preview, Map<String,Object> request) throws Exception {
@@ -608,24 +820,26 @@ final class NativeBridgeAssets {
         return Class.forName("com.live2d.cubism.view.b.a").getField("a").get(null);
     }
 
-    static Object saveModel(CModelingDocument doc, Path path) throws Exception {
+    static Object saveModel(CModelingDocument doc, Path workspace, Path path) throws Exception {
         var source = doc.getModelSource();
         Object validator = nativeEditionChecks();
         Class<?> checks = validator.getClass();
         // A null prompt suppresses the native warning while preserving the native edition check.
         if ((boolean) checks.getMethod("a", CModelSource.class, String.class).invoke(validator, source, null))
             return saved(path, false, doc.getFile(), doc.isModifiedAfterSaving(), "native_edit_restriction");
-        if (source.getTextureManager().getHandler().b().isEmpty())
-            return saved(path, doc.saveDocument(path.toFile(), false), doc.getFile(), doc.isModifiedAfterSaving(), null);
-        // Keep historical PSD sources and call the normal native save callback.
-        var constructor = Class.forName("com.live2d.cubism.doc.modeling.b")
-            .getDeclaredConstructor(CModelingDocument.class, java.io.File.class, boolean.class);
-        constructor.setAccessible(true);
-        var callback = (kotlin.jvm.functions.Function1) constructor.newInstance(doc, path.toFile(), false);
-        com.live2d.util.ak.a.b(callback);
-        doc.getCompletePack().updateProject();
-        doc.getCompletePack().repaintCanvas(com.live2d.cubism.CEUpdateManager.b.a);
-        return saved(path, true, doc.getFile(), doc.isModifiedAfterSaving(), null);
+        return saveNew(workspace, path, () -> {
+            if (source.getTextureManager().getHandler().b().isEmpty())
+                return saved(path, doc.saveDocument(path.toFile(), false), doc.getFile(), doc.isModifiedAfterSaving(), null);
+            // Keep historical PSD sources and call the normal native save callback.
+            var constructor = Class.forName("com.live2d.cubism.doc.modeling.b")
+                .getDeclaredConstructor(CModelingDocument.class, java.io.File.class, boolean.class);
+            constructor.setAccessible(true);
+            var callback = (kotlin.jvm.functions.Function1) constructor.newInstance(doc, path.toFile(), false);
+            com.live2d.util.ak.a.b(callback);
+            doc.getCompletePack().updateProject();
+            doc.getCompletePack().repaintCanvas(com.live2d.cubism.CEUpdateManager.b.a);
+            return saved(path, true, doc.getFile(), doc.isModifiedAfterSaving(), null);
+        });
     }
 
     record PhysicsExport(String json, int sourceGroupCount) {}
@@ -640,10 +854,10 @@ final class NativeBridgeAssets {
         return new PhysicsExport(json, settings.getSources().size());
     }
 
-    static Object writePhysics(PhysicsExport export, Path path) throws IOException {
+    static Object writePhysics(PhysicsExport export, Path workspace, Path path) throws IOException {
         if (!(org.json.simple.JSONValue.parse(export.json) instanceof Map<?,?> result))
             throw new IllegalStateException("Cubism did not generate a valid physics export");
-        writeNew(path, export.json);
+        writeNew(workspace, path, export.json);
         return map("path", path.toString(), "groups", result.get("PhysicsSettings"),
             "source_group_count", export.sourceGroupCount, "bytes", Files.size(path));
     }
@@ -656,8 +870,7 @@ final class NativeBridgeAssets {
     static RuntimeCheck runtimeCheck(CModelingDocument doc, Map<String,Object> request, boolean preflight) {
         checkRevision(doc, request);
         String name = request.get("name") == null ? doc.getModelSource().getName() : nonblank(request.get("name"), "name");
-        if (!preflight && (name.isBlank() || name.matches(".*[\\\\/:*?\"<>|].*") || name.endsWith(".") || name.endsWith(" ")))
-            throw new IllegalArgumentException("Export name must be a valid file basename");
+        if (!preflight) requireBasename(name);
         var source = doc.getModelSource();
         String sdk = targetVersion(request);
         var blockers = runtimeBlockers(source, sdk);
@@ -704,31 +917,35 @@ final class NativeBridgeAssets {
         } finally { exportSource.dispose(); }
     }
 
-    static Object writeRuntime(RuntimeExport export, Path destination, long deadline) throws Exception {
+    static Object writeRuntime(RuntimeExport export, Path workspace, Path destination, long deadline) throws Exception {
+        try (var guard = prepareOutput(workspace, destination)) {
+            return writeRuntime(export, destination, deadline);
+        }
+    }
+
+    private static Object writeRuntime(RuntimeExport export, Path destination, long deadline) throws Exception {
         String name = export.name;
         var assets = export.assets;
-        Files.createDirectories(destination.getParent());
+        requireBasename(name);
         Path staging = Files.createTempDirectory(destination.getParent(), ".cubism-export-");
         var manifest = new ArrayList<Map<String,Object>>();
         try {
             for (var entry : export.files) {
                 var pair = (kotlin.Pair<?,?>) entry;
-                Path file = staging.resolve((String) pair.getFirst()).normalize();
-                if (!file.startsWith(staging) || file.equals(staging))
-                    throw new IOException("Unsafe native export path: " + pair.getFirst());
+                Path file = packagePath(staging, (String) pair.getFirst());
                 byte[] bytes = (byte[]) pair.getSecond();
                 Files.createDirectories(file.getParent());
                 Files.write(file, bytes, StandardOpenOption.CREATE_NEW);
             }
             Path model = staging.resolve(name + ".model3.json");
-            if (!(org.json.simple.JSONValue.parse(Files.readString(model)) instanceof Map<?,?> root)
+            if (!(org.json.simple.JSONValue.parse(readJsonText(model)) instanceof Map<?,?> root)
                     || !(root.get("FileReferences") instanceof Map<?,?> references))
                 throw new IOException("Native export has no valid Model3 file references");
             if (!(references.get("Moc") instanceof String moc) || !(references.get("Textures") instanceof List<?> textures) || textures.isEmpty())
                 throw new IOException("Native export is missing the MOC3 or atlas textures: " + references.keySet());
             if (!assets.files.isEmpty()) {
                 for (var item : assets.files.entrySet()) {
-                    var file = staging.resolve(item.getKey());
+                    var file = packagePath(staging, item.getKey());
                     Files.createDirectories(file.getParent());
                     Files.write(file, item.getValue(), StandardOpenOption.CREATE_NEW);
                 }
@@ -743,7 +960,7 @@ final class NativeBridgeAssets {
                 Files.writeString(model, org.json.simple.JSONValue.toJSONString(modelJson), StandardCharsets.UTF_8);
                 verifyExportReferences(staging, outputReferences);
             } else verifyExportReferences(staging, references);
-            try (var stream = Files.newInputStream(staging.resolve(moc))) {
+            try (var stream = Files.newInputStream(packagePath(staging, moc), LinkOption.NOFOLLOW_LINKS)) {
                 if (!Arrays.equals(stream.readNBytes(4), new byte[]{'M', 'O', 'C', '3'}))
                     throw new IOException("Native export has an invalid MOC3 header");
             }
@@ -780,7 +997,7 @@ final class NativeBridgeAssets {
         return Set.copyOf(parameters);
     }
 
-    static Object exportExpression(Set<String> parameters, Path path, Map<String,Object> request) throws IOException {
+    static Object exportExpression(Set<String> parameters, Path workspace, Path path, Map<String,Object> request) throws IOException {
         var values = new ArrayList<Object>();
         for (Object value : (List<?>) request.get("parameters")) {
             var row = (Map<?,?>) value;
@@ -792,7 +1009,7 @@ final class NativeBridgeAssets {
         double fadeOut = expressionFade(request.get("fade_out_seconds"));
         var data = map("Type", "Live2D Expression", "FadeInTime", fadeIn, "FadeOutTime", fadeOut, "Parameters", values);
         new NativeBridgeSdk(path, parameters, Set.of()).expression(data);
-        writeNew(path, org.json.simple.JSONValue.toJSONString(data));
+        writeNew(workspace, path, org.json.simple.JSONValue.toJSONString(data));
         return map("path", path.toString(), "parameter_count", values.size(), "fade_in_seconds", fadeIn, "fade_out_seconds", fadeOut);
     }
 
@@ -903,7 +1120,7 @@ final class NativeBridgeAssets {
         var expressions = new ArrayList<Object>();
         var names = new HashSet<String>();
         var fileNames = new TreeMap<String,String>(String.CASE_INSENSITIVE_ORDER);
-        var snapshots = new HashMap<Path,Attachment>();
+        var snapshots = new AttachmentSnapshots();
         var parameters = check.parameters;
         var parts = check.parts;
         for (var value : (List<?>) request.getOrDefault("motions", List.of())) {
@@ -911,7 +1128,7 @@ final class NativeBridgeAssets {
             try {
                 String group = nonblank(row.get("group"), "motion group");
                 var path = input(workspace, row.get("path"), ".motion3.json");
-                var asset = readAttachment(snapshots, path);
+                var asset = snapshots.read(path);
                 new NativeBridgeSdk(path, parameters, parts).motion(asset.data);
                 String file = addAttachment(files, fileNames, "motions", path, asset.bytes);
                 motions.computeIfAbsent(group, ignored -> new ArrayList<>()).add(map("File", file));
@@ -925,7 +1142,7 @@ final class NativeBridgeAssets {
                 String name = nonblank(row.get("name"), "expression name");
                 if (!names.add(name.toLowerCase(Locale.ROOT))) throw new IllegalArgumentException("Duplicate expression name: " + name);
                 var path = input(workspace, row.get("path"), ".exp3.json");
-                var asset = readAttachment(snapshots, path);
+                var asset = snapshots.read(path);
                 new NativeBridgeSdk(path, parameters, parts).expression(asset.data);
                 expressions.add(map("Name", name, "File", addAttachment(files, fileNames, "expressions", path, asset.bytes)));
             } catch (IOException | IllegalArgumentException error) {
@@ -936,7 +1153,7 @@ final class NativeBridgeAssets {
         if (request.get("physics_path") != null) {
             try {
                 var path = input(workspace, request.get("physics_path"), ".physics3.json");
-                var asset = readAttachment(snapshots, path);
+                var asset = snapshots.read(path);
                 new NativeBridgeSdk(path, parameters, parts).physics(asset.data);
                 physics = addAttachment(files, fileNames, "physics", path, asset.bytes);
             } catch (IOException | IllegalArgumentException error) {
@@ -953,19 +1170,45 @@ final class NativeBridgeAssets {
 
     private record Attachment(byte[] bytes, Map<?,?> data) {}
 
-    private static Attachment readAttachment(Map<Path,Attachment> snapshots, Path path) throws IOException {
-        var cached = snapshots.get(path);
-        if (cached != null) return cached;
-        byte[] bytes = Files.readAllBytes(path);
-        if (!(org.json.simple.JSONValue.parse(new String(bytes, StandardCharsets.UTF_8)) instanceof Map<?,?> data))
-            throw new NativeBridgeSdk.InvalidAttachment(path, "$", "Invalid JSON attachment");
-        var attachment = new Attachment(bytes, data);
-        snapshots.put(path, attachment);
-        return attachment;
+    private static final class AttachmentSnapshots {
+        private int remaining = ATTACHMENT_LIMIT;
+        private final Map<Path,Attachment> snapshots = new HashMap<>();
+
+        Attachment read(Path path) throws IOException {
+            var cached = snapshots.get(path);
+            if (cached != null) return cached;
+            byte[] bytes = readJsonBytes(path, Math.min(JSON_LIMIT, remaining));
+            remaining -= bytes.length;
+            Object parsed;
+            try {
+                parsed = new JSONParser().parse(decodeJsonText(bytes), new ContainerFactory() {
+                    @Override public Map<String,Object> createObjectContainer() {
+                        return new LinkedHashMap<>() {
+                            @Override public Object put(String key, Object value) {
+                                if (containsKey(key))
+                                    throw new NativeBridgeSdk.InvalidAttachment(path, "$", "Duplicate JSON key: " + key);
+                                return super.put(key, value);
+                            }
+                        };
+                    }
+
+                    @Override public List<Object> creatArrayContainer() { return new ArrayList<>(); }
+                });
+            } catch (ParseException | NumberFormatException error) {
+                throw new NativeBridgeSdk.InvalidAttachment(path, "$", "Invalid JSON attachment");
+            }
+            if (!(parsed instanceof Map<?,?> data))
+                throw new NativeBridgeSdk.InvalidAttachment(path, "$", "Invalid JSON attachment");
+            var attachment = new Attachment(bytes, data);
+            snapshots.put(path, attachment);
+            return attachment;
+        }
     }
 
     private static String addAttachment(Map<String,byte[]> files, Map<String,String> names, String folder, Path path, byte[] bytes) {
-        String file = folder + "/" + path.getFileName();
+        String basename = path.getFileName().toString();
+        requireBasename(basename);
+        String file = folder + "/" + basename;
         var existing = names.putIfAbsent(file, file);
         if (existing != null) {
             if (existing.equals(file) && Arrays.equals(files.get(existing), bytes)) return file;
@@ -1016,10 +1259,23 @@ final class NativeBridgeAssets {
     }
 
     private static void verifyReference(Path directory, String reference) throws IOException {
-        if (reference == null || Path.of(reference).isAbsolute()) throw new IOException("Invalid native file reference: " + reference);
-        Path path = directory.resolve(reference).normalize();
-        if (!path.startsWith(directory) || !Files.isRegularFile(path))
+        var path = packagePath(directory, reference);
+        if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS))
             throw new IOException("Missing native file reference: " + reference);
+    }
+
+    private static Path packagePath(Path directory, String member) throws IOException {
+        if (member == null) throw new IOException("Native package member path is missing");
+        try {
+            Path relative = directory.getFileSystem().getPath(member);
+            if (relative.getRoot() != null) throw new IllegalArgumentException();
+            for (var part : relative) requireBasename(part.toString());
+            Path target = directory.resolve(relative);
+            if (target.equals(directory) || !target.startsWith(directory)) throw new IllegalArgumentException();
+            return target;
+        } catch (IllegalArgumentException error) {
+            throw new IOException("Unsafe native package member path: " + member, error);
+        }
     }
 
     static Object editAtlas(CModelingDocument doc, Map<String,Object> request) throws Exception {

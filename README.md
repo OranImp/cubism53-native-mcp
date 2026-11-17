@@ -4,9 +4,11 @@
 
 在 Windows x64 上通过 MCP stdio 操作 Live2D Cubism Editor **5.3.03** 和 **5.3.04**，共 93 个工具。桥接器在已运行的官方编辑器进程中调用原生建模、动画、物理、渲染和导出接口。画布预览工具使用 Cubism 官方本机 WebSocket API。
 
-**v0.4.1** 优化了千层 PSD 预检、批量重命名和长物理轨迹分页。两版编辑器均完成了 93 项工具回归。详见 [验证记录](VALIDATION.md)。
+**v0.4.2 源码**为原生桥接加入双向认证，并修复预览重定向、文件输出路径和编辑参数溢出问题。两版编辑器均完成了 93 项工具回归。 [验证记录](VALIDATION.md)
 
 ## 下载
+
+当前发布的便携包为 `v0.4.1`。使用 `v0.4.2` 的修复可按下文从源码安装或构建便携包。
 
 - [Windows x64 便携包 ZIP](https://github.com/OranImp/cubism53-native-mcp/releases/latest/download/Cubism53-Native-MCP-win-x64.zip)
 - [SHA-256 校验文件](https://github.com/OranImp/cubism53-native-mcp/releases/latest/download/Cubism53-Native-MCP-win-x64.zip.sha256)
@@ -66,6 +68,7 @@ if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ine $expected) 
 
 - 升级前等作业完成。若旧桥接仍在运行，用旧包的诊断命令将 `doctor` 换成 `stop`。解压新版，在新版目录用同一 profile 运行 Setup，更新客户端条目并重开会话。
 - `doctor` 会核对目标编辑器 PID、编辑器构建、桥接协议和适配器构建 ID。若提示旧桥接或适配器不匹配，先用旧包停止桥接，再用新版重连。
+- 从源码直连且使用默认状态目录时，先用旧版停止桥接，或重开 Cubism Editor。首次预览时需要重新授权。
 - `Unsupported Cubism editor JAR` 表示选中的编辑器构建不在兼容表内。重新运行 Setup，通过 `--editor-home` 指定受支持的安装目录。
 - `Expected one running Cubism` 表示编辑器未启动或有多个匹配进程。启动对应版本，或者用 `CUBISM53_EDITOR_PID` 指定目标 Java 进程。
 - 端口已占用时，先用 `doctor` 确认该端口是否属于本 profile。并行使用多个 profile 时，为每个 profile 指定不同的 `--bridge-port`。
@@ -88,13 +91,13 @@ py -3 -m venv .venv
 | `CUBISM53_EDITOR_HOME` | Cubism Editor 安装根目录。 |
 | `CUBISM53_JDK_HOME` | 源码构建用 JDK 17。未指定时检查 `JAVA_HOME` 和 `PATH`。 |
 | `CUBISM53_WORKSPACE` | 文件工具的工作区根目录，直接运行源码时默认本仓库。 |
-| `CUBISM53_BRIDGE_STATE` | 桥接和令牌目录，直接运行源码时默认 `.state`。 |
+| `CUBISM53_BRIDGE_STATE` | 桥接和令牌目录。直接运行源码时按代码目录在 `%LOCALAPPDATA%\Cubism53MCP\source-state` 下分配。 |
 | `CUBISM53_BRIDGE_PORT` | 原生桥接端口，默认 `22055`。 |
 | `CUBISM53_EDITOR_PID` | 有多个编辑器时指定目标 Java 进程 PID。 |
 | `CUBISM53_PORT` | 画布预览使用的外部程序集成端口，默认 `22033`。 |
 | `CUBISM53_ATTACH_DIR` | Attach 临时配置目录，直接运行源码时默认 `LOCALAPPDATA`。 |
 
-同一编辑器进程内的多个客户端共享打开的文档和原生撤销栈。独立配置应使用各自的桥接端口和状态目录。桥接只监听 `127.0.0.1`。首次使用画布预览时，在 Cubism 启用「外部应用程序集成」，保持 MCP 会话连接并批准 **Cubism53 Native MCP**。
+同一编辑器进程内的多个客户端共享打开的文档和原生撤销栈。独立配置应使用各自的桥接端口和状态目录。原生桥接监听 `127.0.0.1`，收发工具参数前先做双向认证，单次 JSON 请求最多 32 MiB。首次使用画布预览时，在 Cubism 启用「外部应用程序集成」，保持 MCP 会话连接并批准 **Cubism53 Native MCP**。
 
 ### 构建便携包
 

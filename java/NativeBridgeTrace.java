@@ -93,8 +93,8 @@ final class NativeBridgeTrace implements AutoCloseable {
         }
     }
 
-    void writeJson(Path destination, Map<String,Object> metadata, long deadline) throws IOException {
-        NativeBridgeAssets.publishFile(destination, ".json", temporary -> {
+    void writeJson(Path workspace, Path destination, Map<String,Object> metadata, long deadline) throws IOException {
+        NativeBridgeAssets.publishFile(workspace, destination, ".json", temporary -> {
             try (var writer = Files.newBufferedWriter(temporary); var lines = Files.newBufferedReader(path)) {
                 String prefix = JSONValue.toJSONString(metadata);
                 writer.write(prefix, 0, prefix.length() - 1);

@@ -130,6 +130,7 @@ final class NativeBridgeRendering {
             String name = nonblank(row.get("name"), "pose name");
             if (!name.matches("[A-Za-z0-9_-]+") || !names.add(name.toLowerCase(Locale.ROOT)))
                 throw new IllegalArgumentException("Pose names must be distinct portable filenames");
+            NativeBridgeAssets.requireBasename(name);
             var pose = pose(source, base, (Map<?,?>) row.get("parameters"));
             var actual = new TreeMap<String,Double>();
             for (var parameter : source.getAllParameters())
@@ -179,26 +180,27 @@ final class NativeBridgeRendering {
 
     private static Object renderReserved(Callable<CModelingDocument> document, Path workspace, Path output,
                                          Map<String,Object> request, int[] size, Permit permit, long estimatedSnapshot) throws Exception {
-        Files.createDirectories(output.getParent());
-        Path staging = Files.createTempDirectory(output.getParent(), ".cubism-render-");
-        try {
-            int count;
-            try (var plan = onEditorThread(() -> {
-                var doc = document.call();
-                var canvas = doc.getModelSource().getCanvas();
-                if (size[0] != integer(request, "width", canvas.getPixelWidth())
-                        || size[1] != integer(request, "height", canvas.getPixelHeight()))
-                    throw new IllegalStateException("Canvas changed before rendering began");
-                permit.increase(snapshotBytes(doc.getModelSource(), request) - estimatedSnapshot);
-                if (permit.large) closeRenderSessions(null);
-                return prepare(doc, request);
-            }, 0)) {
-                writeSet(plan, workspace, staging, request);
-                count = plan.frames.size();
-            }
-            NativeBridgeAssets.publishDirectory(staging, output);
-            return map("directory", output.toString(), "manifest", output.resolve("manifest.json").toString(), "frame_count", count);
-        } finally { NativeBridgeAssets.removeStaging(staging); }
+        try (var guard = NativeBridgeAssets.prepareOutput(workspace, output)) {
+            Path staging = Files.createTempDirectory(output.getParent(), ".cubism-render-");
+            try {
+                int count;
+                try (var plan = onEditorThread(() -> {
+                    var doc = document.call();
+                    var canvas = doc.getModelSource().getCanvas();
+                    if (size[0] != integer(request, "width", canvas.getPixelWidth())
+                            || size[1] != integer(request, "height", canvas.getPixelHeight()))
+                        throw new IllegalStateException("Canvas changed before rendering began");
+                    permit.increase(snapshotBytes(doc.getModelSource(), request) - estimatedSnapshot);
+                    if (permit.large) closeRenderSessions(null);
+                    return prepare(doc, request);
+                }, 0)) {
+                    writeSet(plan, workspace, staging, request);
+                    count = plan.frames.size();
+                }
+                NativeBridgeAssets.publishDirectory(staging, output);
+                return map("directory", output.toString(), "manifest", output.resolve("manifest.json").toString(), "frame_count", count);
+            } finally { NativeBridgeAssets.removeStaging(staging); }
+        }
     }
 
     private static void writeSet(RenderPlan plan, Path workspace, Path staging, Map<String,Object> request) throws Exception {
@@ -207,7 +209,7 @@ final class NativeBridgeRendering {
         var references = new HashMap<String,Path>();
         if (request.get("baseline_manifest") != null) {
             previous = NativeBridgeAssets.input(workspace, request.get("baseline_manifest"), ".json");
-            if (!(JSONValue.parse(Files.readString(previous)) instanceof Map<?,?> baseline)
+            if (!(JSONValue.parse(NativeBridgeAssets.readJsonText(previous)) instanceof Map<?,?> baseline)
                 || !JSONValue.toJSONString(bounds).equals(JSONValue.toJSONString(baseline.get("crop")))
                 || !String.valueOf(plan.width).equals(String.valueOf(baseline.get("width")))
                 || !String.valueOf(plan.height).equals(String.valueOf(baseline.get("height")))
@@ -247,7 +249,7 @@ final class NativeBridgeRendering {
             } finally { image.flush(); }
         }
         var manifest = map("width", plan.width, "height", plan.height, "crop", bounds, "base_pose", plan.base, "frames", result);
-        NativeBridgeAssets.writeNew(staging.resolve("manifest.json"), JSONValue.toJSONString(manifest));
+        Files.writeString(staging.resolve("manifest.json"), JSONValue.toJSONString(manifest), StandardOpenOption.CREATE_NEW);
     }
 
     private static String hash(Path path) throws Exception {

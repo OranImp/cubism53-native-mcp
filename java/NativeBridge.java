@@ -84,6 +84,9 @@ public final class NativeBridge {
         }
         listener = bound;
         Thread worker = new Thread(NativeBridge::serve, "Cubism53-native-bridge");
+        // The JVM Attach listener can have a null context loader. Cubism's JSON
+        // library needs the editor loader when a worker is the first to use it.
+        worker.setContextClassLoader(CEAppCtrl.class.getClassLoader());
         worker.setDaemon(true);
         worker.start();
     }
@@ -102,8 +105,9 @@ public final class NativeBridge {
         try {
             while (!listener.isClosed()) {
                 Socket connection = listener.accept();
+                long readDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
                 try {
-                    connections.execute(() -> handle(connection, editorRequests));
+                    connections.execute(() -> handle(connection, editorRequests, readDeadline));
                 } catch (RejectedExecutionException error) {
                     reply(connection, errorResponse(new IllegalStateException("Bridge is busy; retry the request")));
                 }
@@ -116,13 +120,10 @@ public final class NativeBridge {
         }
     }
 
-    @SuppressWarnings("unchecked")
-    private static void handle(Socket socket, ExecutorService editorRequests) {
+    private static void handle(Socket socket, ExecutorService editorRequests, long readDeadline) {
+        boolean handedOff = false;
         try {
-            socket.setSoTimeout(10000);
-            BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-            Map<String,Object> request = (Map<String,Object>) JSONValue.parse(reader.readLine());
-            if (request == null || !token.equals(request.get("token"))) throw new SecurityException("Unauthorized local client");
+            Map<String,Object> request = NativeBridgeWire.request(socket, token, readDeadline);
             String operation = nonblank(request.get("operation"), "operation");
             if ("bridge_info".equals(operation)) {
                 reply(socket, map("ok", true, "result", bridgeIdentity()));
@@ -139,12 +140,18 @@ public final class NativeBridge {
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(45);
                 try {
                     editorRequests.execute(() -> handleEditorRequest(socket, operation, request, deadline));
+                    handedOff = true;
                 } catch (RejectedExecutionException error) {
                     throw new IllegalStateException("Editor request queue is busy; retry the request", error);
                 }
             }
         } catch (Exception error) {
             reply(socket, errorResponse(error));
+        } finally {
+            if (!handedOff && !socket.isClosed()) {
+                try { socket.close(); }
+                catch (IOException error) { System.err.println("Cubism53 bridge: " + error); }
+            }
         }
     }
 
@@ -172,7 +179,7 @@ public final class NativeBridge {
                 }, deadline);
             }
             response = map("ok", true, "result", result);
-        } catch (Exception error) {
+        } catch (Exception | LinkageError error) {
             response = errorResponse(error);
         }
         reply(socket, response);
@@ -229,7 +236,7 @@ public final class NativeBridge {
             var path = NativeBridgeAssets.output(workspace, request.get("path"), ".png");
             var frame = onEditorThread(() -> exportMeshTexture(document.call().getModelSource(), request, path), deadline);
             try {
-                NativeBridgeAssets.publishFile(path, ".png", temporary -> frame.image.writeImage(temporary.toFile()));
+                NativeBridgeAssets.publishFile(workspace, path, ".png", temporary -> frame.image.writeImage(temporary.toFile()));
                 return frame.information;
             } finally { frame.image.flush(); }
         }
@@ -259,7 +266,7 @@ public final class NativeBridge {
                 var result = NativeBridgePhysics.solve(simulation, deadline, spool);
                 var trace = spool.finish();
                 if (path == null) return new NativeBridgeJobs.TraceResult(result, trace);
-                try (trace) { trace.writeJson(path, result, deadline); }
+                try (trace) { trace.writeJson(workspace, path, result, deadline); }
                 result.put("frame_count", simulation.frames().size());
                 result.put("trace_path", path.toString());
                 return result;
@@ -267,7 +274,7 @@ public final class NativeBridge {
         }
         if ("import_physics3".equals(operation)) {
             var path = NativeBridgeAssets.input(workspace, request.get("path"), ".physics3.json");
-            var json = Files.readString(path);
+            var json = NativeBridgeAssets.readJsonText(path);
             Object input = Boolean.TRUE.equals(request.get("preflight"))
                 ? new NativeBridgeAssets.PhysicsPreflightInput(path, JSONValue.parse(json))
                 : net.arnx.jsonic.JSON.decode(json, com.live2d.cubism.doc.gameData.importer.CPhysicsJsonLoader.PhysicsJson.class);
@@ -276,12 +283,12 @@ public final class NativeBridge {
         if ("export_physics3".equals(operation)) {
             var path = NativeBridgeAssets.output(workspace, request.get("path"), ".physics3.json");
             var export = onEditorThread(() -> NativeBridgeAssets.preparePhysics(document.call()), deadline);
-            return NativeBridgeAssets.writePhysics(export, path);
+            return NativeBridgeAssets.writePhysics(export, workspace, path);
         }
         if ("export_expression3".equals(operation)) {
             var path = NativeBridgeAssets.output(workspace, request.get("path"), ".exp3.json");
             var ids = onEditorThread(() -> NativeBridgeAssets.parameterIds(document.call().getModelSource()), deadline);
-            return NativeBridgeAssets.exportExpression(ids, path, request);
+            return NativeBridgeAssets.exportExpression(ids, workspace, path, request);
         }
         if ("export_motion3".equals(operation)) {
             var path = NativeBridgeAssets.output(workspace, request.get("path"), ".motion3.json");
@@ -291,7 +298,7 @@ public final class NativeBridge {
                 checkRevision(scene, request);
                 return NativeBridgeAnimation.prepareMotion(scene, request);
             }, deadline);
-            return NativeBridgeAnimation.writeMotion(path, json);
+            return NativeBridgeAnimation.writeMotion(workspace, path, json);
         }
         boolean preflight = "preflight_runtime_export".equals(operation);
         var destination = preflight ? null : NativeBridgeAssets.output(workspace, request.get("directory"), "");
@@ -301,7 +308,7 @@ public final class NativeBridge {
         if (preflight) return NativeBridgeAssets.preflightRuntime(check, assets, diagnostics);
         if (!diagnostics.isEmpty()) throw new IllegalArgumentException("Runtime attachment preflight failed: " + diagnostics);
         var export = onEditorThread(() -> NativeBridgeAssets.prepareRuntime(document.call(), check, assets), deadline);
-        return NativeBridgeAssets.writeRuntime(export, destination, deadline);
+        return NativeBridgeAssets.writeRuntime(export, workspace, destination, deadline);
     }
 
     private static Object stop(long deadline) throws Exception {
@@ -321,7 +328,7 @@ public final class NativeBridge {
         return map("stopped", true);
     }
 
-    private static Map<String,Object> errorResponse(Exception error) {
+    private static Map<String,Object> errorResponse(Throwable error) {
         Throwable cause = error instanceof ExecutionException ? error.getCause() : error;
         return map("ok", false, "error", cause.toString());
     }
@@ -557,6 +564,7 @@ public final class NativeBridge {
                 // Same importer as the file command, without its modal error dialog.
                 var loader=new com.live2d.cubism.doc.gameData.importer.CPhysicsJsonLoader();
                 var undo=new com.live2d.undo.SimpleUndo("Native bridge: import physics",settings,new com.live2d.core.a());
+                Map<String,Object> result;
                 try {
                     var method=loader.getClass().getDeclaredMethod("a",CModelSource.class,input.getClass());
                     method.setAccessible(true);
@@ -564,8 +572,10 @@ public final class NativeBridge {
                         throw new IllegalArgumentException("Native physics import rejected: "+loader.a());
                     if (!loader.a().isEmpty() || !loader.b().isEmpty() || settings.containInvalidVertexIndex())
                         throw new IllegalArgumentException("Invalid physics references: "+loader.a()+" "+loader.b());
-                    finishEdit(doc,undo);return physicsInfo(source);
+                    result = physicsInfo(source);
                 } catch (Throwable error) { undo.undo(); refresh(doc); throw error; }
+                finishEdit(doc, undo);
+                return result;
             }
             case "import_png": {
                 String name = (String)request.get("name");
@@ -575,13 +585,17 @@ public final class NativeBridge {
                 float[] affine = floatArray(request.get("affine"));
                 if (affine.length != 6) throw new IllegalArgumentException("PNG-to-canvas affine requires a,b,c,d,tx,ty");
                 var pixels = ((NativeBridgeAssets.PngInput) staged).pixels();
+                int drawOrder = integer(request, "draw_order", 500);
+                for (float x : new float[]{0, pixels.getWidth()})
+                    for (float y : new float[]{0, pixels.getHeight()})
+                        checkPngVertex(affine[0]*x+affine[2]*y+affine[4], affine[1]*x+affine[3]*y+affine[5]);
                 var undo = new com.live2d.undo.GroupUndo("Native bridge: import PNG");
                 undo.plusAssign(new com.live2d.undo.SimpleUndo("Import material",source.getTextureManager(),new com.live2d.core.a()));
                 try {
                     var resource = new com.live2d.graphics.CImageResource(pixels,false);
                     var material = com.live2d.cubism.doc.model.texture.modelImage.CModelImage.Companion.a(
                         source,name,resource,"Native original artwork",new com.live2d.type.CModelImageGuid());
-                    var meshes = source.getHandler().a(null,List.of(material),source.getRootPart(),integer(request,"draw_order",500),1f,undo);
+                    var meshes = source.getHandler().a(null,List.of(material),source.getRootPart(),drawOrder,1f,undo);
                     var mesh = meshes.get(0); mesh.setLocalName(name);
                     for (var form : mesh.getKeyforms()) {
                         float[] positions = form.getPositions().clone();
@@ -589,6 +603,7 @@ public final class NativeBridge {
                             float x=positions[i],y=positions[i+1];
                             positions[i]=affine[0]*x+affine[2]*y+affine[4];
                             positions[i+1]=affine[1]*x+affine[3]*y+affine[5];
+                            checkPngVertex(positions[i], positions[i+1]);
                         }
                         form.setPositions(positions); form.setUpdated();
                     }
@@ -809,12 +824,18 @@ public final class NativeBridge {
                 if (name == null || name.isBlank()) throw new IllegalArgumentException("Name required");
                 int columns = integer(request, "columns", 2), rows = integer(request, "rows", 2);
                 int bezierColumns = integer(request, "bezier_columns", 2), bezierRows = integer(request, "bezier_rows", 2);
-                if (columns < 1 || columns > 30 || rows < 1 || rows > 30 || bezierColumns < 1 || bezierRows < 1)
-                    throw new IllegalArgumentException("Invalid grid subdivisions");
+                if (columns < 1 || columns > 30 || rows < 1 || rows > 30)
+                    throw new IllegalArgumentException("Warp grid subdivisions must be 1..30");
+                // The editor's Bezier division controls accept at most 100 per axis.
+                if (bezierColumns < 1 || bezierColumns > 100 || bezierRows < 1 || bezierRows > 100)
+                    throw new IllegalArgumentException("Bezier grid subdivisions must be 1..100");
                 for (ACDeformerSource existing : source.getDeformerSourceSet().getSources())
                     if (name.equals(existing.getLocalName())) throw new IllegalArgumentException("Deformer name already exists");
                 float x = number(request, "x"), y = number(request, "y"), width = number(request, "width"), height = number(request, "height");
                 if (width <= 0 || height <= 0) throw new IllegalArgumentException("Positive bounds required");
+                if (!Float.isFinite(x + columns * (width / columns))
+                        || !Float.isFinite(y + rows * (height / rows)))
+                    throw new IllegalArgumentException("Warp bounds produce nonfinite coordinates");
                 var part = targetPart(source, request.get("part_guid"));
                 // Same internal factory as the native command: part membership,
                 // GUID, default form, interpolation grid, Bezier extension and undo.
@@ -843,8 +864,7 @@ public final class NativeBridge {
             case "redo": return replayEdit(doc, true);
             case "save_as_new": {
                 Path path = NativeBridgeAssets.output(workspace, request.get("path"), ".cmo3");
-                Files.createDirectories(path.getParent());
-                return NativeBridgeAssets.saveModel(doc, path);
+                return NativeBridgeAssets.saveModel(doc, workspace, path);
             }
             case "close_saved":
                 if (doc.getFile() == null || doc.isModifiedAfterSaving())
@@ -1023,6 +1043,7 @@ public final class NativeBridge {
         checkPhysicsBindings(source, request.get("expected_outputs"), group.getOutputs().stream().map(output -> output.getDestination()).toList());
         var patch = (Map<?,?>) request.get("patch");
         var undo = new SimpleUndo("Native bridge: update physics group", settings, new com.live2d.core.a());
+        Map<String,Object> result;
         try {
             if (patch.containsKey("enabled")) group.setEnable((Boolean) patch.get("enabled"));
             if (patch.get("inputs") instanceof List<?> inputs) {
@@ -1067,13 +1088,14 @@ public final class NativeBridge {
                 group.setNormalizedAngleDefaultValue(values[2]);
             }
             group.updatePhysicsSettings();
-        } catch (RuntimeException error) {
+            result = physicsInfo(source);
+        } catch (RuntimeException | Error error) {
             undo.undo();
             refresh(doc);
             throw error;
         }
         finishEdit(doc, undo);
-        return physicsInfo(source);
+        return result;
     }
 
     private static int rowIndex(Map<?,?> row, int count) {
@@ -1919,6 +1941,11 @@ public final class NativeBridge {
         return result;
     }
 
+    private static void checkPngVertex(float x, float y) {
+        if (!Float.isFinite(x) || !Float.isFinite(y))
+            throw new IllegalArgumentException("PNG transform produces a nonfinite vertex");
+    }
+
     private static void commitTopology(CArtMeshSource mesh,com.live2d.graphics3d.editableMesh.GEditableMesh2 edited) throws Exception {
         // The obfuscated distribution has both a class and package named util.j.
         // Resolve this one signature at runtime; javac cannot name its progress type.
@@ -2335,7 +2362,7 @@ public final class NativeBridge {
                 }
             }, 0);
             try {
-                NativeBridgeAssets.publishFile(path, ".png", temporary -> frame.image.writeImage(temporary.toFile()));
+                NativeBridgeAssets.publishFile(workspace, path, ".png", temporary -> frame.image.writeImage(temporary.toFile()));
                 frame.information.put("bytes", Files.size(path));
                 return frame.information;
             } finally { frame.image.flush(); }
@@ -2445,7 +2472,11 @@ public final class NativeBridge {
     }
 
     static int integer(Map<String,Object> request, String key, int fallback) {
-        return request.get(key) instanceof Number n ? n.intValue() : fallback;
+        Object value = request.get(key);
+        if (value == null) return fallback;
+        if (!(value instanceof Number number) || number.doubleValue() != number.intValue())
+            throw new IllegalArgumentException(key + " must be a 32-bit integer");
+        return number.intValue();
     }
     private static int canvasDimension(Map<String,Object> request, String key, int minimum) {
         if (!(request.get(key) instanceof Number value)) {
